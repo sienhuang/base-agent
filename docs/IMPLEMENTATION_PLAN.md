@@ -276,7 +276,7 @@ Progress:
 - [x] Attachment/Artifact references, binary store port, Tool access, and checkpoint semantics;
 - [x] optional structured Memory retrieval, failure policy, Tool access, and resume semantics;
 - [x] optional FastAPI Run server with HTTP, SSE, resume, cancellation, and Artifact APIs;
-- [ ] PostgreSQL run store;
+- [x] PostgreSQL Run/Event/Checkpoint/Artifact store and polling EventStream;
 - [ ] Redis event publisher;
 - [ ] MCP tool adapter;
 - [ ] sandbox and browser adapters;
@@ -284,9 +284,10 @@ Progress:
 
 Current verification baseline:
 
-- 114 tests passed with warnings treated as errors;
+- 117 tests passed with warnings treated as errors, including two live PostgreSQL integration
+  tests when `BASE_AGENT_TEST_POSTGRES_DSN` is configured;
 - Ruff passed;
-- mypy passed for 68 source files;
+- mypy passed for 71 source files;
 - source distribution and wheel built successfully;
 - the base wheel imports without the OpenAI SDK installed;
 - the wheel's `openai` extra installs the SDK and exposes `OpenAIChatProvider`;
@@ -308,6 +309,8 @@ Current verification baseline:
   redaction, best-effort/required failures, Tool queries, and resume stability are covered by tests;
 - FastAPI background start, Run lookup, cooperative cancellation, shielded resume, cursor-based SSE,
   history-only store rejection, Attachment references, and guarded Artifact download are covered;
+- PostgreSQL protocol conformance, atomic event sequencing, Run cancellation, binary content,
+  atomic Checkpoint claim, Agent waiting/resume, and cursor replay are covered against PostgreSQL;
 - adopted and rejected reference patterns are recorded in `docs/REFERENCE_DESIGN.md`.
 
 ## Decisions still requiring explicit approval

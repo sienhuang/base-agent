@@ -139,9 +139,11 @@ tools through an adapter while BI-WIKI owns lineage analysis and SQL repair skil
 
 ## Persistence boundary
 
-The core defines store protocols and ships in-memory implementations. PostgreSQL and Redis are
-optional adapters. Redis may distribute events but must not be the sole durable source of run
-state.
+The core defines store protocols and ships in-memory implementations. The optional
+`base_agent.postgres.PostgresStore` implements Run, Event, Checkpoint, Attachment, and Artifact
+ports without changing the runtime. Its polling `EventStream` supports the same cursor contract as
+the in-memory store, so the HTTP/SSE layer can use either implementation. Redis may later reduce
+event-delivery latency, but must not be the sole durable source of Run state.
 
 ## Security boundary
 

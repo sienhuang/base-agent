@@ -40,6 +40,7 @@ All examples are deterministic and offline. Start with the
 - [Attachments and Artifacts](docs/ARTIFACTS.md)
 - [Optional Memory Retrieval](docs/MEMORY.md)
 - [Optional FastAPI Run Server](docs/SERVER.md)
+- [Optional PostgreSQL Persistence](docs/POSTGRES.md)
 - [Model Providers](docs/PROVIDERS.md)
 - [Reference Design Decisions](docs/REFERENCE_DESIGN.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
@@ -54,6 +55,12 @@ The HTTP/SSE adapter is also optional:
 
 ```bash
 uv add 'base-agent[server]'
+```
+
+Durable PostgreSQL stores are installed separately as well:
+
+```bash
+uv add 'base-agent[postgres]'
 ```
 
 ## Design goals
