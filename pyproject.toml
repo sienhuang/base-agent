@@ -1,0 +1,50 @@
+[project]
+name = "base-agent"
+version = "0.1.0"
+description = "A small, framework-agnostic runtime for building tool- and skill-enabled agents."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.11,<3",
+    "pyyaml>=6,<7",
+]
+
+[project.optional-dependencies]
+openai = [
+    "openai>=2,<3",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.15",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.11",
+    "types-pyyaml>=6.0.12",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/base_agent"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["base_agent"]
+mypy_path = "src"
