@@ -277,17 +277,17 @@ Progress:
 - [x] optional structured Memory retrieval, failure policy, Tool access, and resume semantics;
 - [x] optional FastAPI Run server with HTTP, SSE, resume, cancellation, and Artifact APIs;
 - [x] PostgreSQL Run/Event/Checkpoint/Artifact store and polling EventStream;
-- [ ] Redis event publisher;
+- [x] Redis event publisher with durable cursor replay and polling fallback;
 - [ ] MCP tool adapter;
 - [ ] sandbox and browser adapters;
 - [ ] build-lineage tool adapter and BI-WIKI domain skills.
 
 Current verification baseline:
 
-- 117 tests passed with warnings treated as errors, including two live PostgreSQL integration
-  tests when `BASE_AGENT_TEST_POSTGRES_DSN` is configured;
+- 121 tests passed with warnings treated as errors, including live PostgreSQL and Redis integration
+  tests when their test URLs are configured;
 - Ruff passed;
-- mypy passed for 71 source files;
+- mypy passed for 73 source files;
 - source distribution and wheel built successfully;
 - the base wheel imports without the OpenAI SDK installed;
 - the wheel's `openai` extra installs the SDK and exposes `OpenAIChatProvider`;
@@ -311,6 +311,8 @@ Current verification baseline:
   history-only store rejection, Attachment references, and guarded Artifact download are covered;
 - PostgreSQL protocol conformance, atomic event sequencing, Run cancellation, binary content,
   atomic Checkpoint claim, Agent waiting/resume, and cursor replay are covered against PostgreSQL;
+- Redis cross-client Pub/Sub wake-up, durable-first publishing, connection failure fallback, and
+  optional dependency boundaries are covered;
 - adopted and rejected reference patterns are recorded in `docs/REFERENCE_DESIGN.md`.
 
 ## Decisions still requiring explicit approval

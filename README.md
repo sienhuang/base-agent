@@ -41,6 +41,7 @@ All examples are deterministic and offline. Start with the
 - [Optional Memory Retrieval](docs/MEMORY.md)
 - [Optional FastAPI Run Server](docs/SERVER.md)
 - [Optional PostgreSQL Persistence](docs/POSTGRES.md)
+- [Optional Redis Event Notifications](docs/REDIS.md)
 - [Model Providers](docs/PROVIDERS.md)
 - [Reference Design Decisions](docs/REFERENCE_DESIGN.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
@@ -61,6 +62,12 @@ Durable PostgreSQL stores are installed separately as well:
 
 ```bash
 uv add 'base-agent[postgres]'
+```
+
+Cross-process event notifications can optionally use Redis:
+
+```bash
+uv add 'base-agent[redis]'
 ```
 
 ## Design goals

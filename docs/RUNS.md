@@ -35,10 +35,11 @@ async for event in handle.stream(after_sequence=last_sequence):
     last_sequence = event.sequence
 ```
 
-The default `InMemoryEventStore` implements the optional `EventStream` protocol. A PostgreSQL,
-Redis, or other EventStore can expose the same subscription contract. Stores that implement only
-history listing remain valid `EventStore` implementations, but `RunHandle.stream()` raises
-`EventStreamingNotSupportedError` for them.
+The default `InMemoryEventStore` implements the optional `EventStream` protocol. `PostgresStore`
+provides durable polling, while [`RedisEventStore`](REDIS.md) layers cross-process notifications
+over any durable EventStore. Other stores can expose the same subscription contract. Stores that
+implement only history listing remain valid `EventStore` implementations, but
+`RunHandle.stream()` raises `EventStreamingNotSupportedError` for them.
 
 ## Process boundary
 

@@ -142,8 +142,12 @@ tools through an adapter while BI-WIKI owns lineage analysis and SQL repair skil
 The core defines store protocols and ships in-memory implementations. The optional
 `base_agent.postgres.PostgresStore` implements Run, Event, Checkpoint, Attachment, and Artifact
 ports without changing the runtime. Its polling `EventStream` supports the same cursor contract as
-the in-memory store, so the HTTP/SSE layer can use either implementation. Redis may later reduce
-event-delivery latency, but must not be the sole durable source of Run state.
+the in-memory store, so the HTTP/SSE layer can use either implementation.
+
+`base_agent.redis.RedisEventStore` decorates a durable `EventStore`: it writes the event to that
+store first, then publishes a sequence notification. Subscribers always reconcile through the
+durable store. Redis therefore reduces cross-process delivery latency but is never the sole source
+of Run history, and missed Pub/Sub messages are repaired by cursor replay.
 
 ## Security boundary
 
