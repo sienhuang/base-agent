@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from base_agent.models.artifact import Artifact, Attachment
 from base_agent.models.model import TokenUsage
 from base_agent.models.skill import SkillReference
 
@@ -43,3 +44,5 @@ class Run(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    attachments: tuple[Attachment, ...] = ()
+    artifacts: tuple[Artifact, ...] = ()

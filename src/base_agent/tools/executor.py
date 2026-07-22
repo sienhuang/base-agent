@@ -8,6 +8,8 @@ from pydantic import ValidationError
 from pydantic_core import to_jsonable_python
 
 from base_agent.models import ToolCall, ToolResult, ToolResultStatus, WaitForInput
+from base_agent.tools.context import ToolContext
+from base_agent.tools.protocol import ContextualTool
 from base_agent.tools.registry import ToolRegistry
 
 
@@ -21,6 +23,7 @@ class ToolExecutor:
         *,
         granted_permissions: frozenset[str] = frozenset(),
         allowed_tools: frozenset[str] | None = None,
+        context: ToolContext | None = None,
     ) -> ToolResult:
         if allowed_tools is not None and call.name not in allowed_tools:
             return ToolResult(
@@ -49,10 +52,14 @@ class ToolExecutor:
             )
 
         try:
-            data = await asyncio.wait_for(
-                registered_tool.invoke(_copy_arguments(call.arguments)),
-                timeout=registered_tool.timeout_seconds,
+            arguments = _copy_arguments(call.arguments)
+            invocation = (
+                registered_tool.invoke_with_context(arguments, context)
+                if context is not None and isinstance(registered_tool, ContextualTool)
+                else registered_tool.invoke(arguments)
             )
+            async with asyncio.timeout(registered_tool.timeout_seconds):
+                data = await invocation
             if isinstance(data, WaitForInput):
                 return ToolResult(
                     tool_name=call.name,

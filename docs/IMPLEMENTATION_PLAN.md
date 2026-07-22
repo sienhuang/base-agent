@@ -271,8 +271,11 @@ Progress:
 - [x] generic RunHandle and replayable live event subscription;
 - [x] generic waiting state with resume/cancel transitions;
 - [x] resume input API, atomic checkpoint claim, and context restoration;
-- [ ] generic orchestration strategy plus plan/step models;
-- [ ] FastAPI run server;
+- [x] generic orchestration strategy plus immutable plan/step models and lifecycle events;
+- [x] execution-scoped resource lifecycle with Tool context injection and resume semantics;
+- [x] Attachment/Artifact references, binary store port, Tool access, and checkpoint semantics;
+- [x] optional structured Memory retrieval, failure policy, Tool access, and resume semantics;
+- [x] optional FastAPI Run server with HTTP, SSE, resume, cancellation, and Artifact APIs;
 - [ ] PostgreSQL run store;
 - [ ] Redis event publisher;
 - [ ] MCP tool adapter;
@@ -281,9 +284,9 @@ Progress:
 
 Current verification baseline:
 
-- 79 tests passed with warnings treated as errors;
+- 114 tests passed with warnings treated as errors;
 - Ruff passed;
-- mypy passed for 45 source files;
+- mypy passed for 68 source files;
 - source distribution and wheel built successfully;
 - the base wheel imports without the OpenAI SDK installed;
 - the wheel's `openai` extra installs the SDK and exposes `OpenAIChatProvider`;
@@ -293,6 +296,18 @@ Current verification baseline:
   are covered without a server or queue;
 - Tool-driven suspension, serialized checkpoints, repeated waits, resume cursor continuation,
   concurrent resume rejection, and waiting cancellation are covered by deterministic tests;
+- the default model/tool loop is a replaceable `OrchestrationStrategy`; custom strategies are
+  covered without consuming a model response;
+- immutable dependency-validated plans, step transitions, Run snapshots, lifecycle events, and
+  checkpoint round-trips are covered by deterministic tests;
+- lazy/eager resource acquisition, reverse same-task cleanup, partial failures, cleanup failures,
+  task cancellation, WAITING/reacquisition, and resource-aware Tools are covered by tests;
+- structured input Attachments, Tool-generated Artifacts, content isolation, access boundaries,
+  lifecycle events, Run/Result snapshots, and WAITING checkpoint restoration are covered by tests;
+- deterministic Memory retrieval, namespace/filter limits, structured Provider requests, event
+  redaction, best-effort/required failures, Tool queries, and resume stability are covered by tests;
+- FastAPI background start, Run lookup, cooperative cancellation, shielded resume, cursor-based SSE,
+  history-only store rejection, Attachment references, and guarded Artifact download are covered;
 - adopted and rejected reference patterns are recorded in `docs/REFERENCE_DESIGN.md`.
 
 ## Decisions still requiring explicit approval

@@ -16,7 +16,8 @@ OpenAI-compatible model Provider is available, while generic runtime capabilitie
 infrastructure integrations remain adapter work.
 
 The generic Runtime supports background Run handles, cursor-based live events, cooperative
-cancellation, and checkpointed human-input suspension/resume without a server or queue.
+cancellation, checkpointed human-input suspension/resume, replaceable orchestration strategies,
+and durable execution plans without a server or queue.
 
 ## Quick start
 
@@ -34,6 +35,11 @@ All examples are deterministic and offline. Start with the
 - [Writing Skills](docs/SKILLS.md)
 - [Testing Agents](docs/TESTING.md)
 - [Background Runs and Events](docs/RUNS.md)
+- [Orchestration Strategies and Plans](docs/ORCHESTRATION.md)
+- [Execution-scoped Resources](docs/RESOURCES.md)
+- [Attachments and Artifacts](docs/ARTIFACTS.md)
+- [Optional Memory Retrieval](docs/MEMORY.md)
+- [Optional FastAPI Run Server](docs/SERVER.md)
 - [Model Providers](docs/PROVIDERS.md)
 - [Reference Design Decisions](docs/REFERENCE_DESIGN.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
@@ -42,6 +48,12 @@ Optional OpenAI-compatible support is installed separately:
 
 ```bash
 uv add 'base-agent[openai]'
+```
+
+The HTTP/SSE adapter is also optional:
+
+```bash
+uv add 'base-agent[server]'
 ```
 
 ## Design goals

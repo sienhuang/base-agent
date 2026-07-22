@@ -1,12 +1,24 @@
 """Small public facade for starting an agent run."""
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from typing import Any
 from uuid import UUID, uuid4
 
-from base_agent.models import AgentResult, Run, RunStatus, RuntimeEvent
+from base_agent.memory import MemoryRetriever
+from base_agent.models import (
+    AgentResult,
+    Artifact,
+    Attachment,
+    ExecutionPlan,
+    MemoryFailureMode,
+    Run,
+    RunStatus,
+    RuntimeEvent,
+)
 from base_agent.profiles import AgentProfile
 from base_agent.providers import ModelProvider
+from base_agent.resources import ResourceSpec
 from base_agent.run_handle import RunHandle, request_cancellation
 from base_agent.runtime import AgentRuntime
 from base_agent.skills import (
@@ -15,8 +27,10 @@ from base_agent.skills import (
     select_and_validate_skills,
 )
 from base_agent.stores import (
+    ArtifactStore,
     CheckpointStore,
     EventStore,
+    InMemoryArtifactStore,
     InMemoryCheckpointStore,
     InMemoryEventStore,
     InMemoryRunStore,
@@ -42,6 +56,12 @@ class Agent:
         checkpoint_store: CheckpointStore | None = None,
         skill_registry: SkillRegistry | None = None,
         supervisor: Supervisor | None = None,
+        resources: Iterable[ResourceSpec] = (),
+        artifact_store: ArtifactStore | None = None,
+        memory_retriever: MemoryRetriever | None = None,
+        memory_limit: int = 5,
+        memory_namespace: str | None = None,
+        memory_failure_mode: MemoryFailureMode = MemoryFailureMode.BEST_EFFORT,
     ) -> None:
         self.profile = profile
         self.model = model
@@ -56,6 +76,16 @@ class Agent:
         for skill_name in profile.skills:
             self.skill_registry.manifest(skill_name)
         self.supervisor = supervisor or build_default_supervisor(profile)
+        self.resources = tuple(resources)
+        self.artifact_store = artifact_store or InMemoryArtifactStore()
+        if memory_limit < 1 or memory_limit > 100:
+            raise ValueError("memory_limit must be between 1 and 100")
+        if memory_namespace is not None and not memory_namespace.strip():
+            raise ValueError("memory_namespace must not be blank")
+        self.memory_retriever = memory_retriever
+        self.memory_limit = memory_limit
+        self.memory_namespace = memory_namespace
+        self.memory_failure_mode = memory_failure_mode
 
     async def run(
         self,
@@ -63,15 +93,20 @@ class Agent:
         *,
         run_id: UUID | None = None,
         skills: Iterable[str] = (),
+        plan: ExecutionPlan | None = None,
+        attachments: Iterable[Attachment] = (),
     ) -> AgentResult:
         selected_skills = self._select_skills(tuple(skills))
         enabled_tool_names = self._enabled_tools(selected_skills)
+        selected_attachments = await self._resolve_attachments(tuple(attachments))
         context = self.runtime.create_context(
             self.profile,
             prompt,
             run_id=run_id,
             skills=selected_skills,
             enabled_tool_names=enabled_tool_names,
+            plan=plan,
+            attachments=selected_attachments,
         )
         return await self.runtime.execute(
             context,
@@ -82,6 +117,12 @@ class Agent:
             event_store=self.event_store,
             checkpoint_store=self.checkpoint_store,
             supervisor=self.supervisor,
+            resource_specs=self.resources,
+            artifact_store=self.artifact_store,
+            memory_retriever=self.memory_retriever,
+            memory_limit=self.memory_limit,
+            memory_namespace=self.memory_namespace,
+            memory_failure_mode=self.memory_failure_mode,
         )
 
     async def resume(self, run_id: UUID, user_input: str) -> AgentResult:
@@ -110,6 +151,12 @@ class Agent:
                 event_store=self.event_store,
                 checkpoint_store=self.checkpoint_store,
                 supervisor=self.supervisor,
+                resource_specs=self.resources,
+                artifact_store=self.artifact_store,
+                memory_retriever=self.memory_retriever,
+                memory_limit=self.memory_limit,
+                memory_namespace=self.memory_namespace,
+                memory_failure_mode=self.memory_failure_mode,
                 resume_input=user_input,
             )
         except Exception:
@@ -122,11 +169,19 @@ class Agent:
         *,
         run_id: UUID | None = None,
         skills: Iterable[str] = (),
+        plan: ExecutionPlan | None = None,
+        attachments: Iterable[Attachment] = (),
     ) -> RunHandle:
         """Start a Run in the current event loop and return after its record is created."""
         active_run_id = run_id or uuid4()
         task = asyncio.create_task(
-            self.run(prompt, run_id=active_run_id, skills=skills),
+            self.run(
+                prompt,
+                run_id=active_run_id,
+                skills=skills,
+                plan=plan,
+                attachments=tuple(attachments),
+            ),
             name=f"base-agent-run-{active_run_id}",
         )
         while True:
@@ -159,6 +214,45 @@ class Agent:
 
     async def events(self, run_id: UUID) -> tuple[RuntimeEvent, ...]:
         return await self.event_store.list(run_id)
+
+    async def add_attachment(
+        self,
+        *,
+        name: str,
+        media_type: str,
+        content: bytes,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Attachment:
+        return await self.artifact_store.add_attachment(
+            name=name,
+            media_type=media_type,
+            content=content,
+            metadata=metadata,
+        )
+
+    async def get_artifact(self, artifact_id: UUID) -> Artifact:
+        return await self.artifact_store.get_artifact(artifact_id)
+
+    async def read_content(self, content_id: UUID) -> bytes:
+        return await self.artifact_store.read(content_id)
+
+    async def list_artifacts(self, run_id: UUID) -> tuple[Artifact, ...]:
+        return await self.artifact_store.list_artifacts(run_id)
+
+    async def _resolve_attachments(
+        self, attachments: tuple[Attachment, ...]
+    ) -> tuple[Attachment, ...]:
+        if len({attachment.id for attachment in attachments}) != len(attachments):
+            raise ValueError("attachments must be unique")
+        resolved = []
+        for attachment in attachments:
+            stored = await self.artifact_store.get_attachment(attachment.id)
+            if stored != attachment:
+                raise ValueError(
+                    f"attachment '{attachment.id}' does not match its stored reference"
+                )
+            resolved.append(stored)
+        return tuple(resolved)
 
     def _select_skills(self, names: tuple[str, ...]) -> tuple[Skill, ...]:
         return select_and_validate_skills(

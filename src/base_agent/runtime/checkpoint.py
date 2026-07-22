@@ -7,8 +7,19 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from base_agent.models import Message, ModelResponse, PendingInput, RunStatus, TokenUsage
+from base_agent.models import (
+    Artifact,
+    Attachment,
+    ExecutionPlan,
+    MemoryMatch,
+    Message,
+    ModelResponse,
+    PendingInput,
+    RunStatus,
+    TokenUsage,
+)
 from base_agent.profiles import AgentProfile
+from base_agent.resources import ResourceFailure
 from base_agent.skills import Skill
 
 if TYPE_CHECKING:
@@ -35,6 +46,14 @@ class RuntimeCheckpoint(BaseModel):
     provider_name: str | None = None
     supervision_data: dict[str, Any] = Field(default_factory=dict)
     pending_input: PendingInput
+    plan: ExecutionPlan | None = None
+    resource_failures: tuple[ResourceFailure, ...] = ()
+    attachments: tuple[Attachment, ...] = ()
+    artifacts: tuple[Artifact, ...] = ()
+    input_text: str
+    memories: tuple[MemoryMatch, ...] = ()
+    memory_initialized: bool = False
+    memory_error: str | None = None
 
     @model_validator(mode="after")
     def validate_waiting_state(self) -> RuntimeCheckpoint:
@@ -62,6 +81,14 @@ class RuntimeCheckpoint(BaseModel):
             provider_name=context.provider_name,
             supervision_data=context.supervision_data,
             pending_input=context.pending_input,
+            plan=context.plan,
+            resource_failures=tuple(context.resource_failures),
+            attachments=context.attachments,
+            artifacts=tuple(context.artifacts),
+            input_text=context.input_text,
+            memories=context.memories,
+            memory_initialized=context.memory_initialized,
+            memory_error=context.memory_error,
         )
 
     def restore(self) -> RuntimeContext:
@@ -84,4 +111,12 @@ class RuntimeCheckpoint(BaseModel):
             provider_name=self.provider_name,
             supervision_data=dict(self.supervision_data),
             pending_input=self.pending_input,
+            plan=self.plan,
+            resource_failures=list(self.resource_failures),
+            attachments=self.attachments,
+            artifacts=list(self.artifacts),
+            input_text=self.input_text,
+            memories=self.memories,
+            memory_initialized=self.memory_initialized,
+            memory_error=self.memory_error,
         )

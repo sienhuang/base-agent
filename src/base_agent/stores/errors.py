@@ -15,3 +15,11 @@ class RunNotCancellableError(RuntimeError):
 
 class CheckpointNotFoundError(LookupError):
     """Raised when a suspended Runtime checkpoint cannot be found or was already claimed."""
+
+
+class AttachmentNotFoundError(LookupError):
+    """Raised when an Attachment reference has no stored content."""
+
+
+class ArtifactNotFoundError(LookupError):
+    """Raised when an Artifact reference has no stored content."""

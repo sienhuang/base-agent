@@ -3,19 +3,109 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections import defaultdict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from base_agent.models import EventType, Run, RunStatus, RuntimeEvent
+from base_agent.models import Artifact, Attachment, EventType, Run, RunStatus, RuntimeEvent
 from base_agent.models.run import utc_now
 from base_agent.stores.errors import (
+    ArtifactNotFoundError,
+    AttachmentNotFoundError,
     CheckpointNotFoundError,
     RunAlreadyExistsError,
     RunNotCancellableError,
     RunNotFoundError,
 )
+
+
+class InMemoryArtifactStore:
+    """Dependency-free binary store for local runs and deterministic tests."""
+
+    def __init__(self) -> None:
+        self._attachments: dict[UUID, Attachment] = {}
+        self._artifacts: dict[UUID, Artifact] = {}
+        self._content: dict[UUID, bytes] = {}
+        self._lock = asyncio.Lock()
+
+    async def add_attachment(
+        self,
+        *,
+        name: str,
+        media_type: str,
+        content: bytes,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Attachment:
+        payload = bytes(content)
+        attachment = Attachment(
+            name=name,
+            media_type=media_type,
+            size_bytes=len(payload),
+            checksum_sha256=hashlib.sha256(payload).hexdigest(),
+            metadata=dict(metadata or {}),
+        )
+        async with self._lock:
+            self._attachments[attachment.id] = attachment
+            self._content[attachment.id] = payload
+        return attachment.model_copy(deep=True)
+
+    async def get_attachment(self, attachment_id: UUID) -> Attachment:
+        async with self._lock:
+            try:
+                attachment = self._attachments[attachment_id]
+            except KeyError as exc:
+                raise AttachmentNotFoundError(
+                    f"attachment '{attachment_id}' was not found"
+                ) from exc
+            return attachment.model_copy(deep=True)
+
+    async def create_artifact(
+        self,
+        run_id: UUID,
+        *,
+        name: str,
+        media_type: str,
+        content: bytes,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Artifact:
+        payload = bytes(content)
+        artifact = Artifact(
+            run_id=run_id,
+            name=name,
+            media_type=media_type,
+            size_bytes=len(payload),
+            checksum_sha256=hashlib.sha256(payload).hexdigest(),
+            metadata=dict(metadata or {}),
+        )
+        async with self._lock:
+            self._artifacts[artifact.id] = artifact
+            self._content[artifact.id] = payload
+        return artifact.model_copy(deep=True)
+
+    async def get_artifact(self, artifact_id: UUID) -> Artifact:
+        async with self._lock:
+            try:
+                artifact = self._artifacts[artifact_id]
+            except KeyError as exc:
+                raise ArtifactNotFoundError(f"artifact '{artifact_id}' was not found") from exc
+            return artifact.model_copy(deep=True)
+
+    async def read(self, content_id: UUID) -> bytes:
+        async with self._lock:
+            try:
+                return bytes(self._content[content_id])
+            except KeyError as exc:
+                raise ArtifactNotFoundError(f"content '{content_id}' was not found") from exc
+
+    async def list_artifacts(self, run_id: UUID) -> tuple[Artifact, ...]:
+        async with self._lock:
+            return tuple(
+                artifact.model_copy(deep=True)
+                for artifact in self._artifacts.values()
+                if artifact.run_id == run_id
+            )
 
 if TYPE_CHECKING:
     from base_agent.runtime.checkpoint import RuntimeCheckpoint
@@ -147,12 +237,15 @@ class InMemoryEventStore:
             EventType.RUN_LIMIT_REACHED,
             EventType.RUN_WAITING,
         }
+        permanent_terminal_types = terminal_types - {EventType.RUN_WAITING}
         while True:
             async with self._changed:
-                while len(self._events[run_id]) < next_sequence and not any(
-                    event.sequence >= next_sequence and event.type in terminal_types
-                    for event in self._events[run_id]
-                ):
+                while len(self._events[run_id]) < next_sequence:
+                    if any(
+                        event.type in permanent_terminal_types
+                        for event in self._events[run_id]
+                    ):
+                        return
                     await self._changed.wait()
                 available = self._events[run_id][next_sequence - 1 :]
                 batch = tuple(event.model_copy(deep=True) for event in available)

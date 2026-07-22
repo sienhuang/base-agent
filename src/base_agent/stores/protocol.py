@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from uuid import UUID
 
-from base_agent.models import EventType, Run, RuntimeEvent
+from base_agent.models import Artifact, Attachment, EventType, Run, RuntimeEvent
 
 if TYPE_CHECKING:
     from base_agent.runtime.checkpoint import RuntimeCheckpoint
@@ -63,3 +63,35 @@ class CheckpointStore(Protocol):
     async def claim(self, run_id: UUID) -> RuntimeCheckpoint: ...
 
     async def delete(self, run_id: UUID) -> None: ...
+
+
+@runtime_checkable
+class ArtifactStore(Protocol):
+    """Binary content boundary; events and checkpoints retain references only."""
+
+    async def add_attachment(
+        self,
+        *,
+        name: str,
+        media_type: str,
+        content: bytes,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Attachment: ...
+
+    async def get_attachment(self, attachment_id: UUID) -> Attachment: ...
+
+    async def create_artifact(
+        self,
+        run_id: UUID,
+        *,
+        name: str,
+        media_type: str,
+        content: bytes,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Artifact: ...
+
+    async def get_artifact(self, artifact_id: UUID) -> Artifact: ...
+
+    async def read(self, content_id: UUID) -> bytes: ...
+
+    async def list_artifacts(self, run_id: UUID) -> tuple[Artifact, ...]: ...

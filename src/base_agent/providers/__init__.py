@@ -3,6 +3,8 @@
 from base_agent.providers.errors import (
     InvalidProviderResponseError,
     MissingProviderDependencyError,
+    UnsupportedAttachmentError,
+    UnsupportedMemoryError,
 )
 from base_agent.providers.openai_chat import OpenAIChatClient, OpenAIChatProvider
 from base_agent.providers.protocol import ModelProvider
@@ -13,4 +15,6 @@ __all__ = [
     "ModelProvider",
     "OpenAIChatClient",
     "OpenAIChatProvider",
+    "UnsupportedAttachmentError",
+    "UnsupportedMemoryError",
 ]

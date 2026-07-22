@@ -47,11 +47,12 @@ adapters. The core supplies stable contracts and lifecycle behavior.
 
 1. `RunHandle` and replayable live event subscriptions;
 2. complete wait/resume input semantics (implemented);
-3. generic orchestration strategy and step/plan models;
-4. task-scoped resource lifecycle;
-5. artifact and attachment ports;
-6. optional memory retrieval port;
-7. transport and infrastructure adapters outside the core loop.
+3. generic orchestration strategy and step/plan models (implemented);
+4. task-scoped resource lifecycle and Tool context injection (implemented);
+5. artifact and attachment ports with Tool context access (implemented);
+6. optional memory retrieval port with explicit failure policy (implemented);
+7. transport and infrastructure adapters outside the core loop (FastAPI HTTP/SSE adapter
+   implemented; durable infrastructure adapters remain).
 
 Each extracted capability must work with in-memory fakes and without importing either reference
 application.

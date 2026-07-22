@@ -7,6 +7,8 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from base_agent.models.artifact import Attachment
+from base_agent.models.memory import MemoryMatch
 from base_agent.models.message import Message, ToolCall
 
 
@@ -74,6 +76,8 @@ class ModelRequest(BaseModel):
     tool_choice: ToolChoice = ToolChoice.AUTO
     model: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    attachments: tuple[Attachment, ...] = ()
+    memories: tuple[MemoryMatch, ...] = ()
 
     @model_validator(mode="after")
     def validate_tool_choice(self) -> Self:

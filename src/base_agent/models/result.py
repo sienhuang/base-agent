@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from base_agent.models.artifact import Artifact, Attachment
 from base_agent.models.message import Message
 from base_agent.models.model import TokenUsage
 
@@ -32,3 +33,5 @@ class AgentResult(BaseModel):
     usage: TokenUsage = Field(default_factory=TokenUsage)
     error: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    attachments: tuple[Attachment, ...] = ()
+    artifacts: tuple[Artifact, ...] = ()

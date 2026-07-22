@@ -6,8 +6,18 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID, uuid4
 
-from base_agent.models import Message, ModelResponse, PendingInput, TokenUsage
+from base_agent.models import (
+    Artifact,
+    Attachment,
+    ExecutionPlan,
+    MemoryMatch,
+    Message,
+    ModelResponse,
+    PendingInput,
+    TokenUsage,
+)
 from base_agent.profiles import AgentProfile
+from base_agent.resources import ResourceFailure
 from base_agent.runtime.state_machine import ExecutionState, RuntimeStateMachine
 from base_agent.skills import Skill
 
@@ -31,6 +41,14 @@ class RuntimeContext:
     provider_name: str | None = None
     supervision_data: dict[str, Any] = field(default_factory=dict)
     pending_input: PendingInput | None = None
+    plan: ExecutionPlan | None = None
+    resource_failures: list[ResourceFailure] = field(default_factory=list)
+    attachments: tuple[Attachment, ...] = ()
+    artifacts: list[Artifact] = field(default_factory=list)
+    input_text: str = ""
+    memories: tuple[MemoryMatch, ...] = ()
+    memory_initialized: bool = False
+    memory_error: str | None = None
 
     @property
     def state(self) -> ExecutionState:

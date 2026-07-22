@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, overload
+from typing import Any, get_type_hints, overload
 
 from pydantic import BaseModel, ConfigDict, create_model
 
 from base_agent.models import ToolDefinition
+from base_agent.tools.context import ToolContext
 
 
 class FunctionTool:
@@ -28,6 +29,7 @@ class FunctionTool:
             raise ValueError("tool timeout_seconds must be greater than zero")
 
         self._function = function
+        self._uses_context = _uses_tool_context(function)
         self._argument_model = _create_argument_model(function)
         tool_name = name or function.__name__
         tool_description = description or inspect.getdoc(function) or f"Execute {tool_name}."
@@ -52,8 +54,27 @@ class FunctionTool:
         return self._timeout_seconds
 
     async def invoke(self, arguments: Mapping[str, Any]) -> Any:
+        return await self._invoke(arguments, context=None)
+
+    async def invoke_with_context(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolContext,
+    ) -> Any:
+        return await self._invoke(arguments, context=context)
+
+    async def _invoke(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        context: ToolContext | None,
+    ) -> Any:
         validated = self._argument_model.model_validate(dict(arguments))
         keyword_arguments = validated.model_dump()
+        if self._uses_context:
+            if context is None:
+                raise RuntimeError("tool requires an execution context")
+            keyword_arguments["context"] = context
         if inspect.iscoroutinefunction(self._function):
             awaitable = self._function(**keyword_arguments)
             return await _await_result(awaitable)
@@ -62,15 +83,21 @@ class FunctionTool:
 
 def _create_argument_model(function: Callable[..., Any]) -> type[BaseModel]:
     fields: dict[str, tuple[Any, Any]] = {}
+    annotations = get_type_hints(function)
     for parameter in inspect.signature(function).parameters.values():
         if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
             raise TypeError("tool functions cannot declare *args or **kwargs")
         if parameter.kind is parameter.POSITIONAL_ONLY:
             raise TypeError("tool functions cannot declare positional-only parameters")
-        if parameter.annotation is inspect.Parameter.empty:
+        annotation = annotations.get(parameter.name, parameter.annotation)
+        if annotation is ToolContext:
+            if parameter.name != "context":
+                raise TypeError("ToolContext parameter must be named 'context'")
+            continue
+        if annotation is inspect.Parameter.empty:
             raise TypeError(f"tool parameter '{parameter.name}' requires a type annotation")
         default = ... if parameter.default is inspect.Parameter.empty else parameter.default
-        fields[parameter.name] = (parameter.annotation, default)
+        fields[parameter.name] = (annotation, default)
 
     model_name = f"{function.__name__.title().replace('_', '')}Arguments"
     argument_model: type[BaseModel] = create_model(  # type: ignore[call-overload]
@@ -79,6 +106,14 @@ def _create_argument_model(function: Callable[..., Any]) -> type[BaseModel]:
         **fields,
     )
     return argument_model
+
+
+def _uses_tool_context(function: Callable[..., Any]) -> bool:
+    annotations = get_type_hints(function)
+    return any(
+        annotations.get(parameter.name, parameter.annotation) is ToolContext
+        for parameter in inspect.signature(function).parameters.values()
+    )
 
 
 async def _await_result(value: Awaitable[Any]) -> Any:

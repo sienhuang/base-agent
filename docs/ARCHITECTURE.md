@@ -24,6 +24,9 @@ Applications depend on `base-agent`; the core never imports application or domai
 | `Agent` | Small public facade used to start or resume a run. |
 | `AgentProfile` | Instructions, enabled capabilities, model route, and execution limits. |
 | `Runtime` | Advances the model/tool loop and emits events. |
+| `OrchestrationStrategy` | Advances one bounded turn; replaceable without replacing Run lifecycle. |
+| `ExecutionPlan` | Immutable dependency graph and step lifecycle used by planning strategies. |
+| `Resource` | Task-local stateful capability acquired and released around execution. |
 | `ModelProvider` | Converts runtime requests into provider responses. |
 | `Tool` | Typed, atomic executable capability. |
 | `Skill` | Versioned instructions, tool requirements, permissions, and output contract. |
@@ -31,6 +34,8 @@ Applications depend on `base-agent`; the core never imports application or domai
 | `Run` | Durable execution aggregate containing status and references to its history. |
 | `Event` | Immutable observation of a runtime transition. |
 | `Artifact` | File or structured output produced by a run. |
+| `Attachment` | Stored input reference explicitly selected for a Run. |
+| `MemoryRetriever` | Optional structured context search independent of storage technology. |
 
 ## Dependency rule
 
@@ -55,6 +60,9 @@ src/base_agent/
 ├── profiles.py
 ├── models/
 ├── runtime/
+├── orchestration/
+├── resources/
+├── server/             # optional FastAPI import boundary
 ├── providers/
 ├── tools/
 ├── skills/
@@ -79,14 +87,32 @@ Human-input suspension is also a core lifecycle concern. Tools return a typed `W
 outcome; Runtime state is persisted through `CheckpointStore`; applications collect the answer and
 resume the same Run. The core does not prescribe a web socket, form, terminal, or chat transport.
 
+Stateful infrastructure is exposed through execution-scoped `ResourceSpec` factories. Resources
+are acquired and released in the same async task, and Tools receive them through a runtime-only
+`ToolContext` that is omitted from model schemas. WAITING releases resources; resume reacquires
+them. Checkpoints never serialize live infrastructure objects.
+
+Input Attachments and generated Artifacts are immutable references backed by `ArtifactStore`.
+Binary content never enters messages, events, Runs, Results, or checkpoints. Tools access content
+through the Run-scoped ArtifactManager exposed by `ToolContext`; provider adapters receive
+structured Attachment references and must map or explicitly reject them.
+
+Memory retrieval is optional and isolated behind `MemoryRetriever`. Initial matches enter the
+provider-neutral ModelRequest without changing the system prompt. Retrieval events and durable Run
+metadata retain only IDs and scores; WAITING checkpoints retain selected matches so resume does not
+silently change context.
+
 The runtime owns:
 
 - state transitions;
-- model and tool sequencing;
 - event emission;
 - budget and permission checks;
 - cancellation checks;
 - final result construction.
+
+The selected orchestration strategy owns bounded model/tool sequencing or planning. The default
+`ModelToolStrategy` preserves the simple ReAct-style loop. Custom strategies receive only generic
+`RuntimeServices`; plan updates use the shared persistence and lifecycle-event operation.
 
 The runtime does not own:
 
@@ -96,6 +122,10 @@ The runtime does not own:
 - provider-specific clients;
 - application authentication;
 - domain-specific repair or analysis logic.
+
+The optional FastAPI adapter is a transport layer over these ports. Its task manager is scoped to
+one application instance and does not claim process-restart durability. Authentication, tenancy,
+upload policy, and distributed scheduling remain host-application responsibilities.
 
 ## Skill boundary
 

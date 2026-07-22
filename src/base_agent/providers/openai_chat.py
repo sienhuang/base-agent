@@ -20,6 +20,8 @@ from base_agent.models import (
 from base_agent.providers.errors import (
     InvalidProviderResponseError,
     MissingProviderDependencyError,
+    UnsupportedAttachmentError,
+    UnsupportedMemoryError,
 )
 
 
@@ -80,6 +82,16 @@ class OpenAIChatProvider:
         return self._name
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
+        if request.attachments:
+            raise UnsupportedAttachmentError(
+                "OpenAIChatProvider does not map attachments; use an attachment-capable "
+                "Provider or process them through Tools"
+            )
+        if request.memories:
+            raise UnsupportedMemoryError(
+                "OpenAIChatProvider does not map retrieved memories; use a memory-capable "
+                "Provider or retrieve them through Tools"
+            )
         parameters: dict[str, Any] = {
             "model": request.model or self.model,
             "messages": [_message_to_openai(message) for message in request.messages],

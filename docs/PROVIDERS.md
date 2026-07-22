@@ -29,6 +29,16 @@ agent = Agent(
 The official SDK reads `OPENAI_API_KEY` when `api_key` is omitted. Do not store keys in Python,
 Skill files, TOML configuration, examples, or Git history.
 
+## Attachments
+
+`ModelRequest.attachments` contains structured references rather than binary payloads. Provider
+adapters must resolve and map them using an application-authorized content mechanism or reject
+them explicitly. `OpenAIChatProvider` currently raises `UnsupportedAttachmentError`; use an
+attachment-capable Provider adapter or process the input through Tools.
+
+`ModelRequest.memories` follows the same explicit capability rule. `OpenAIChatProvider` raises
+`UnsupportedMemoryError`; a memory-capable Provider must deliberately map the structured matches.
+
 For an OpenAI-compatible gateway:
 
 ```python
