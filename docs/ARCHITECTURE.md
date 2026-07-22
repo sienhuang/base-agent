@@ -63,6 +63,11 @@ src/base_agent/
 ├── orchestration/
 ├── resources/
 ├── server/             # optional FastAPI import boundary
+├── postgres/           # optional durable Store implementation
+├── redis/              # optional event notification implementation
+├── mcp/                # optional remote Tool transport
+├── sandbox/            # generic session/tools plus optional Docker module
+├── browser/            # generic session/tools plus optional Playwright module
 ├── providers/
 ├── tools/
 ├── skills/
@@ -93,6 +98,12 @@ are acquired and released in the same async task, and Tools receive them through
 them. Checkpoints never serialize live infrastructure objects.
 
 Input Attachments and generated Artifacts are immutable references backed by `ArtifactStore`.
+
+Sandbox and Browser capabilities follow this same Resource boundary. Their provider-neutral
+sessions and Tools do not own process-global infrastructure. Docker and Playwright implementations
+are acquired lazily for one execution segment and are closed on completion, failure, cancellation,
+or WAITING. Persistent cross-segment workspaces or browser profiles must be owned explicitly by the
+host application; live containers and pages are never serialized into checkpoints.
 Binary content never enters messages, events, Runs, Results, or checkpoints. Tools access content
 through the Run-scoped ArtifactManager exposed by `ToolContext`; provider adapters receive
 structured Attachment references and must map or explicitly reject them.

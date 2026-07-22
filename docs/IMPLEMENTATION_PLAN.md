@@ -279,15 +279,15 @@ Progress:
 - [x] PostgreSQL Run/Event/Checkpoint/Artifact store and polling EventStream;
 - [x] Redis event publisher with durable cursor replay and polling fallback;
 - [x] MCP Tool discovery/invocation adapter with stdio and Streamable HTTP transports;
-- [ ] sandbox and browser adapters;
+- [x] provider-neutral Sandbox/Browser sessions and optional Docker/Playwright implementations;
 - [ ] build-lineage tool adapter and BI-WIKI domain skills.
 
 Current verification baseline:
 
-- 126 tests passed with warnings treated as errors, including live PostgreSQL and Redis integration
-  tests when their test URLs are configured;
+- 133 tests passed with warnings treated as errors, including live PostgreSQL, Redis, Docker
+  Sandbox, Playwright Browser, and stdio MCP integration tests when configured;
 - Ruff passed;
-- mypy passed for 78 source files;
+- mypy passed for 88 source files;
 - source distribution and wheel built successfully;
 - the base wheel imports without the OpenAI SDK installed;
 - the wheel's `openai` extra installs the SDK and exposes `OpenAIChatProvider`;
@@ -315,6 +315,9 @@ Current verification baseline:
   optional dependency boundaries are covered;
 - MCP pagination, namespacing, permissions, JSON Schema validation, result/error normalization,
   private metadata filtering, and a real stdio MCP server-to-Agent loop are covered;
+- generic Sandbox/Browser Resource Tools, explicit permissions, Docker hardening, path/output/file
+  limits, timeout destruction, Browser network policy, interaction, and screenshot Artifacts are
+  covered, including real Docker and headless Chrome tests;
 - adopted and rejected reference patterns are recorded in `docs/REFERENCE_DESIGN.md`.
 
 ## Decisions still requiring explicit approval

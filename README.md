@@ -43,6 +43,8 @@ All examples are deterministic and offline. Start with the
 - [Optional PostgreSQL Persistence](docs/POSTGRES.md)
 - [Optional Redis Event Notifications](docs/REDIS.md)
 - [Optional MCP Tool Adapter](docs/MCP.md)
+- [Sandbox Sessions and Docker Adapter](docs/SANDBOX.md)
+- [Browser Sessions and Playwright Adapter](docs/BROWSER.md)
 - [Model Providers](docs/PROVIDERS.md)
 - [Reference Design Decisions](docs/REFERENCE_DESIGN.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
@@ -75,6 +77,13 @@ Remote MCP tools use the official Python SDK through another optional boundary:
 
 ```bash
 uv add 'base-agent[mcp]'
+```
+
+Docker Sandbox and Playwright Browser implementations are independently optional:
+
+```bash
+uv add 'base-agent[sandbox]'
+uv add 'base-agent[browser]'
 ```
 
 ## Design goals
