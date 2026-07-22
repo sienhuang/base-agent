@@ -103,6 +103,7 @@ from base_agent.tools import (
     Tool,
     ToolContext,
     ToolExecutor,
+    ToolInvalidArgumentsError,
     ToolRegistry,
     tool,
 )
@@ -192,6 +193,7 @@ __all__ = [
     "ToolDefinition",
     "Tool",
     "ToolExecutor",
+    "ToolInvalidArgumentsError",
     "ToolRegistry",
     "ToolResult",
     "ToolResultStatus",

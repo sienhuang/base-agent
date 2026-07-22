@@ -42,6 +42,7 @@ All examples are deterministic and offline. Start with the
 - [Optional FastAPI Run Server](docs/SERVER.md)
 - [Optional PostgreSQL Persistence](docs/POSTGRES.md)
 - [Optional Redis Event Notifications](docs/REDIS.md)
+- [Optional MCP Tool Adapter](docs/MCP.md)
 - [Model Providers](docs/PROVIDERS.md)
 - [Reference Design Decisions](docs/REFERENCE_DESIGN.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
@@ -68,6 +69,12 @@ Cross-process event notifications can optionally use Redis:
 
 ```bash
 uv add 'base-agent[redis]'
+```
+
+Remote MCP tools use the official Python SDK through another optional boundary:
+
+```bash
+uv add 'base-agent[mcp]'
 ```
 
 ## Design goals

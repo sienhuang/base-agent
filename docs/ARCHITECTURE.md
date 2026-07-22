@@ -137,6 +137,14 @@ the run history.
 Domain skills remain with their domain applications. For example, build-lineage exposes atomic
 tools through an adapter while BI-WIKI owns lineage analysis and SQL repair skills.
 
+## MCP boundary
+
+MCP is a Tool transport, not a second Agent runtime. The optional MCP client discovers remote Tool
+definitions and maps them onto the existing `Tool` protocol. Model-facing names may be namespaced;
+arguments still pass local validation and permissions before a remote call. Session/subprocess
+lifecycle stays explicit in the host application's async context. MCP prompts, resources, sampling,
+and elicitation are not silently injected into the core runtime.
+
 ## Persistence boundary
 
 The core defines store protocols and ships in-memory implementations. The optional

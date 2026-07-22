@@ -9,6 +9,7 @@ from pydantic_core import to_jsonable_python
 
 from base_agent.models import ToolCall, ToolResult, ToolResultStatus, WaitForInput
 from base_agent.tools.context import ToolContext
+from base_agent.tools.errors import ToolInvalidArgumentsError
 from base_agent.tools.protocol import ContextualTool
 from base_agent.tools.registry import ToolRegistry
 
@@ -72,7 +73,7 @@ class ToolExecutor:
                 status=ToolResultStatus.SUCCESS,
                 data=to_jsonable_python(data),
             )
-        except ValidationError as exc:
+        except (ValidationError, ToolInvalidArgumentsError) as exc:
             return ToolResult(
                 tool_name=call.name,
                 status=ToolResultStatus.INVALID_ARGUMENTS,
