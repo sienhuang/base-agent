@@ -1,3 +1,5 @@
+from importlib.resources import files
+
 import base_agent
 from base_agent import Message, ModelProvider, ModelRequest, ModelResponse
 
@@ -8,3 +10,7 @@ def test_package_is_importable() -> None:
     assert ModelRequest is not None
     assert ModelResponse is not None
     assert ModelProvider is not None
+
+
+def test_package_declares_inline_types() -> None:
+    assert files("base_agent").joinpath("py.typed").is_file()

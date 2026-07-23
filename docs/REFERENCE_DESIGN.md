@@ -15,6 +15,9 @@ BI-WIKI ────┘
 Applications select Providers, Tools, Skills, stores, orchestration strategies, and infrastructure
 adapters. The core supplies stable contracts and lifecycle behavior.
 
+The copyable `starter/` is a downstream application example, not a nested runtime distribution. It
+depends on base-agent public APIs in the same direction as any external application.
+
 ## Lessons adopted from mock-manus
 
 - Separate background task control from Agent/Flow domain logic.

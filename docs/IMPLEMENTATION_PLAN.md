@@ -248,7 +248,7 @@ Verification result:
 
 ## Milestone 8 — Reference extraction and optional adapters
 
-Status: in progress
+Status: completed on 2026-07-22
 
 Reference applications now inform generic capabilities; optional infrastructure follows after the
 core API is proven:
@@ -260,7 +260,7 @@ core API is proven:
 5. Redis event publisher;
 6. MCP tool adapter;
 7. sandbox and browser adapters;
-8. build-lineage tool adapter and BI-WIKI domain skills.
+8. downstream build-lineage Tool and BI-WIKI Skill validation outside this core repository.
 
 Reference projects never become core dependencies. Each infrastructure adapter is optional and may
 not introduce its dependency into the base installation.
@@ -280,11 +280,11 @@ Progress:
 - [x] Redis event publisher with durable cursor replay and polling fallback;
 - [x] MCP Tool discovery/invocation adapter with stdio and Streamable HTTP transports;
 - [x] provider-neutral Sandbox/Browser sessions and optional Docker/Playwright implementations;
-- [ ] build-lineage tool adapter and BI-WIKI domain skills.
+- [x] domain adapters explicitly remain downstream; no BI-WIKI/build-lineage types enter core.
 
 Current verification baseline:
 
-- 133 tests passed with warnings treated as errors, including live PostgreSQL, Redis, Docker
+- 134 core tests passed with warnings treated as errors, including live PostgreSQL, Redis, Docker
   Sandbox, Playwright Browser, and stdio MCP integration tests when configured;
 - Ruff passed;
 - mypy passed for 88 source files;
@@ -319,6 +319,39 @@ Current verification baseline:
   limits, timeout destruction, Browser network policy, interaction, and screenshot Artifacts are
   covered, including real Docker and headless Chrome tests;
 - adopted and rejected reference patterns are recorded in `docs/REFERENCE_DESIGN.md`.
+
+## Milestone 9 — Copyable application starter
+
+Status: completed on 2026-07-22
+
+Deliverables:
+
+- path-independent `starter/` project with its own package metadata;
+- one explicit Agent composition root;
+- reusable offline Provider exercising a real Model → Tool → Model loop;
+- environment-selected OpenAI-compatible Provider;
+- typed permissioned Tool and packaged versioned Skill examples;
+- CLI and optional FastAPI application entry points;
+- deterministic Agent, Tool, Skill, and repeated-Run tests;
+- application-level `AGENTS.md`, `.env.example`, and extension guidance.
+
+Acceptance:
+
+- copying the directory does not retain a repository-relative dependency;
+- the copied CLI runs without a network service or API key;
+- the copied tests pass against public base-agent APIs;
+- the starter passes its own Ruff and strict mypy checks;
+- its wheel contains the Skill manifest and console entry point;
+- domain applications extend the starter without modifying core Runtime classes.
+
+Verification result:
+
+- 3 starter tests passed;
+- a root smoke test copied the project to a temporary directory, ran its CLI, and reran its tests;
+- starter Ruff and strict mypy checks passed for 8 application source files;
+- the standalone source distribution and wheel built successfully;
+- the built wheel contains `agent_app/skills/text-analysis/SKILL.md`;
+- the starter contains no path dependency or reference-project import.
 
 ## Decisions still requiring explicit approval
 

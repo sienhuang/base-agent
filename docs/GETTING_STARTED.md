@@ -59,6 +59,7 @@ See [Background Runs and Events](RUNS.md) for cancellation and cursor replay.
 
 ## Continue learning
 
+- [Copy the application starter](../starter/README.md)
 - [Writing Tools](TOOLS.md)
 - [Writing Skills](SKILLS.md)
 - [Testing Agents](TESTING.md)

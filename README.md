@@ -9,11 +9,10 @@ belong in optional adapters and applications built on top of the core.
 
 ## Project status
 
-Milestones 0 through 7 are complete. The core includes provider-neutral model contracts, typed
-tools, observable runs, cooperative cancellation, versioned Skills, composable supervision,
-offline examples, and focused component Harnesses. Milestone 8 is in progress: an optional
-OpenAI-compatible model Provider is available, while generic runtime capabilities and
-infrastructure integrations remain adapter work.
+Milestones 0 through 9 are complete. The project includes provider-neutral model contracts, typed
+Tools, observable Runs, cooperative cancellation, versioned Skills, composable supervision,
+durable/streaming infrastructure adapters, MCP, Sandbox and Browser boundaries, and a copyable
+application starter.
 
 The generic Runtime supports background Run handles, cursor-based live events, cooperative
 cancellation, checkpointed human-input suspension/resume, replaceable orchestration strategies,
@@ -45,6 +44,7 @@ All examples are deterministic and offline. Start with the
 - [Optional MCP Tool Adapter](docs/MCP.md)
 - [Sandbox Sessions and Docker Adapter](docs/SANDBOX.md)
 - [Browser Sessions and Playwright Adapter](docs/BROWSER.md)
+- [Copyable Agent Application Starter](starter/README.md)
 - [Model Providers](docs/PROVIDERS.md)
 - [Reference Design Decisions](docs/REFERENCE_DESIGN.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
@@ -95,6 +95,7 @@ uv add 'base-agent[browser]'
 - Support background execution and cursor-based live event observation without requiring a server.
 - Support deterministic tests without calling a real model.
 - Keep domain logic such as BI-WIKI and build-lineage outside the core.
+- Let a new application start by copying one small, path-independent project template.
 
 ## Non-goals
 
