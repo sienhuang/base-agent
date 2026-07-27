@@ -157,7 +157,7 @@ ModelProvider / Tool / Store / Resource / Memory / Browser / Sandbox Protocol
 | `resources/` | 执行期资源获取、缓存和逆序释放。 | [`manager.py`](../src/base_agent/resources/manager.py) |
 | `artifacts/` | 当前 Run 对 Attachment/Artifact 内容的受控访问。 | [`manager.py`](../src/base_agent/artifacts/manager.py) |
 | `memory/` | 可选检索契约、初始化和 Tool 查询入口。 | [`manager.py`](../src/base_agent/memory/manager.py) |
-| `stores/` | Run/Event/Checkpoint/Artifact Protocol 和内存实现。 | [`protocol.py`](../src/base_agent/stores/protocol.py) |
+| `stores/` | Store Protocol、内存默认实现及可选持久化适配器。 | [`protocol.py`](../src/base_agent/stores/protocol.py)、[`in_memory.py`](../src/base_agent/stores/in_memory.py) |
 | `providers/` | ModelProvider Protocol 和模型厂商适配器。 | [`protocol.py`](../src/base_agent/providers/protocol.py) |
 | `testing/` | FakeModel、ToolHarness、SkillHarness。 | [`fake_model.py`](../src/base_agent/testing/fake_model.py) |
 
@@ -167,8 +167,8 @@ ModelProvider / Tool / Store / Resource / Memory / Browser / Sandbox Protocol
 | --- | --- | --- |
 | `providers/openai_chat.py` | OpenAI-compatible Chat Completions | `base-agent[openai]` |
 | `server/` | FastAPI HTTP 与 SSE 映射 | `base-agent[server]` |
-| `postgres/` | Run/Event/Checkpoint/Artifact 持久化 | `base-agent[postgres]` |
-| `redis/` | 持久化 EventStore 上的低延迟 Pub/Sub 通知 | `base-agent[redis]` |
+| `stores/postgres/` | Run/Event/Checkpoint/Artifact 持久化 | `base-agent[postgres]` |
+| `stores/redis/` | 持久化 EventStore 上的低延迟 Pub/Sub 通知 | `base-agent[redis]` |
 | `mcp/` | MCP Tool 发现和调用 | `base-agent[mcp]` |
 | `sandbox/` | Sandbox Protocol、Tool 和 Docker 实现 | `base-agent[sandbox]` |
 | `browser/` | Browser Protocol、Tool 和 Playwright 实现 | `base-agent[browser]` |
@@ -759,8 +759,8 @@ BrowserSession 提供导航、快照、选择器交互和截图。Playwright 实
 | OpenAI Chat Completions | 已实现、能力有限 | `OpenAIChatProvider` |
 | 流式模型输出 | 尚未实现 | 需要新 Provider/Runtime 契约 |
 | FastAPI/SSE | 可选实现 | `base_agent.server` |
-| PostgreSQL 持久化 | 可选实现 | `base_agent.postgres` |
-| Redis 事件通知 | 可选实现 | `base_agent.redis` |
+| PostgreSQL 持久化 | 可选实现 | `base_agent.stores.postgres` |
+| Redis 事件通知 | 可选实现 | `base_agent.stores.redis` |
 | MCP Tool | 可选实现 | `base_agent.mcp` |
 | Docker Sandbox | 可选实现 | `base_agent.sandbox.docker` |
 | Playwright Browser | 可选实现 | `base_agent.browser.playwright` |

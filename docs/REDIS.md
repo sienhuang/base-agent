@@ -14,14 +14,14 @@ the authoritative events from the durable store by sequence cursor.
 uv add 'base-agent[redis]'
 ```
 
-Importing `base_agent` does not import redis-py. Only `base_agent.redis` requires the extra.
+Importing `base_agent` does not import redis-py. Only `base_agent.stores.redis` requires the extra.
 
 ## Combine Redis with PostgreSQL
 
 ```python
 from base_agent import Agent
-from base_agent.postgres import PostgresStore
-from base_agent.redis import RedisEventStore
+from base_agent.stores.postgres import PostgresStore
+from base_agent.stores.redis import RedisEventStore
 
 postgres = PostgresStore.from_url(
     "postgresql+asyncpg://agent:password@localhost/agents"

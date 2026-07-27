@@ -1,4 +1,4 @@
-"""Redis notifications layered over a durable EventStore."""
+"""Redis Store notifications layered over a durable EventStore."""
 
 from __future__ import annotations
 

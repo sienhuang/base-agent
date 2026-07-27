@@ -1,4 +1,4 @@
-"""SQLAlchemy Core schema for the optional PostgreSQL stores."""
+"""SQLAlchemy Core schema for the optional PostgreSQL Store adapter."""
 
 from __future__ import annotations
 

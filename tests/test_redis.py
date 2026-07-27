@@ -14,8 +14,8 @@ from base_agent import (
     ModelResponse,
     RuntimeEvent,
 )
-from base_agent.redis import RedisEventStore
 from base_agent.stores import EventStore, EventStream, InMemoryEventStore
+from base_agent.stores.redis import RedisEventStore
 from base_agent.testing import FakeModel
 
 REDIS_URL = os.getenv("BASE_AGENT_TEST_REDIS_URL")

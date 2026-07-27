@@ -20,8 +20,6 @@ from base_agent import (
     WaitForInput,
     tool,
 )
-from base_agent.postgres import PostgresStore
-from base_agent.postgres.schema import build_tables
 from base_agent.stores import (
     ArtifactStore,
     CheckpointNotFoundError,
@@ -33,6 +31,8 @@ from base_agent.stores import (
     RunNotCancellableError,
     RunStore,
 )
+from base_agent.stores.postgres import PostgresStore
+from base_agent.stores.postgres.schema import build_tables
 from base_agent.testing import FakeModel
 
 POSTGRES_DSN = os.getenv("BASE_AGENT_TEST_POSTGRES_DSN")

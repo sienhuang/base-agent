@@ -11,13 +11,13 @@ uv add 'base-agent[postgres]'
 ```
 
 The adapter uses SQLAlchemy's async engine with the asyncpg driver. Importing `base_agent` does not
-import either dependency; only `base_agent.postgres` requires this extra.
+import either dependency; only `base_agent.stores.postgres` requires this extra.
 
 ## Use
 
 ```python
 from base_agent import Agent
-from base_agent.postgres import PostgresStore
+from base_agent.stores.postgres import PostgresStore
 
 store = PostgresStore.from_url(
     "postgresql+asyncpg://agent:password@localhost/agents",

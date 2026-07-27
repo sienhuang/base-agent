@@ -63,8 +63,6 @@ src/base_agent/
 ├── orchestration/
 ├── resources/
 ├── server/             # optional FastAPI import boundary
-├── postgres/           # optional durable Store implementation
-├── redis/              # optional event notification implementation
 ├── mcp/                # optional remote Tool transport
 ├── sandbox/            # generic session/tools plus optional Docker module
 ├── browser/            # generic session/tools plus optional Playwright module
@@ -73,6 +71,9 @@ src/base_agent/
 ├── skills/
 ├── supervision/
 ├── stores/
+│   ├── in_memory.py    # dependency-free local Store implementations
+│   ├── postgres/       # optional durable Store implementation
+│   └── redis/          # optional event notification implementation
 └── testing/
 ```
 
@@ -159,11 +160,11 @@ and elicitation are not silently injected into the core runtime.
 ## Persistence boundary
 
 The core defines store protocols and ships in-memory implementations. The optional
-`base_agent.postgres.PostgresStore` implements Run, Event, Checkpoint, Attachment, and Artifact
+`base_agent.stores.postgres.PostgresStore` implements Run, Event, Checkpoint, Attachment, and Artifact
 ports without changing the runtime. Its polling `EventStream` supports the same cursor contract as
 the in-memory store, so the HTTP/SSE layer can use either implementation.
 
-`base_agent.redis.RedisEventStore` decorates a durable `EventStore`: it writes the event to that
+`base_agent.stores.redis.RedisEventStore` decorates a durable `EventStore`: it writes the event to that
 store first, then publishes a sequence notification. Subscribers always reconcile through the
 durable store. Redis therefore reduces cross-process delivery latency but is never the sole source
 of Run history, and missed Pub/Sub messages are repaired by cursor replay.

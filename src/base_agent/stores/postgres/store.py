@@ -26,7 +26,6 @@ from base_agent.models import (
     RuntimeEvent,
 )
 from base_agent.models.run import utc_now
-from base_agent.postgres.schema import PostgresTables, build_tables
 from base_agent.runtime.checkpoint import RuntimeCheckpoint
 from base_agent.stores.errors import (
     ArtifactNotFoundError,
@@ -41,6 +40,7 @@ from base_agent.stores.errors import (
     RunNotCancellableError,
     RunNotFoundError,
 )
+from base_agent.stores.postgres.schema import PostgresTables, build_tables
 
 
 class PostgresStore:

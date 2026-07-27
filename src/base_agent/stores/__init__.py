@@ -13,7 +13,7 @@ from base_agent.stores.errors import (
     RunNotCancellableError,
     RunNotFoundError,
 )
-from base_agent.stores.memory import (
+from base_agent.stores.in_memory import (
     InMemoryArtifactStore,
     InMemoryCheckpointStore,
     InMemoryConversationStore,

@@ -1,4 +1,4 @@
-"""Concurrency-safe in-memory stores used by local agents and tests."""
+"""Concurrency-safe in-memory Store adapters used by local agents and tests."""
 
 from __future__ import annotations
 
