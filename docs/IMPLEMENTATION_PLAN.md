@@ -269,6 +269,8 @@ Progress:
 
 - [x] OpenAI-compatible Chat Completions Provider;
 - [x] generic RunHandle and replayable live event subscription;
+- [x] Run-backed multi-Turn Conversations through the same `Agent.run()` path, with single-active
+  Turn concurrency, WAITING/resume continuity, bounded history injection, HTTP, and PostgreSQL;
 - [x] generic waiting state with resume/cancel transitions;
 - [x] resume input API, atomic checkpoint claim, and context restoration;
 - [x] generic orchestration strategy plus immutable plan/step models and lifecycle events;
@@ -284,15 +286,17 @@ Progress:
 
 Current verification baseline:
 
-- 134 core tests passed with warnings treated as errors, including live PostgreSQL, Redis, Docker
+- 145 core tests collected with warnings treated as errors, including live PostgreSQL, Redis, Docker
   Sandbox, Playwright Browser, and stdio MCP integration tests when configured;
 - Ruff passed;
-- mypy passed for 88 source files;
+- mypy passed for 89 source files;
 - source distribution and wheel built successfully;
 - the base wheel imports without the OpenAI SDK installed;
 - the wheel's `openai` extra installs the SDK and exposes `OpenAIChatProvider`;
 - Provider behavior is tested with an in-memory fake client and does not require a live API key;
 - the generic `WAITING` Run/Result state and its resume/cancel transitions are covered by tests;
+- standalone Runs remain isolated while Conversation Turns carry only completed user/assistant
+  history; active-Turn exclusion, profile ownership, trimming, cancellation, and resume are covered;
 - background Runs, live subscription, cursor replay, isolation, shielded waiting, and cancellation
   are covered without a server or queue;
 - Tool-driven suspension, serialized checkpoints, repeated waits, resume cursor continuation,
@@ -346,7 +350,7 @@ Acceptance:
 
 Verification result:
 
-- 3 starter tests passed;
+- 4 starter tests passed, including two linked Conversation Turns;
 - a root smoke test copied the project to a temporary directory, ran its CLI, and reran its tests;
 - starter Ruff and strict mypy checks passed for 8 application source files;
 - the standalone source distribution and wheel built successfully;

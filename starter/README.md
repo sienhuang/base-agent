@@ -9,6 +9,7 @@ small enough to understand in one sitting but includes the boundaries most Agent
 - a typed, permissioned example Tool;
 - a versioned Skill with an explicit allowlist;
 - an asynchronous CLI and optional FastAPI entry point;
+- Run-backed multi-Turn Conversations through the same `Agent.run()` path;
 - deterministic Tool, Skill, Agent, and repeated-Run tests.
 
 It contains no mock-manus, BI-WIKI, build-lineage, database, queue, browser, or Sandbox assumptions.
@@ -16,7 +17,13 @@ It contains no mock-manus, BI-WIKI, build-lineage, database, queue, browser, or 
 ## Copy it
 
 ```bash
-cp -R /path/to/base-agent/starter ./my-agent
+mkdir ./my-agent
+rsync -a \
+  --exclude '.venv*' \
+  --exclude '.uv-cache' \
+  --exclude 'dist' \
+  --exclude '.env' \
+  /path/to/base-agent/starter/ ./my-agent/
 cd ./my-agent
 ```
 
@@ -53,6 +60,14 @@ Offline starter completed the Tool loop: 3 words, 20 characters.
 ```
 
 The offline Provider is intentionally reusable across Runs and makes no network calls.
+
+Start an interactive Conversation:
+
+```bash
+uv run agent-app --chat --no-skill
+```
+
+Every user Turn creates a different Run linked to the same Conversation. Use `/exit` to stop.
 
 ## Test and check
 

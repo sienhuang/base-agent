@@ -17,7 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from base_agent.models import (
     Artifact,
     Attachment,
+    Conversation,
+    ConversationTurn,
     EventType,
+    Message,
     Run,
     RunStatus,
     RuntimeEvent,
@@ -29,6 +32,11 @@ from base_agent.stores.errors import (
     ArtifactNotFoundError,
     AttachmentNotFoundError,
     CheckpointNotFoundError,
+    ConversationAlreadyExistsError,
+    ConversationBusyError,
+    ConversationNotFoundError,
+    ConversationProfileMismatchError,
+    ConversationTurnNotFoundError,
     RunAlreadyExistsError,
     RunNotCancellableError,
     RunNotFoundError,
@@ -75,6 +83,190 @@ class PostgresStore:
     async def close(self) -> None:
         if self._owns_engine:
             await self.engine.dispose()
+
+    async def create_conversation(self, conversation: Conversation) -> None:
+        statement = insert(self.tables.conversations).values(
+            **_conversation_values(conversation)
+        )
+        try:
+            async with self.engine.begin() as connection:
+                await connection.execute(statement)
+        except IntegrityError as exc:
+            raise ConversationAlreadyExistsError(
+                f"conversation '{conversation.id}' already exists"
+            ) from exc
+
+    async def get_conversation(self, conversation_id: UUID) -> Conversation:
+        statement = select(self.tables.conversations.c.payload).where(
+            self.tables.conversations.c.id == conversation_id
+        )
+        async with self.engine.connect() as connection:
+            payload = (await connection.execute(statement)).scalar_one_or_none()
+        if payload is None:
+            raise ConversationNotFoundError(
+                f"conversation '{conversation_id}' was not found"
+            )
+        return Conversation.model_validate(payload)
+
+    async def begin_turn(
+        self,
+        conversation_id: UUID,
+        *,
+        run_id: UUID,
+        profile_id: str,
+        user_message: str,
+    ) -> tuple[ConversationTurn, tuple[Message, ...]]:
+        if not user_message.strip():
+            raise ValueError("user_message must not be empty")
+        async with self.engine.begin() as connection:
+            payload = (
+                await connection.execute(
+                    select(self.tables.conversations.c.payload)
+                    .where(self.tables.conversations.c.id == conversation_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if payload is None:
+                raise ConversationNotFoundError(
+                    f"conversation '{conversation_id}' was not found"
+                )
+            conversation = Conversation.model_validate(payload)
+            if conversation.profile_id != profile_id:
+                raise ConversationProfileMismatchError(
+                    f"conversation '{conversation_id}' belongs to profile "
+                    f"'{conversation.profile_id}', not '{profile_id}'"
+                )
+            if conversation.active_run_id is not None:
+                raise ConversationBusyError(
+                    f"conversation '{conversation_id}' already has active run "
+                    f"'{conversation.active_run_id}'"
+                )
+            turn_payloads = (
+                await connection.execute(
+                    select(self.tables.conversation_turns.c.payload)
+                    .where(
+                        self.tables.conversation_turns.c.conversation_id
+                        == conversation_id
+                    )
+                    .order_by(self.tables.conversation_turns.c.sequence)
+                )
+            ).scalars().all()
+            history = _conversation_messages(
+                tuple(ConversationTurn.model_validate(item) for item in turn_payloads)
+            )
+            turn = ConversationTurn(
+                conversation_id=conversation_id,
+                sequence=conversation.version + 1,
+                run_id=run_id,
+                user_message=user_message,
+            )
+            updated_conversation = conversation.model_copy(
+                update={
+                    "version": turn.sequence,
+                    "active_run_id": run_id,
+                    "updated_at": utc_now(),
+                },
+                deep=True,
+            )
+            await connection.execute(
+                insert(self.tables.conversation_turns).values(**_turn_values(turn))
+            )
+            await connection.execute(
+                update(self.tables.conversations)
+                .where(self.tables.conversations.c.id == conversation_id)
+                .values(**_conversation_values(updated_conversation))
+            )
+        return turn, history
+
+    async def finish_turn(
+        self,
+        conversation_id: UUID,
+        *,
+        run_id: UUID,
+        status: RunStatus,
+        assistant_message: str | None = None,
+    ) -> ConversationTurn:
+        if status in {RunStatus.CREATED, RunStatus.RUNNING}:
+            raise ValueError("Conversation Turn cannot finish in an active Run state")
+        async with self.engine.begin() as connection:
+            conversation_payload = (
+                await connection.execute(
+                    select(self.tables.conversations.c.payload)
+                    .where(self.tables.conversations.c.id == conversation_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if conversation_payload is None:
+                raise ConversationNotFoundError(
+                    f"conversation '{conversation_id}' was not found"
+                )
+            conversation = Conversation.model_validate(conversation_payload)
+            turn_payload = (
+                await connection.execute(
+                    select(self.tables.conversation_turns.c.payload)
+                    .where(
+                        self.tables.conversation_turns.c.conversation_id
+                        == conversation_id,
+                        self.tables.conversation_turns.c.run_id == run_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if turn_payload is None:
+                raise ConversationTurnNotFoundError(
+                    f"conversation '{conversation_id}' has no turn for run '{run_id}'"
+                )
+            if conversation.active_run_id != run_id:
+                raise ConversationBusyError(
+                    f"run '{run_id}' is not the active run for conversation "
+                    f"'{conversation_id}'"
+                )
+            normalized_message = assistant_message
+            if status is RunStatus.COMPLETED and normalized_message is None:
+                normalized_message = ""
+            turn = ConversationTurn.model_validate(turn_payload).model_copy(
+                update={
+                    "status": status,
+                    "assistant_message": normalized_message,
+                    "updated_at": utc_now(),
+                },
+                deep=True,
+            )
+            await connection.execute(
+                update(self.tables.conversation_turns)
+                .where(
+                    self.tables.conversation_turns.c.conversation_id == conversation_id,
+                    self.tables.conversation_turns.c.run_id == run_id,
+                )
+                .values(**_turn_values(turn))
+            )
+            if status is not RunStatus.WAITING:
+                updated_conversation = conversation.model_copy(
+                    update={"active_run_id": None, "updated_at": utc_now()},
+                    deep=True,
+                )
+                await connection.execute(
+                    update(self.tables.conversations)
+                    .where(self.tables.conversations.c.id == conversation_id)
+                    .values(**_conversation_values(updated_conversation))
+                )
+        return turn
+
+    async def list_turns(
+        self, conversation_id: UUID
+    ) -> tuple[ConversationTurn, ...]:
+        await self.get_conversation(conversation_id)
+        statement = (
+            select(self.tables.conversation_turns.c.payload)
+            .where(self.tables.conversation_turns.c.conversation_id == conversation_id)
+            .order_by(self.tables.conversation_turns.c.sequence)
+        )
+        async with self.engine.connect() as connection:
+            payloads = (await connection.execute(statement)).scalars().all()
+        return tuple(ConversationTurn.model_validate(payload) for payload in payloads)
+
+    async def messages(self, conversation_id: UUID) -> tuple[Message, ...]:
+        return _conversation_messages(await self.list_turns(conversation_id))
 
     async def create(self, run: Run) -> None:
         statement = insert(self.tables.runs).values(**_run_values(run))
@@ -407,3 +599,35 @@ def _run_values(run: Run) -> dict[str, Any]:
         "updated_at": run.updated_at,
         "payload": _model_payload(run),
     }
+
+
+def _conversation_values(conversation: Conversation) -> dict[str, Any]:
+    return {
+        "id": conversation.id,
+        "profile_id": conversation.profile_id,
+        "version": conversation.version,
+        "active_run_id": conversation.active_run_id,
+        "updated_at": conversation.updated_at,
+        "payload": _model_payload(conversation),
+    }
+
+
+def _turn_values(turn: ConversationTurn) -> dict[str, Any]:
+    return {
+        "conversation_id": turn.conversation_id,
+        "sequence": turn.sequence,
+        "run_id": turn.run_id,
+        "status": turn.status.value,
+        "updated_at": turn.updated_at,
+        "payload": _model_payload(turn),
+    }
+
+
+def _conversation_messages(turns: tuple[ConversationTurn, ...]) -> tuple[Message, ...]:
+    messages: list[Message] = []
+    for turn in turns:
+        if turn.status is not RunStatus.COMPLETED:
+            continue
+        messages.append(Message.user(turn.user_message))
+        messages.append(Message.assistant(turn.assistant_message or ""))
+    return tuple(messages)

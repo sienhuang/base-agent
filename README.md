@@ -10,7 +10,7 @@ belong in optional adapters and applications built on top of the core.
 ## Project status
 
 Milestones 0 through 9 are complete. The project includes provider-neutral model contracts, typed
-Tools, observable Runs, cooperative cancellation, versioned Skills, composable supervision,
+Tools, observable Runs, Run-backed multi-Turn Conversations, cooperative cancellation, versioned Skills, composable supervision,
 durable/streaming infrastructure adapters, MCP, Sandbox and Browser boundaries, and a copyable
 application starter.
 
@@ -30,10 +30,12 @@ uv run python examples/skill_agent/run.py
 All examples are deterministic and offline. Start with the
 [`Getting Started`](docs/GETTING_STARTED.md) guide, then continue with:
 
+- [中文架构与扩展指南](docs/ARCHITECTURE_GUIDE_ZH.md)
 - [Writing Tools](docs/TOOLS.md)
 - [Writing Skills](docs/SKILLS.md)
 - [Testing Agents](docs/TESTING.md)
 - [Background Runs and Events](docs/RUNS.md)
+- [Conversations and Run-backed Turns](docs/CONVERSATIONS.md)
 - [Orchestration Strategies and Plans](docs/ORCHESTRATION.md)
 - [Execution-scoped Resources](docs/RESOURCES.md)
 - [Attachments and Artifacts](docs/ARTIFACTS.md)
@@ -115,8 +117,8 @@ uv build
 
 ## Roadmap
 
-The incremental implementation plan and acceptance criteria live in
-[`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
+Open work is tracked in [`docs/TODO.md`](docs/TODO.md). Completed incremental milestones and their
+acceptance criteria remain in [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
 
 ## License
 

@@ -44,6 +44,23 @@ assert result.output == "Done"
 `FakeModel` is intentionally part of the supported developer API. Use it to make application tests
 deterministic before adding a real provider adapter.
 
+## Continue across user Turns
+
+Every Conversation Turn still uses the normal Run path:
+
+```python
+conversation = await agent.create_conversation()
+
+first = await agent.run("My name is Xiao Ming.", conversation_id=conversation.id)
+second = await agent.run("What is my name?", conversation_id=conversation.id)
+
+assert first.metadata["run_id"] != second.metadata["run_id"]
+assert second.metadata["turn_sequence"] == 2
+```
+
+See [Conversations and Run-backed Turns](CONVERSATIONS.md) for persistence, concurrency,
+WAITING/resume, history limits, and HTTP.
+
 ## Start a background Run
 
 ```python
@@ -64,6 +81,7 @@ See [Background Runs and Events](RUNS.md) for cancellation and cursor replay.
 - [Writing Skills](SKILLS.md)
 - [Testing Agents](TESTING.md)
 - [Background Runs and Events](RUNS.md)
+- [Conversations and Run-backed Turns](CONVERSATIONS.md)
 - [Model Providers](PROVIDERS.md)
 - [Reference Design Decisions](REFERENCE_DESIGN.md)
 - [Troubleshooting](TROUBLESHOOTING.md)

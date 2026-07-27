@@ -1,11 +1,13 @@
 """Durable aggregate describing one agent execution."""
 
+from __future__ import annotations
+
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from base_agent.models.artifact import Artifact, Attachment
 from base_agent.models.model import TokenUsage
@@ -33,6 +35,8 @@ class Run(BaseModel):
 
     id: UUID = Field(default_factory=uuid4)
     profile_id: str
+    conversation_id: UUID | None = None
+    turn_sequence: int | None = Field(default=None, ge=1)
     status: RunStatus = RunStatus.CREATED
     step_count: int = Field(default=0, ge=0)
     tool_call_count: int = Field(default=0, ge=0)
@@ -46,3 +50,11 @@ class Run(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     attachments: tuple[Attachment, ...] = ()
     artifacts: tuple[Artifact, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_conversation_link(self) -> Run:
+        if (self.conversation_id is None) != (self.turn_sequence is None):
+            raise ValueError(
+                "conversation_id and turn_sequence must be provided together"
+            )
+        return self

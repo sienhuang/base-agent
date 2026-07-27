@@ -28,6 +28,8 @@ class RuntimeContext:
 
     profile: AgentProfile
     messages: list[Message]
+    conversation_id: UUID | None = None
+    turn_sequence: int | None = None
     skills: tuple[Skill, ...] = ()
     enabled_tool_names: tuple[str, ...] = ()
     run_id: UUID = field(default_factory=uuid4)

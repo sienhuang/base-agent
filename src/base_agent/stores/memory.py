@@ -9,16 +9,169 @@ from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from base_agent.models import Artifact, Attachment, EventType, Run, RunStatus, RuntimeEvent
+from base_agent.models import (
+    Artifact,
+    Attachment,
+    Conversation,
+    ConversationTurn,
+    EventType,
+    Message,
+    Run,
+    RunStatus,
+    RuntimeEvent,
+)
 from base_agent.models.run import utc_now
 from base_agent.stores.errors import (
     ArtifactNotFoundError,
     AttachmentNotFoundError,
     CheckpointNotFoundError,
+    ConversationAlreadyExistsError,
+    ConversationBusyError,
+    ConversationNotFoundError,
+    ConversationProfileMismatchError,
+    ConversationTurnNotFoundError,
     RunAlreadyExistsError,
     RunNotCancellableError,
     RunNotFoundError,
 )
+
+
+class InMemoryConversationStore:
+    """Concurrency-safe Conversation history for local Agents and tests."""
+
+    def __init__(self) -> None:
+        self._conversations: dict[UUID, Conversation] = {}
+        self._turns: dict[UUID, list[ConversationTurn]] = defaultdict(list)
+        self._lock = asyncio.Lock()
+
+    async def create_conversation(self, conversation: Conversation) -> None:
+        async with self._lock:
+            if conversation.id in self._conversations:
+                raise ConversationAlreadyExistsError(
+                    f"conversation '{conversation.id}' already exists"
+                )
+            self._conversations[conversation.id] = conversation.model_copy(deep=True)
+
+    async def get_conversation(self, conversation_id: UUID) -> Conversation:
+        async with self._lock:
+            return self._get_locked(conversation_id).model_copy(deep=True)
+
+    async def begin_turn(
+        self,
+        conversation_id: UUID,
+        *,
+        run_id: UUID,
+        profile_id: str,
+        user_message: str,
+    ) -> tuple[ConversationTurn, tuple[Message, ...]]:
+        if not user_message.strip():
+            raise ValueError("user_message must not be empty")
+        async with self._lock:
+            conversation = self._get_locked(conversation_id)
+            if conversation.profile_id != profile_id:
+                raise ConversationProfileMismatchError(
+                    f"conversation '{conversation_id}' belongs to profile "
+                    f"'{conversation.profile_id}', not '{profile_id}'"
+                )
+            if conversation.active_run_id is not None:
+                raise ConversationBusyError(
+                    f"conversation '{conversation_id}' already has active run "
+                    f"'{conversation.active_run_id}'"
+                )
+            history = self._messages_locked(conversation_id)
+            turn = ConversationTurn(
+                conversation_id=conversation_id,
+                sequence=conversation.version + 1,
+                run_id=run_id,
+                user_message=user_message,
+            )
+            self._turns[conversation_id].append(turn)
+            self._conversations[conversation_id] = conversation.model_copy(
+                update={
+                    "version": turn.sequence,
+                    "active_run_id": run_id,
+                    "updated_at": utc_now(),
+                },
+                deep=True,
+            )
+            return turn.model_copy(deep=True), tuple(
+                message.model_copy(deep=True) for message in history
+            )
+
+    async def finish_turn(
+        self,
+        conversation_id: UUID,
+        *,
+        run_id: UUID,
+        status: RunStatus,
+        assistant_message: str | None = None,
+    ) -> ConversationTurn:
+        if status in {RunStatus.CREATED, RunStatus.RUNNING}:
+            raise ValueError("Conversation Turn cannot finish in an active Run state")
+        async with self._lock:
+            conversation = self._get_locked(conversation_id)
+            turns = self._turns[conversation_id]
+            index = next(
+                (index for index, turn in enumerate(turns) if turn.run_id == run_id),
+                None,
+            )
+            if index is None:
+                raise ConversationTurnNotFoundError(
+                    f"conversation '{conversation_id}' has no turn for run '{run_id}'"
+                )
+            if conversation.active_run_id != run_id:
+                raise ConversationBusyError(
+                    f"run '{run_id}' is not the active run for conversation "
+                    f"'{conversation_id}'"
+                )
+            normalized_message = assistant_message
+            if status is RunStatus.COMPLETED and normalized_message is None:
+                normalized_message = ""
+            updated = turns[index].model_copy(
+                update={
+                    "status": status,
+                    "assistant_message": normalized_message,
+                    "updated_at": utc_now(),
+                },
+                deep=True,
+            )
+            turns[index] = updated
+            if status is not RunStatus.WAITING:
+                self._conversations[conversation_id] = conversation.model_copy(
+                    update={"active_run_id": None, "updated_at": utc_now()},
+                    deep=True,
+                )
+            return updated.model_copy(deep=True)
+
+    async def list_turns(self, conversation_id: UUID) -> tuple[ConversationTurn, ...]:
+        async with self._lock:
+            self._get_locked(conversation_id)
+            return tuple(turn.model_copy(deep=True) for turn in self._turns[conversation_id])
+
+    async def messages(self, conversation_id: UUID) -> tuple[Message, ...]:
+        async with self._lock:
+            self._get_locked(conversation_id)
+            return tuple(
+                message.model_copy(deep=True)
+                for message in self._messages_locked(conversation_id)
+            )
+
+    def _get_locked(self, conversation_id: UUID) -> Conversation:
+        try:
+            return self._conversations[conversation_id]
+        except KeyError as exc:
+            raise ConversationNotFoundError(
+                f"conversation '{conversation_id}' was not found"
+            ) from exc
+
+    def _messages_locked(self, conversation_id: UUID) -> tuple[Message, ...]:
+        messages: list[Message] = []
+        for turn in self._turns[conversation_id]:
+            if turn.status is not RunStatus.COMPLETED:
+                continue
+            messages.append(Message.user(turn.user_message))
+            messages.append(Message.assistant(turn.assistant_message or ""))
+        return tuple(messages)
 
 
 class InMemoryArtifactStore:

@@ -1,7 +1,7 @@
 # Optional PostgreSQL Persistence
 
 `PostgresStore` is a durable implementation of the core `RunStore`, `EventStore`, `EventStream`,
-`CheckpointStore`, and `ArtifactStore` ports. The same instance can be passed directly to `Agent`;
+`CheckpointStore`, `ArtifactStore`, and `ConversationStore` ports. The same instance can be passed directly to `Agent`;
 there is no PostgreSQL-specific Agent subclass or application adapter.
 
 ## Install
@@ -33,6 +33,7 @@ agent = Agent(
     event_store=store,
     checkpoint_store=store,
     artifact_store=store,
+    conversation_store=store,
 )
 
 try:
@@ -48,6 +49,8 @@ schema must already exist.
 ## Durability and concurrency
 
 - Run snapshots and immutable ordered events are stored as JSONB with indexed state columns.
+- Conversations and Run-backed Turns are stored in `base_agent_conversations` and
+  `base_agent_conversation_turns`; row locking permits only one active Turn per Conversation.
 - Emitting an event locks its Run row while assigning the next sequence number. Concurrent writers
   therefore produce one contiguous sequence per Run.
 - Checkpoint `claim()` uses `DELETE ... RETURNING`; only one concurrent resume can acquire it.

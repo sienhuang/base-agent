@@ -6,7 +6,17 @@ from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from uuid import UUID
 
-from base_agent.models import Artifact, Attachment, EventType, Run, RuntimeEvent
+from base_agent.models import (
+    Artifact,
+    Attachment,
+    Conversation,
+    ConversationTurn,
+    EventType,
+    Message,
+    Run,
+    RunStatus,
+    RuntimeEvent,
+)
 
 if TYPE_CHECKING:
     from base_agent.runtime.checkpoint import RuntimeCheckpoint
@@ -23,6 +33,37 @@ class RunStore(Protocol):
     async def request_cancel(self, run_id: UUID) -> Run: ...
 
     async def is_cancel_requested(self, run_id: UUID) -> bool: ...
+
+
+@runtime_checkable
+class ConversationStore(Protocol):
+    """Ordered multi-Run history with an atomic single-active-Turn boundary."""
+
+    async def create_conversation(self, conversation: Conversation) -> None: ...
+
+    async def get_conversation(self, conversation_id: UUID) -> Conversation: ...
+
+    async def begin_turn(
+        self,
+        conversation_id: UUID,
+        *,
+        run_id: UUID,
+        profile_id: str,
+        user_message: str,
+    ) -> tuple[ConversationTurn, tuple[Message, ...]]: ...
+
+    async def finish_turn(
+        self,
+        conversation_id: UUID,
+        *,
+        run_id: UUID,
+        status: RunStatus,
+        assistant_message: str | None = None,
+    ) -> ConversationTurn: ...
+
+    async def list_turns(self, conversation_id: UUID) -> tuple[ConversationTurn, ...]: ...
+
+    async def messages(self, conversation_id: UUID) -> tuple[Message, ...]: ...
 
 
 @runtime_checkable

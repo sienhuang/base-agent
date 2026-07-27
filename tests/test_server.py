@@ -73,6 +73,91 @@ async def test_server_starts_queries_and_replays_a_completed_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_server_conversation_runs_share_history_through_the_normal_run_api() -> None:
+    model = FakeModel(
+        [
+            ModelResponse(content="Hello Xiao Ming."),
+            ModelResponse(content="Your name is Xiao Ming."),
+        ]
+    )
+    agent = Agent(
+        profile=AgentProfile(id="conversation-server", instructions="Remember."),
+        model=model,
+    )
+
+    async with server_client(agent) as (client, _):
+        created = await client.post(
+            "/v1/conversations",
+            json={"metadata": {"tenant": "demo"}},
+        )
+        assert created.status_code == 201
+        conversation_id = created.json()["id"]
+
+        first = await client.post(
+            "/v1/runs",
+            json={
+                "prompt": "My name is Xiao Ming.",
+                "conversation_id": conversation_id,
+            },
+        )
+        await wait_for_status(client, first.json()["run_id"], RunStatus.COMPLETED)
+        second = await client.post(
+            f"/v1/conversations/{conversation_id}/runs",
+            json={"prompt": "What is my name?"},
+        )
+        await wait_for_status(client, second.json()["run_id"], RunStatus.COMPLETED)
+        conversation = await client.get(f"/v1/conversations/{conversation_id}")
+        turns = await client.get(f"/v1/conversations/{conversation_id}/turns")
+        messages = await client.get(f"/v1/conversations/{conversation_id}/messages")
+
+        assert first.status_code == 202
+        assert first.json()["turn_sequence"] == 1
+        assert second.status_code == 202
+        assert second.json()["turn_sequence"] == 2
+        assert conversation.json()["version"] == 2
+        assert conversation.json()["active_run_id"] is None
+        assert [turn["sequence"] for turn in turns.json()] == [1, 2]
+        assert [message["content"] for message in messages.json()] == [
+            "My name is Xiao Ming.",
+            "Hello Xiao Ming.",
+            "What is my name?",
+            "Your name is Xiao Ming.",
+        ]
+        assert [message.content for message in model.requests[1].messages] == [
+            "Remember.",
+            "My name is Xiao Ming.",
+            "Hello Xiao Ming.",
+            "What is my name?",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_server_rejects_overlapping_conversation_runs() -> None:
+    model = ControlledModel()
+    agent = Agent(
+        profile=AgentProfile(id="conversation-busy", instructions="Work."),
+        model=model,
+    )
+
+    async with server_client(agent) as (client, _):
+        conversation_id = (await client.post("/v1/conversations", json={})).json()["id"]
+        first = await client.post(
+            "/v1/runs",
+            json={"prompt": "first", "conversation_id": conversation_id},
+        )
+        await model.started.wait()
+        overlapping = await client.post(
+            "/v1/runs",
+            json={"prompt": "second", "conversation_id": conversation_id},
+        )
+        model.release.set()
+        await wait_for_status(client, first.json()["run_id"], RunStatus.COMPLETED)
+
+        assert overlapping.status_code == 409
+        assert "already has active run" in overlapping.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_sse_stream_supports_query_and_last_event_id_cursors() -> None:
     agent = Agent(
         profile=AgentProfile(id="sse", instructions="Work."),
@@ -138,9 +223,16 @@ async def test_server_resumes_a_waiting_run_and_reports_conflicts() -> None:
     )
 
     async with server_client(agent) as (client, _):
-        started = await client.post("/v1/runs", json={"prompt": "report"})
+        conversation_id = (
+            await client.post("/v1/conversations", json={})
+        ).json()["id"]
+        started = await client.post(
+            "/v1/runs",
+            json={"prompt": "report", "conversation_id": conversation_id},
+        )
         run_id = started.json()["run_id"]
         waiting = await wait_for_status(client, run_id, RunStatus.WAITING)
+        active = await client.get(f"/v1/conversations/{conversation_id}")
         resumed = await client.post(
             f"/v1/runs/{run_id}/resume", json={"input": "APAC"}
         )
@@ -149,10 +241,17 @@ async def test_server_resumes_a_waiting_run_and_reports_conflicts() -> None:
         )
 
         assert waiting["metadata"]["pending_input"]["prompt"] == "Region?"
+        assert active.json()["active_run_id"] == run_id
         assert resumed.status_code == 200
         assert resumed.json()["status"] == "completed"
         assert resumed.json()["output"] == "Using APAC."
         assert duplicate.status_code == 409
+        turns = (await client.get(f"/v1/conversations/{conversation_id}/turns")).json()
+        conversation = (await client.get(f"/v1/conversations/{conversation_id}")).json()
+        assert len(turns) == 1
+        assert turns[0]["run_id"] == run_id
+        assert turns[0]["status"] == "completed"
+        assert conversation["active_run_id"] is None
 
 
 class ControlledModel:

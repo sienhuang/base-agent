@@ -26,12 +26,14 @@ class RunTaskManager:
         self,
         prompt: str,
         *,
+        conversation_id: UUID | None = None,
         skills: Iterable[str] = (),
         attachments: Iterable[Attachment] = (),
         plan: ExecutionPlan | None = None,
     ) -> RunHandle:
         handle = await self.agent.start(
             prompt,
+            conversation_id=conversation_id,
             skills=skills,
             attachments=attachments,
             plan=plan,

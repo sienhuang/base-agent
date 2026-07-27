@@ -30,6 +30,11 @@ The default prefix is `/v1`:
 | Method | Path | Behavior |
 | --- | --- | --- |
 | `POST` | `/v1/runs` | Start a background Run and return `202`. |
+| `POST` | `/v1/conversations` | Create a Conversation and return `201`. |
+| `GET` | `/v1/conversations/{conversation_id}` | Return Conversation state. |
+| `GET` | `/v1/conversations/{conversation_id}/turns` | List Run-backed Turns. |
+| `GET` | `/v1/conversations/{conversation_id}/messages` | List committed user/assistant history. |
+| `POST` | `/v1/conversations/{conversation_id}/runs` | Start the next Turn through the normal Run path. |
 | `GET` | `/v1/runs/{run_id}` | Return the durable Run snapshot. |
 | `POST` | `/v1/runs/{run_id}/cancel` | Request cooperative cancellation. |
 | `POST` | `/v1/runs/{run_id}/resume` | Supply pending human input and continue. |
@@ -47,6 +52,9 @@ Start requests accept structured references, not inline binary payloads:
   "attachment_ids": ["2d82ad67-f683-4993-97db-4310f19b15d8"]
 }
 ```
+
+`POST /v1/runs` also accepts an optional `conversation_id`. The path-scoped Conversation Run route
+is a semantic alias and uses the same `Agent.start()` and `RunTaskManager` implementation.
 
 The referenced Attachments must already exist in the Agent's ArtifactStore. Upload policy,
 malware scanning, size limits, tenant ownership, and retention remain application concerns.

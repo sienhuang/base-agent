@@ -13,13 +13,29 @@ from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.responses import StreamingResponse
 
 from base_agent.agent import Agent
-from base_agent.models import AgentResult, Artifact, Run, RuntimeEvent
-from base_agent.server.schemas import ResumeRunRequest, StartRunRequest, StartRunResponse
+from base_agent.models import (
+    AgentResult,
+    Artifact,
+    Conversation,
+    ConversationTurn,
+    Message,
+    Run,
+    RuntimeEvent,
+)
+from base_agent.server.schemas import (
+    CreateConversationRequest,
+    ResumeRunRequest,
+    StartRunRequest,
+    StartRunResponse,
+)
 from base_agent.server.tasks import RunTaskManager
 from base_agent.stores import EventStream
 from base_agent.stores.errors import (
     ArtifactNotFoundError,
     AttachmentNotFoundError,
+    ConversationBusyError,
+    ConversationNotFoundError,
+    ConversationProfileMismatchError,
     RunNotCancellableError,
     RunNotFoundError,
 )
@@ -49,12 +65,21 @@ def create_app(
     app.state.agent = agent
     app.state.run_tasks = tasks
 
-    @app.post(
-        f"{route_prefix}/runs",
-        response_model=StartRunResponse,
-        status_code=status.HTTP_202_ACCEPTED,
-    )
-    async def start_run(payload: StartRunRequest) -> StartRunResponse:
+    async def start_run_from_payload(
+        payload: StartRunRequest,
+        *,
+        conversation_id: UUID | None = None,
+    ) -> StartRunResponse:
+        resolved_conversation_id = conversation_id or payload.conversation_id
+        if (
+            conversation_id is not None
+            and payload.conversation_id is not None
+            and conversation_id != payload.conversation_id
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="path and payload conversation_id must match",
+            )
         try:
             attachments = tuple(
                 [
@@ -64,6 +89,7 @@ def create_app(
             )
             handle = await tasks.start(
                 payload.prompt,
+                conversation_id=resolved_conversation_id,
                 skills=payload.skills,
                 attachments=attachments,
                 plan=payload.plan,
@@ -71,9 +97,79 @@ def create_app(
             run = await handle.get_run()
         except AttachmentNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConversationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ConversationBusyError, ConversationProfileMismatchError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return StartRunResponse(run_id=handle.run_id, status=run.status)
+        return StartRunResponse(
+            run_id=handle.run_id,
+            status=run.status,
+            conversation_id=run.conversation_id,
+            turn_sequence=run.turn_sequence,
+        )
+
+    @app.post(
+        f"{route_prefix}/conversations",
+        response_model=Conversation,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_conversation(payload: CreateConversationRequest) -> Conversation:
+        return await agent.create_conversation(metadata=payload.metadata)
+
+    @app.get(
+        f"{route_prefix}/conversations/{{conversation_id}}",
+        response_model=Conversation,
+    )
+    async def get_conversation(conversation_id: UUID) -> Conversation:
+        try:
+            return await agent.get_conversation(conversation_id)
+        except ConversationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get(
+        f"{route_prefix}/conversations/{{conversation_id}}/turns",
+        response_model=tuple[ConversationTurn, ...],
+    )
+    async def list_conversation_turns(
+        conversation_id: UUID,
+    ) -> tuple[ConversationTurn, ...]:
+        try:
+            return await agent.conversation_turns(conversation_id)
+        except ConversationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get(
+        f"{route_prefix}/conversations/{{conversation_id}}/messages",
+        response_model=tuple[Message, ...],
+    )
+    async def list_conversation_messages(
+        conversation_id: UUID,
+    ) -> tuple[Message, ...]:
+        try:
+            return await agent.conversation_messages(conversation_id)
+        except ConversationNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post(
+        f"{route_prefix}/runs",
+        response_model=StartRunResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def start_run(payload: StartRunRequest) -> StartRunResponse:
+        return await start_run_from_payload(payload)
+
+    @app.post(
+        f"{route_prefix}/conversations/{{conversation_id}}/runs",
+        response_model=StartRunResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def start_conversation_run(
+        conversation_id: UUID,
+        payload: StartRunRequest,
+    ) -> StartRunResponse:
+        return await start_run_from_payload(payload, conversation_id=conversation_id)
 
     @app.get(f"{route_prefix}/runs/{{run_id}}", response_model=Run)
     async def get_run(run_id: UUID) -> Run:

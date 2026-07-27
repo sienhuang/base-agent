@@ -1,7 +1,7 @@
 import asyncio
 import os
 from collections.abc import AsyncIterator
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -9,6 +9,8 @@ from base_agent import (
     Agent,
     AgentProfile,
     AgentResultStatus,
+    Conversation,
+    ConversationStore,
     EventType,
     ModelResponse,
     Run,
@@ -24,6 +26,7 @@ from base_agent.stores import (
     ArtifactStore,
     CheckpointNotFoundError,
     CheckpointStore,
+    ConversationBusyError,
     EventStore,
     EventStream,
     RunAlreadyExistsError,
@@ -181,3 +184,112 @@ async def test_agent_wait_resume_checkpoint_and_event_stream_are_durable() -> No
         assert resumed_events[-1].type is EventType.RUN_COMPLETED
         with pytest.raises(CheckpointNotFoundError):
             await store.load(run_id)
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_conversation_turns_history_and_waiting_resume_are_durable() -> None:
+    assert POSTGRES_DSN is not None
+    model = FakeModel(
+        [
+            ModelResponse(content="Hello Xiao Ming."),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id="region-call",
+                        name="request_region",
+                        arguments={"question": "Which region?"},
+                    ),
+                )
+            ),
+            ModelResponse(content="Using APAC."),
+        ]
+    )
+    first_store = PostgresStore.from_url(POSTGRES_DSN, poll_interval=0.01)
+    await first_store.create_schema()
+    first_agent = Agent(
+        profile=AgentProfile(
+            id="postgres-conversation",
+            instructions="Remember prior turns.",
+            tools=("request_region",),
+        ),
+        model=model,
+        tools=(request_region,),
+        run_store=first_store,
+        event_store=first_store,
+        checkpoint_store=first_store,
+        artifact_store=first_store,
+        conversation_store=first_store,
+    )
+    try:
+        assert isinstance(first_store, ConversationStore)
+        conversation = await first_agent.create_conversation()
+        await first_agent.run("My name is Xiao Ming.", conversation_id=conversation.id)
+        waiting = await first_agent.run("Build report", conversation_id=conversation.id)
+        waiting_run_id = UUID(waiting.metadata["run_id"])
+        assert waiting.status is AgentResultStatus.WAITING
+    finally:
+        await first_store.close()
+
+    reopened = PostgresStore.from_url(POSTGRES_DSN, poll_interval=0.01)
+    resumed_agent = Agent(
+        profile=AgentProfile(
+            id="postgres-conversation",
+            instructions="Remember prior turns.",
+            tools=("request_region",),
+        ),
+        model=model,
+        tools=(request_region,),
+        run_store=reopened,
+        event_store=reopened,
+        checkpoint_store=reopened,
+        artifact_store=reopened,
+        conversation_store=reopened,
+    )
+    try:
+        assert (await reopened.get_conversation(conversation.id)).active_run_id == waiting_run_id
+        completed = await resumed_agent.resume(waiting_run_id, "APAC")
+        turns = await reopened.list_turns(conversation.id)
+        messages = await reopened.messages(conversation.id)
+
+        assert completed.status is AgentResultStatus.COMPLETED
+        assert [turn.sequence for turn in turns] == [1, 2]
+        assert [turn.status for turn in turns] == [
+            RunStatus.COMPLETED,
+            RunStatus.COMPLETED,
+        ]
+        assert len(messages) == 4
+        assert (await reopened.get_conversation(conversation.id)).active_run_id is None
+        assert [message.content for message in model.requests[1].messages[:4]] == [
+            "Remember prior turns.",
+            "My name is Xiao Ming.",
+            "Hello Xiao Ming.",
+            "Build report",
+        ]
+    finally:
+        await reopened.close()
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_postgres_serializes_concurrent_conversation_turns() -> None:
+    async for store in open_store():
+        conversation = Conversation(profile_id="postgres-serial")
+        await store.create_conversation(conversation)
+        run_ids = (uuid4(), uuid4())
+
+        results = await asyncio.gather(
+            *(
+                store.begin_turn(
+                    conversation.id,
+                    run_id=run_id,
+                    profile_id="postgres-serial",
+                    user_message="work",
+                )
+                for run_id in run_ids
+            ),
+            return_exceptions=True,
+        )
+
+        assert sum(not isinstance(result, Exception) for result in results) == 1
+        assert sum(isinstance(result, ConversationBusyError) for result in results) == 1

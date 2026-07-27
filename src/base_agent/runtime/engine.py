@@ -15,7 +15,9 @@ from base_agent.models import (
     ExecutionPlan,
     MemoryFailureMode,
     Message,
+    MessageRole,
     Run,
+    RunStatus,
     ToolResult,
     ToolResultStatus,
 )
@@ -36,6 +38,7 @@ from base_agent.skills import Skill
 from base_agent.stores import (
     ArtifactStore,
     CheckpointStore,
+    ConversationStore,
     EventStore,
     InMemoryArtifactStore,
     InMemoryCheckpointStore,
@@ -59,6 +62,9 @@ class AgentRuntime:
         prompt: str,
         *,
         run_id: UUID | None = None,
+        conversation_id: UUID | None = None,
+        turn_sequence: int | None = None,
+        conversation_history: tuple[Message, ...] = (),
         skills: tuple[Skill, ...] = (),
         enabled_tool_names: tuple[str, ...] | None = None,
         plan: ExecutionPlan | None = None,
@@ -68,12 +74,26 @@ class AgentRuntime:
             raise ValueError("prompt must not be empty")
         if len({attachment.id for attachment in attachments}) != len(attachments):
             raise ValueError("attachments must be unique")
+        if any(
+            message.role not in {MessageRole.USER, MessageRole.ASSISTANT}
+            for message in conversation_history
+        ):
+            raise ValueError(
+                "conversation history may contain only user and assistant messages"
+            )
+        if (conversation_id is None) != (turn_sequence is None):
+            raise ValueError(
+                "conversation_id and turn_sequence must be provided together"
+            )
         context = RuntimeContext(
             profile=profile,
             messages=[
                 Message.system(self._compose_instructions(profile, skills)),
+                *conversation_history,
                 Message.user(prompt),
             ],
+            conversation_id=conversation_id,
+            turn_sequence=turn_sequence,
             skills=skills,
             enabled_tool_names=(
                 profile.tools if enabled_tool_names is None else enabled_tool_names
@@ -112,6 +132,7 @@ class AgentRuntime:
         run_store: RunStore | None = None,
         event_store: EventStore | None = None,
         checkpoint_store: CheckpointStore | None = None,
+        conversation_store: ConversationStore | None = None,
         supervisor: Supervisor | None = None,
         resume_input: str | None = None,
         resource_specs: tuple[ResourceSpec, ...] = (),
@@ -219,6 +240,17 @@ class AgentRuntime:
             await active_checkpoint_store.save(RuntimeCheckpoint.from_context(context))
         else:
             await active_checkpoint_store.delete(context.run_id)
+        if context.conversation_id is not None:
+            if conversation_store is None:
+                raise ValueError(
+                    "conversation_store is required for a Conversation Run"
+                )
+            await conversation_store.finish_turn(
+                context.conversation_id,
+                run_id=context.run_id,
+                status=RunStatus(context.state.value),
+                assistant_message=context.output,
+            )
         await self._finalize_run(context, active_run_store, active_event_store)
         return result
 
@@ -274,13 +306,25 @@ class AgentRuntime:
         run = Run(
             id=context.run_id,
             profile_id=context.profile.id,
+            conversation_id=context.conversation_id,
+            turn_sequence=context.turn_sequence,
             skills=tuple(skill.manifest.reference() for skill in context.skills),
             attachments=context.attachments,
             artifacts=tuple(context.artifacts),
         )
         await run_store.create(run)
         await event_store.emit(
-            context.run_id, EventType.RUN_CREATED, {"profile_id": context.profile.id}
+            context.run_id,
+            EventType.RUN_CREATED,
+            {
+                "profile_id": context.profile.id,
+                "conversation_id": (
+                    str(context.conversation_id)
+                    if context.conversation_id is not None
+                    else None
+                ),
+                "turn_sequence": context.turn_sequence,
+            },
         )
         for selected_skill in context.skills:
             skill_data = {
@@ -388,6 +432,12 @@ class AgentRuntime:
             artifacts=tuple(context.artifacts),
             metadata={
                 "run_id": str(context.run_id),
+                "conversation_id": (
+                    str(context.conversation_id)
+                    if context.conversation_id is not None
+                    else None
+                ),
+                "turn_sequence": context.turn_sequence,
                 "steps": context.step_count,
                 "tool_calls": context.tool_call_count,
                 "provider": context.provider_name,

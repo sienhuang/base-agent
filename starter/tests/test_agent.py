@@ -33,3 +33,18 @@ async def test_offline_provider_is_reusable_across_runs() -> None:
     assert first.status is AgentResultStatus.COMPLETED
     assert second.status is AgentResultStatus.COMPLETED
     assert first.output != second.output
+
+
+@pytest.mark.asyncio
+async def test_offline_agent_supports_run_backed_conversation_turns() -> None:
+    agent = build_agent(Settings(provider="offline"))
+    conversation = await agent.create_conversation()
+
+    first = await agent.run("my name is Xiao Ming", conversation_id=conversation.id)
+    second = await agent.run("what is my name", conversation_id=conversation.id)
+    turns = await agent.conversation_turns(conversation.id)
+
+    assert [turn.sequence for turn in turns] == [1, 2]
+    assert turns[0].run_id != turns[1].run_id
+    assert second.messages[1].content == "my name is Xiao Ming"
+    assert second.messages[2].content == first.output

@@ -16,6 +16,10 @@ result = await handle.result()
 record exists. `RunHandle` is deliberately independent of FastAPI, SSE, Redis, and task queues.
 Applications may map it onto those transports without changing Agent or Runtime code.
 
+Passing `conversation_id` does not change these Run semantics. It atomically assigns the Run as the
+next Conversation Turn and injects completed prior Turn history. See
+[Conversations and Run-backed Turns](CONVERSATIONS.md).
+
 ## Handle operations
 
 - `result()` waits for the `AgentResult`. Cancelling this waiter does not cancel the Run.

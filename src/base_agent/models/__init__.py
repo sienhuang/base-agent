@@ -1,6 +1,7 @@
 """Provider-neutral models used by the public runtime API."""
 
 from base_agent.models.artifact import Artifact, Attachment
+from base_agent.models.conversation import Conversation, ConversationTurn
 from base_agent.models.event import EventType, RuntimeEvent
 from base_agent.models.input import PendingInput, WaitForInput
 from base_agent.models.memory import (
@@ -34,6 +35,8 @@ __all__ = [
     "AgentResultStatus",
     "Artifact",
     "Attachment",
+    "Conversation",
+    "ConversationTurn",
     "EventType",
     "ExecutionPlan",
     "InvalidPlanTransitionError",

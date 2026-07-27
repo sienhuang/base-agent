@@ -34,6 +34,8 @@ class RuntimeCheckpoint(BaseModel):
     run_id: UUID
     profile: AgentProfile
     messages: tuple[Message, ...]
+    conversation_id: UUID | None = None
+    turn_sequence: int | None = None
     skills: tuple[Skill, ...] = ()
     enabled_tool_names: tuple[str, ...] = ()
     state: RunStatus = RunStatus.WAITING
@@ -69,6 +71,8 @@ class RuntimeCheckpoint(BaseModel):
             run_id=context.run_id,
             profile=context.profile,
             messages=tuple(context.messages),
+            conversation_id=context.conversation_id,
+            turn_sequence=context.turn_sequence,
             skills=context.skills,
             enabled_tool_names=context.enabled_tool_names,
             state=context.state,
@@ -98,6 +102,8 @@ class RuntimeCheckpoint(BaseModel):
         return RuntimeContext(
             profile=self.profile,
             messages=list(self.messages),
+            conversation_id=self.conversation_id,
+            turn_sequence=self.turn_sequence,
             skills=self.skills,
             enabled_tool_names=self.enabled_tool_names,
             run_id=self.run_id,

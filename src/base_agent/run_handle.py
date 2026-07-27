@@ -7,7 +7,13 @@ from uuid import UUID
 
 from base_agent.models import AgentResult, EventType, Run, RunStatus, RuntimeEvent
 from base_agent.models.run import utc_now
-from base_agent.stores import CheckpointStore, EventStore, EventStream, RunStore
+from base_agent.stores import (
+    CheckpointStore,
+    ConversationStore,
+    EventStore,
+    EventStream,
+    RunStore,
+)
 
 
 class EventStreamingNotSupportedError(RuntimeError):
@@ -23,6 +29,7 @@ class RunHandle:
     _run_store: RunStore
     _event_store: EventStore
     _checkpoint_store: CheckpointStore
+    _conversation_store: ConversationStore | None = None
 
     @property
     def done(self) -> bool:
@@ -39,6 +46,7 @@ class RunHandle:
             run_store=self._run_store,
             event_store=self._event_store,
             checkpoint_store=self._checkpoint_store,
+            conversation_store=self._conversation_store,
         )
 
     async def get_run(self) -> Run:
@@ -62,6 +70,7 @@ async def request_cancellation(
     run_store: RunStore,
     event_store: EventStore,
     checkpoint_store: CheckpointStore,
+    conversation_store: ConversationStore | None = None,
 ) -> Run:
     """Cancel active work, immediately finalizing a suspended Run."""
     existing = await run_store.get(run_id)
@@ -76,6 +85,12 @@ async def request_cancellation(
         },
         deep=True,
     )
+    if cancelled.conversation_id is not None and conversation_store is not None:
+        await conversation_store.finish_turn(
+            cancelled.conversation_id,
+            run_id=run_id,
+            status=RunStatus.CANCELLED,
+        )
     await run_store.save(cancelled)
     await checkpoint_store.delete(run_id)
     await event_store.emit(

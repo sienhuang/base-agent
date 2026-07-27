@@ -10,8 +10,11 @@ from base_agent.models import (
     AgentResult,
     Artifact,
     Attachment,
+    Conversation,
+    ConversationTurn,
     ExecutionPlan,
     MemoryFailureMode,
+    Message,
     Run,
     RunStatus,
     RuntimeEvent,
@@ -29,9 +32,11 @@ from base_agent.skills import (
 from base_agent.stores import (
     ArtifactStore,
     CheckpointStore,
+    ConversationStore,
     EventStore,
     InMemoryArtifactStore,
     InMemoryCheckpointStore,
+    InMemoryConversationStore,
     InMemoryEventStore,
     InMemoryRunStore,
     RunStore,
@@ -54,6 +59,7 @@ class Agent:
         run_store: RunStore | None = None,
         event_store: EventStore | None = None,
         checkpoint_store: CheckpointStore | None = None,
+        conversation_store: ConversationStore | None = None,
         skill_registry: SkillRegistry | None = None,
         supervisor: Supervisor | None = None,
         resources: Iterable[ResourceSpec] = (),
@@ -62,6 +68,7 @@ class Agent:
         memory_limit: int = 5,
         memory_namespace: str | None = None,
         memory_failure_mode: MemoryFailureMode = MemoryFailureMode.BEST_EFFORT,
+        conversation_history_limit: int = 40,
     ) -> None:
         self.profile = profile
         self.model = model
@@ -72,6 +79,7 @@ class Agent:
         self.run_store = run_store or InMemoryRunStore()
         self.event_store = event_store or InMemoryEventStore()
         self.checkpoint_store = checkpoint_store or InMemoryCheckpointStore()
+        self.conversation_store = conversation_store or InMemoryConversationStore()
         self.skill_registry = skill_registry or SkillRegistry()
         for skill_name in profile.skills:
             self.skill_registry.manifest(skill_name)
@@ -86,44 +94,82 @@ class Agent:
         self.memory_limit = memory_limit
         self.memory_namespace = memory_namespace
         self.memory_failure_mode = memory_failure_mode
+        if conversation_history_limit < 2 or conversation_history_limit % 2:
+            raise ValueError(
+                "conversation_history_limit must be an even integer of at least 2"
+            )
+        self.conversation_history_limit = conversation_history_limit
 
     async def run(
         self,
         prompt: str,
         *,
         run_id: UUID | None = None,
+        conversation_id: UUID | None = None,
         skills: Iterable[str] = (),
         plan: ExecutionPlan | None = None,
         attachments: Iterable[Attachment] = (),
     ) -> AgentResult:
-        selected_skills = self._select_skills(tuple(skills))
-        enabled_tool_names = self._enabled_tools(selected_skills)
-        selected_attachments = await self._resolve_attachments(tuple(attachments))
-        context = self.runtime.create_context(
-            self.profile,
-            prompt,
-            run_id=run_id,
-            skills=selected_skills,
-            enabled_tool_names=enabled_tool_names,
-            plan=plan,
-            attachments=selected_attachments,
-        )
-        return await self.runtime.execute(
-            context,
-            self.model,
-            tool_registry=self.tool_registry,
-            tool_executor=self.tool_executor,
-            run_store=self.run_store,
-            event_store=self.event_store,
-            checkpoint_store=self.checkpoint_store,
-            supervisor=self.supervisor,
-            resource_specs=self.resources,
-            artifact_store=self.artifact_store,
-            memory_retriever=self.memory_retriever,
-            memory_limit=self.memory_limit,
-            memory_namespace=self.memory_namespace,
-            memory_failure_mode=self.memory_failure_mode,
-        )
+        active_run_id = run_id or uuid4()
+        turn: ConversationTurn | None = None
+        history: tuple[Message, ...] = ()
+        try:
+            selected_skills = self._select_skills(tuple(skills))
+            enabled_tool_names = self._enabled_tools(selected_skills)
+            selected_attachments = await self._resolve_attachments(tuple(attachments))
+            if conversation_id is not None:
+                turn, history = await self.conversation_store.begin_turn(
+                    conversation_id,
+                    run_id=active_run_id,
+                    profile_id=self.profile.id,
+                    user_message=prompt,
+                )
+                history = history[-self.conversation_history_limit :]
+            context = self.runtime.create_context(
+                self.profile,
+                prompt,
+                run_id=active_run_id,
+                conversation_id=conversation_id,
+                turn_sequence=turn.sequence if turn is not None else None,
+                conversation_history=history,
+                skills=selected_skills,
+                enabled_tool_names=enabled_tool_names,
+                plan=plan,
+                attachments=selected_attachments,
+            )
+            result = await self.runtime.execute(
+                context,
+                self.model,
+                tool_registry=self.tool_registry,
+                tool_executor=self.tool_executor,
+                run_store=self.run_store,
+                event_store=self.event_store,
+                checkpoint_store=self.checkpoint_store,
+                conversation_store=self.conversation_store,
+                supervisor=self.supervisor,
+                resource_specs=self.resources,
+                artifact_store=self.artifact_store,
+                memory_retriever=self.memory_retriever,
+                memory_limit=self.memory_limit,
+                memory_namespace=self.memory_namespace,
+                memory_failure_mode=self.memory_failure_mode,
+            )
+        except BaseException as exc:
+            if conversation_id is not None and turn is not None:
+                try:
+                    await self.conversation_store.finish_turn(
+                        conversation_id,
+                        run_id=active_run_id,
+                        status=(
+                            RunStatus.CANCELLED
+                            if isinstance(exc, asyncio.CancelledError)
+                            else RunStatus.FAILED
+                        ),
+                    )
+                except Exception as finish_error:
+                    exc.add_note(f"failed to release Conversation Turn: {finish_error}")
+            raise
+        return result
 
     async def resume(self, run_id: UUID, user_input: str) -> AgentResult:
         """Complete a pending input Tool call and continue the same Run."""
@@ -142,7 +188,7 @@ class Agent:
         checkpoint = await self.checkpoint_store.claim(run_id)
         context = checkpoint.restore()
         try:
-            return await self.runtime.execute(
+            result = await self.runtime.execute(
                 context,
                 self.model,
                 tool_registry=self.tool_registry,
@@ -150,6 +196,7 @@ class Agent:
                 run_store=self.run_store,
                 event_store=self.event_store,
                 checkpoint_store=self.checkpoint_store,
+                conversation_store=self.conversation_store,
                 supervisor=self.supervisor,
                 resource_specs=self.resources,
                 artifact_store=self.artifact_store,
@@ -162,12 +209,14 @@ class Agent:
         except Exception:
             await self.checkpoint_store.save(checkpoint)
             raise
+        return result
 
     async def start(
         self,
         prompt: str,
         *,
         run_id: UUID | None = None,
+        conversation_id: UUID | None = None,
         skills: Iterable[str] = (),
         plan: ExecutionPlan | None = None,
         attachments: Iterable[Attachment] = (),
@@ -178,6 +227,7 @@ class Agent:
             self.run(
                 prompt,
                 run_id=active_run_id,
+                conversation_id=conversation_id,
                 skills=skills,
                 plan=plan,
                 attachments=tuple(attachments),
@@ -198,6 +248,7 @@ class Agent:
             _run_store=self.run_store,
             _event_store=self.event_store,
             _checkpoint_store=self.checkpoint_store,
+            _conversation_store=self.conversation_store,
         )
 
     async def cancel(self, run_id: UUID) -> Run:
@@ -207,7 +258,31 @@ class Agent:
             run_store=self.run_store,
             event_store=self.event_store,
             checkpoint_store=self.checkpoint_store,
+            conversation_store=self.conversation_store,
         )
+
+    async def create_conversation(
+        self,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Conversation:
+        conversation = Conversation(
+            profile_id=self.profile.id,
+            metadata=dict(metadata or {}),
+        )
+        await self.conversation_store.create_conversation(conversation)
+        return conversation
+
+    async def get_conversation(self, conversation_id: UUID) -> Conversation:
+        return await self.conversation_store.get_conversation(conversation_id)
+
+    async def conversation_turns(
+        self, conversation_id: UUID
+    ) -> tuple[ConversationTurn, ...]:
+        return await self.conversation_store.list_turns(conversation_id)
+
+    async def conversation_messages(self, conversation_id: UUID) -> tuple[Message, ...]:
+        return await self.conversation_store.messages(conversation_id)
 
     async def get_run(self, run_id: UUID) -> Run:
         return await self.run_store.get(run_id)
