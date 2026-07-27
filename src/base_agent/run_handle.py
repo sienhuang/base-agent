@@ -1,10 +1,12 @@
 """Handle for one background Agent execution."""
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from uuid import UUID
 
+from base_agent._logging import reset_log_context, set_log_context
 from base_agent.models import AgentResult, EventType, Run, RunStatus, RuntimeEvent
 from base_agent.models.run import utc_now
 from base_agent.stores import (
@@ -14,6 +16,8 @@ from base_agent.stores import (
     EventStream,
     RunStore,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class EventStreamingNotSupportedError(RuntimeError):
@@ -74,28 +78,47 @@ async def request_cancellation(
 ) -> Run:
     """Cancel active work, immediately finalizing a suspended Run."""
     existing = await run_store.get(run_id)
-    requested = await run_store.request_cancel(run_id)
-    if existing.status is not RunStatus.WAITING:
-        return requested
-    cancelled = requested.model_copy(
-        update={
-            "status": RunStatus.CANCELLED,
-            "error": "run cancellation requested while waiting for input",
-            "updated_at": utc_now(),
+    log_tokens = set_log_context(
+        run_id=run_id,
+        conversation_id=existing.conversation_id,
+        turn_sequence=existing.turn_sequence,
+    )
+    logger.info(
+        "run cancellation requested",
+        extra={
+            "event": "run.cancellation_requested",
+            "status": existing.status.value,
         },
-        deep=True,
     )
-    if cancelled.conversation_id is not None and conversation_store is not None:
-        await conversation_store.finish_turn(
-            cancelled.conversation_id,
-            run_id=run_id,
-            status=RunStatus.CANCELLED,
+    try:
+        requested = await run_store.request_cancel(run_id)
+        if existing.status is not RunStatus.WAITING:
+            return requested
+        cancelled = requested.model_copy(
+            update={
+                "status": RunStatus.CANCELLED,
+                "error": "run cancellation requested while waiting for input",
+                "updated_at": utc_now(),
+            },
+            deep=True,
         )
-    await run_store.save(cancelled)
-    await checkpoint_store.delete(run_id)
-    await event_store.emit(
-        run_id,
-        EventType.RUN_CANCELLED,
-        {"error": cancelled.error, "while_waiting": True},
-    )
-    return cancelled
+        if cancelled.conversation_id is not None and conversation_store is not None:
+            await conversation_store.finish_turn(
+                cancelled.conversation_id,
+                run_id=run_id,
+                status=RunStatus.CANCELLED,
+            )
+        await run_store.save(cancelled)
+        await checkpoint_store.delete(run_id)
+        await event_store.emit(
+            run_id,
+            EventType.RUN_CANCELLED,
+            {"error": cancelled.error, "while_waiting": True},
+        )
+        logger.info(
+            "waiting run cancelled",
+            extra={"event": "run.cancelled", "status": cancelled.status.value},
+        )
+        return cancelled
+    finally:
+        reset_log_context(log_tokens)

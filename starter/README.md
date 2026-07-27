@@ -69,6 +69,10 @@ uv run agent-app --chat --no-skill
 
 Every user Turn creates a different Run linked to the same Conversation. Use `/exit` to stop.
 
+Every Agent process automatically writes rotating JSON Lines logs to `logs/base-agent.log`. Set
+`BASE_AGENT_LOG_FILE` to choose another path and `BASE_AGENT_LOG_LEVEL` to change the default
+`INFO` level. Prompts, model output, Tool arguments, and secrets are not logged.
+
 ## Test and check
 
 ```bash

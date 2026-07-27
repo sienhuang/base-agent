@@ -1,5 +1,8 @@
 """Default bounded model -> tool -> model orchestration strategy."""
 
+import logging
+from time import monotonic
+
 from base_agent.models import (
     EventType,
     Message,
@@ -15,6 +18,8 @@ from base_agent.runtime.persistence import save_context_snapshot
 from base_agent.runtime.state_machine import ExecutionState
 from base_agent.supervision import SupervisionAction
 from base_agent.tools import ToolContext, ToolExecutor, ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class ModelToolStrategy:
@@ -48,13 +53,53 @@ class ModelToolStrategy:
                 },
             },
         )
+        model_started_at = monotonic()
+        logger.info(
+            "model request started",
+            extra={
+                "event": "model.request.started",
+                "run_id": str(context.run_id),
+                "step": context.step_count,
+                "provider": services.provider.name,
+                "model": context.profile.model,
+                "message_count": len(request.messages),
+                "tool_definition_count": len(request.tools),
+            },
+        )
 
         try:
             response = await services.provider.complete(request)
         except Exception as exc:
+            logger.exception(
+                "model request failed",
+                extra={
+                    "event": "model.request.failed",
+                    "run_id": str(context.run_id),
+                    "step": context.step_count,
+                    "provider": services.provider.name,
+                    "model": context.profile.model,
+                    "duration_ms": round((monotonic() - model_started_at) * 1000, 3),
+                    "error_type": type(exc).__name__,
+                },
+            )
             context.error = f"model provider '{services.provider.name}' failed: {exc}"
             context.state_machine.transition_to(ExecutionState.FAILED)
             return
+        logger.info(
+            "model request completed",
+            extra={
+                "event": "model.request.completed",
+                "run_id": str(context.run_id),
+                "step": context.step_count,
+                "provider": services.provider.name,
+                "model": context.profile.model,
+                "duration_ms": round((monotonic() - model_started_at) * 1000, 3),
+                "tool_call_count": len(response.tool_calls),
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "total_tokens": response.usage.total_tokens,
+            },
+        )
 
         await services.event_store.emit(
             context.run_id,
@@ -122,6 +167,17 @@ class ModelToolStrategy:
             await services.event_store.emit(
                 context.run_id, EventType.TOOL_STARTED, call_data
             )
+            tool_started_at = monotonic()
+            logger.info(
+                "tool execution started",
+                extra={
+                    "event": "tool.execution.started",
+                    "run_id": str(context.run_id),
+                    "step": context.step_count,
+                    "tool_name": call.name,
+                    "tool_call_id": call.id,
+                },
+            )
             result = await executor.execute(
                 call,
                 granted_permissions=context.profile.permissions,
@@ -133,10 +189,33 @@ class ModelToolStrategy:
                     memories=services.memories,
                 ),
             )
+            logger.info(
+                "tool execution finished",
+                extra={
+                    "event": "tool.execution.finished",
+                    "run_id": str(context.run_id),
+                    "step": context.step_count,
+                    "tool_name": call.name,
+                    "tool_call_id": call.id,
+                    "status": result.status.value,
+                    "error_code": result.error_code,
+                    "duration_ms": round((monotonic() - tool_started_at) * 1000, 3),
+                },
+            )
             if result.status is ToolResultStatus.WAITING:
                 wait_data = result.data if isinstance(result.data, dict) else {}
                 prompt = wait_data.get("prompt")
                 if not isinstance(prompt, str) or not prompt.strip():
+                    logger.error(
+                        "tool returned invalid input request",
+                        extra={
+                            "event": "tool.waiting.invalid",
+                            "run_id": str(context.run_id),
+                            "step": context.step_count,
+                            "tool_name": call.name,
+                            "tool_call_id": call.id,
+                        },
+                    )
                     context.error = f"tool '{call.name}' returned an invalid input request"
                     context.state_machine.transition_to(ExecutionState.FAILED)
                     return

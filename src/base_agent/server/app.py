@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from time import monotonic
 from typing import Annotated
 from urllib.parse import quote
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import FastAPI, Header, HTTPException, Query, Response, status
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
+from starlette.middleware.base import RequestResponseEndpoint
 
+from base_agent._logging import reset_log_context, set_log_context
 from base_agent.agent import Agent
 from base_agent.models import (
     AgentResult,
@@ -40,6 +45,9 @@ from base_agent.stores.errors import (
     RunNotFoundError,
 )
 
+logger = logging.getLogger(__name__)
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
 
 def create_app(
     agent: Agent,
@@ -64,6 +72,49 @@ def create_app(
     app = FastAPI(title=title, lifespan=lifespan)
     app.state.agent = agent
     app.state.run_tasks = tasks
+
+    @app.middleware("http")
+    async def log_request(
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        supplied_request_id = request.headers.get("X-Request-ID", "")
+        request_id = (
+            supplied_request_id
+            if _REQUEST_ID.fullmatch(supplied_request_id)
+            else str(uuid4())
+        )
+        log_tokens = set_log_context(request_id=request_id)
+        started_at = monotonic()
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            logger.exception(
+                "http request failed",
+                extra={
+                    "event": "http.request.failed",
+                    "method": request.method,
+                    "path": request.url.path,
+                    "duration_ms": round((monotonic() - started_at) * 1000, 3),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise
+        else:
+            response.headers["X-Request-ID"] = request_id
+            logger.info(
+                "http request completed",
+                extra={
+                    "event": "http.request.completed",
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": response.status_code,
+                    "duration_ms": round((monotonic() - started_at) * 1000, 3),
+                },
+            )
+            return response
+        finally:
+            reset_log_context(log_tokens)
 
     async def start_run_from_payload(
         payload: StartRunRequest,

@@ -89,6 +89,11 @@ The answer becomes the result of the original pending Tool call, preserving prov
 ordering. The restored Runtime retains its messages, token usage, selected Skills, enabled Tools,
 step/tool budgets, and Supervisor state. A Run may wait and resume more than once.
 
+`Run.usage` and `AgentResult.usage` contain actual Provider-reported token usage accumulated across
+every model call in that Run. They do not accumulate across different Runs or Conversation Turns.
+Per-call values appear in `model.responded` events and `model.request.completed` logs; the Run total
+appears in `run.finished` or `run.resume_finished`.
+
 Checkpoint claims are atomic: only one concurrent resume can continue a waiting Run. Empty input
 does not consume the checkpoint. Cancelling a waiting Run immediately finalizes it and removes the
 checkpoint.

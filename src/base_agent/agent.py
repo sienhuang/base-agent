@@ -1,10 +1,17 @@
 """Small public facade for starting an agent run."""
 
 import asyncio
+import logging
 from collections.abc import Iterable, Mapping
+from time import monotonic
 from typing import Any
 from uuid import UUID, uuid4
 
+from base_agent._logging import (
+    ensure_file_logging,
+    reset_log_context,
+    set_log_context,
+)
 from base_agent.memory import MemoryRetriever
 from base_agent.models import (
     AgentResult,
@@ -45,6 +52,8 @@ from base_agent.stores.errors import RunNotFoundError
 from base_agent.supervision import Supervisor, build_default_supervisor
 from base_agent.tools import Tool, ToolExecutor, ToolRegistry
 
+logger = logging.getLogger(__name__)
+
 
 class Agent:
     """Compose a profile, model provider, and runtime without subclassing."""
@@ -70,6 +79,7 @@ class Agent:
         memory_failure_mode: MemoryFailureMode = MemoryFailureMode.BEST_EFFORT,
         conversation_history_limit: int = 40,
     ) -> None:
+        log_path = ensure_file_logging()
         self.profile = profile
         self.model = model
         self.runtime = runtime or AgentRuntime()
@@ -99,6 +109,17 @@ class Agent:
                 "conversation_history_limit must be an even integer of at least 2"
             )
         self.conversation_history_limit = conversation_history_limit
+        logger.info(
+            "agent initialized",
+            extra={
+                "event": "agent.initialized",
+                "profile_id": profile.id,
+                "model_provider": model.name,
+                "tool_count": len(self.tool_registry),
+                "resource_count": len(self.resources),
+                "log_file": str(log_path),
+            },
+        )
 
     async def run(
         self,
@@ -111,12 +132,31 @@ class Agent:
         attachments: Iterable[Attachment] = (),
     ) -> AgentResult:
         active_run_id = run_id or uuid4()
+        selected_skill_names = tuple(skills)
+        selected_attachment_refs = tuple(attachments)
+        log_tokens = set_log_context(
+            run_id=active_run_id,
+            conversation_id=conversation_id,
+            turn_sequence=None,
+        )
+        started_at = monotonic()
+        logger.info(
+            "run requested",
+            extra={
+                "event": "run.requested",
+                "profile_id": self.profile.id,
+                "skill_count": len(selected_skill_names),
+                "attachment_count": len(selected_attachment_refs),
+            },
+        )
         turn: ConversationTurn | None = None
         history: tuple[Message, ...] = ()
         try:
-            selected_skills = self._select_skills(tuple(skills))
+            selected_skills = self._select_skills(selected_skill_names)
             enabled_tool_names = self._enabled_tools(selected_skills)
-            selected_attachments = await self._resolve_attachments(tuple(attachments))
+            selected_attachments = await self._resolve_attachments(
+                selected_attachment_refs
+            )
             if conversation_id is not None:
                 turn, history = await self.conversation_store.begin_turn(
                     conversation_id,
@@ -125,6 +165,19 @@ class Agent:
                     user_message=prompt,
                 )
                 history = history[-self.conversation_history_limit :]
+                reset_log_context(log_tokens)
+                log_tokens = set_log_context(
+                    run_id=active_run_id,
+                    conversation_id=conversation_id,
+                    turn_sequence=turn.sequence,
+                )
+                logger.info(
+                    "conversation turn started",
+                    extra={
+                        "event": "conversation.turn.started",
+                        "history_message_count": len(history),
+                    },
+                )
             context = self.runtime.create_context(
                 self.profile,
                 prompt,
@@ -168,7 +221,38 @@ class Agent:
                     )
                 except Exception as finish_error:
                     exc.add_note(f"failed to release Conversation Turn: {finish_error}")
+            log_method = (
+                logger.warning
+                if isinstance(exc, asyncio.CancelledError)
+                else logger.exception
+            )
+            log_method(
+                "run execution raised",
+                extra={
+                    "event": "run.execution_raised",
+                    "profile_id": self.profile.id,
+                    "duration_ms": round((monotonic() - started_at) * 1000, 3),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            reset_log_context(log_tokens)
             raise
+        logger.info(
+            "run finished",
+            extra={
+                "event": "run.finished",
+                "profile_id": self.profile.id,
+                "status": result.status.value,
+                "duration_ms": round((monotonic() - started_at) * 1000, 3),
+                "step_count": result.metadata["steps"],
+                "tool_call_count": result.metadata["tool_calls"],
+                "model_call_count": result.metadata["model_calls"],
+                "input_tokens": result.usage.input_tokens,
+                "output_tokens": result.usage.output_tokens,
+                "total_tokens": result.usage.total_tokens,
+            },
+        )
+        reset_log_context(log_tokens)
         return result
 
     async def resume(self, run_id: UUID, user_input: str) -> AgentResult:
@@ -185,7 +269,29 @@ class Agent:
                 f"not '{self.profile.id}'"
             )
         self.tool_registry.require(checkpoint.enabled_tool_names)
-        checkpoint = await self.checkpoint_store.claim(run_id)
+        log_tokens = set_log_context(
+            run_id=run_id,
+            conversation_id=run.conversation_id,
+            turn_sequence=run.turn_sequence,
+        )
+        started_at = monotonic()
+        logger.info(
+            "run resume requested",
+            extra={"event": "run.resume_requested", "profile_id": self.profile.id},
+        )
+        try:
+            checkpoint = await self.checkpoint_store.claim(run_id)
+        except BaseException as exc:
+            logger.exception(
+                "run resume claim failed",
+                extra={
+                    "event": "run.resume_claim_failed",
+                    "duration_ms": round((monotonic() - started_at) * 1000, 3),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            reset_log_context(log_tokens)
+            raise
         context = checkpoint.restore()
         try:
             result = await self.runtime.execute(
@@ -206,9 +312,44 @@ class Agent:
                 memory_failure_mode=self.memory_failure_mode,
                 resume_input=user_input,
             )
-        except Exception:
-            await self.checkpoint_store.save(checkpoint)
+        except Exception as exc:
+            try:
+                await self.checkpoint_store.save(checkpoint)
+            finally:
+                logger.exception(
+                    "run resume raised",
+                    extra={
+                        "event": "run.resume_raised",
+                        "duration_ms": round((monotonic() - started_at) * 1000, 3),
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                reset_log_context(log_tokens)
             raise
+        except BaseException as exc:
+            logger.warning(
+                "run resume interrupted",
+                extra={
+                    "event": "run.resume_interrupted",
+                    "duration_ms": round((monotonic() - started_at) * 1000, 3),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            reset_log_context(log_tokens)
+            raise
+        logger.info(
+            "run resume finished",
+            extra={
+                "event": "run.resume_finished",
+                "status": result.status.value,
+                "duration_ms": round((monotonic() - started_at) * 1000, 3),
+                "model_call_count": result.metadata["model_calls"],
+                "input_tokens": result.usage.input_tokens,
+                "output_tokens": result.usage.output_tokens,
+                "total_tokens": result.usage.total_tokens,
+            },
+        )
+        reset_log_context(log_tokens)
         return result
 
     async def start(
@@ -271,6 +412,20 @@ class Agent:
             metadata=dict(metadata or {}),
         )
         await self.conversation_store.create_conversation(conversation)
+        log_tokens = set_log_context(
+            conversation_id=conversation.id,
+            run_id=None,
+            turn_sequence=None,
+        )
+        logger.info(
+            "conversation created",
+            extra={
+                "event": "conversation.created",
+                "profile_id": self.profile.id,
+                "metadata_key_count": len(conversation.metadata),
+            },
+        )
+        reset_log_context(log_tokens)
         return conversation
 
     async def get_conversation(self, conversation_id: UUID) -> Conversation:

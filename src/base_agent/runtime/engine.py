@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from time import monotonic
 from uuid import UUID
 
 from base_agent.artifacts import ArtifactManager
@@ -48,6 +50,8 @@ from base_agent.stores import (
 )
 from base_agent.supervision import SupervisionAction, Supervisor, build_default_supervisor
 from base_agent.tools import ToolExecutor, ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class AgentRuntime:
@@ -142,6 +146,16 @@ class AgentRuntime:
         memory_namespace: str | None = None,
         memory_failure_mode: MemoryFailureMode = MemoryFailureMode.BEST_EFFORT,
     ) -> AgentResult:
+        runtime_started_at = monotonic()
+        correlation = {
+            "run_id": str(context.run_id),
+            "conversation_id": (
+                str(context.conversation_id)
+                if context.conversation_id is not None
+                else None
+            ),
+            "turn_sequence": context.turn_sequence,
+        }
         active_run_store = run_store or InMemoryRunStore()
         active_event_store = event_store or InMemoryEventStore()
         active_checkpoint_store = checkpoint_store or InMemoryCheckpointStore()
@@ -175,6 +189,16 @@ class AgentRuntime:
             resources=resources,
             artifacts=artifacts,
             memories=memories,
+        )
+        logger.info(
+            "runtime execution started",
+            extra={
+                "event": "runtime.execution.started",
+                **correlation,
+                "profile_id": context.profile.id,
+                "provider": provider.name,
+                "initial_state": context.state.value,
+            },
         )
         if context.state_machine.state is ExecutionState.CREATED:
             await self._create_run(context, active_run_store, active_event_store)
@@ -226,9 +250,26 @@ class AgentRuntime:
                 await self.strategy.advance(context, services)
         except asyncio.CancelledError as exc:
             execution_error = exc
+            logger.warning(
+                "runtime task cancelled",
+                extra={
+                    "event": "runtime.execution.cancelled",
+                    **correlation,
+                    "duration_ms": round((monotonic() - runtime_started_at) * 1000, 3),
+                },
+            )
             raise
         except Exception as exc:
             execution_error = exc
+            logger.exception(
+                "runtime execution failed",
+                extra={
+                    "event": "runtime.execution.failed",
+                    **correlation,
+                    "duration_ms": round((monotonic() - runtime_started_at) * 1000, 3),
+                    "error_type": type(exc).__name__,
+                },
+            )
             context.error = f"orchestration failed: {exc}"
             if context.state is ExecutionState.RUNNING:
                 context.state_machine.transition_to(ExecutionState.FAILED)
@@ -252,6 +293,22 @@ class AgentRuntime:
                 assistant_message=context.output,
             )
         await self._finalize_run(context, active_run_store, active_event_store)
+        logger.info(
+            "runtime execution finished",
+            extra={
+                "event": "runtime.execution.finished",
+                **correlation,
+                "status": result.status.value,
+                "duration_ms": round((monotonic() - runtime_started_at) * 1000, 3),
+                "step_count": context.step_count,
+                "tool_call_count": context.tool_call_count,
+                "input_tokens": context.usage.input_tokens,
+                "output_tokens": context.usage.output_tokens,
+                "total_tokens": context.usage.total_tokens,
+                "model_call_count": len(context.responses),
+                "resource_failure_count": len(context.resource_failures),
+            },
+        )
         return result
 
     @staticmethod
@@ -377,6 +434,7 @@ class AgentRuntime:
                 "output": context.output,
                 "error": context.error,
                 "usage": context.usage.model_dump(mode="json"),
+                "model_calls": len(context.responses),
                 "pending_input": (
                     context.pending_input.model_dump(mode="json")
                     if context.pending_input is not None
@@ -441,6 +499,7 @@ class AgentRuntime:
                 "steps": context.step_count,
                 "tool_calls": context.tool_call_count,
                 "provider": context.provider_name,
+                "model_calls": len(context.responses),
                 "pending_input": (
                     context.pending_input.model_dump(mode="json")
                     if context.pending_input is not None

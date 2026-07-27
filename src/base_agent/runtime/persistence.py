@@ -42,6 +42,7 @@ async def save_context_snapshot(context: RuntimeContext, run_store: RunStore) ->
                         for match in context.memories
                     ],
                 },
+                "model_calls": len(context.responses),
             },
             "updated_at": utc_now(),
         },

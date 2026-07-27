@@ -41,6 +41,7 @@ All examples are deterministic and offline. Start with the
 - [Attachments and Artifacts](docs/ARTIFACTS.md)
 - [Optional Memory Retrieval](docs/MEMORY.md)
 - [Optional FastAPI Run Server](docs/SERVER.md)
+- [Automatic File Logging](docs/LOGGING.md)
 - [Optional PostgreSQL Persistence](docs/POSTGRES.md)
 - [Optional Redis Event Notifications](docs/REDIS.md)
 - [Optional MCP Tool Adapter](docs/MCP.md)
