@@ -8,11 +8,18 @@ import asyncio
 from agent_app.agent import build_agent
 
 
-async def run(prompt: str, *, use_skill: bool = True) -> int:
-    agent = build_agent()
+async def run(
+    prompt: str,
+    *,
+    use_skill: bool = True,
+    planning: bool = False,
+    react: bool = False,
+) -> int:
+    agent = build_agent(react=react)
     result = await agent.run(
         prompt,
         skills=("text-analysis",) if use_skill else (),
+        planning=planning,
     )
     if result.output:
         print(result.output)
@@ -22,9 +29,14 @@ async def run(prompt: str, *, use_skill: bool = True) -> int:
     return 0
 
 
-async def run_chat(*, use_skill: bool = True) -> int:
+async def run_chat(
+    *,
+    use_skill: bool = True,
+    planning: bool = False,
+    react: bool = False,
+) -> int:
     """Run an interactive Conversation whose every user Turn is a normal Run."""
-    agent = build_agent()
+    agent = build_agent(react=react)
     conversation = await agent.create_conversation()
     print(f"conversation_id={conversation.id}")
     print("Enter /exit to stop.")
@@ -38,6 +50,7 @@ async def run_chat(*, use_skill: bool = True) -> int:
             prompt,
             conversation_id=conversation.id,
             skills=("text-analysis",) if use_skill else (),
+            planning=planning,
         )
         if result.output:
             print(f"agent> {result.output}")
@@ -54,6 +67,17 @@ def main() -> None:
         action="store_true",
         help="Start an interactive multi-Run Conversation",
     )
+    execution = parser.add_mutually_exclusive_group()
+    execution.add_argument(
+        "--plan",
+        action="store_true",
+        help="Generate and execute a Plan inside the same Run",
+    )
+    execution.add_argument(
+        "--react",
+        action="store_true",
+        help="Run the whole task with observable ReAct iterations",
+    )
     parser.add_argument(
         "--no-skill",
         action="store_true",
@@ -61,7 +85,24 @@ def main() -> None:
     )
     arguments = parser.parse_args()
     if arguments.chat:
-        raise SystemExit(asyncio.run(run_chat(use_skill=not arguments.no_skill)))
+        raise SystemExit(
+            asyncio.run(
+                run_chat(
+                    use_skill=not arguments.no_skill,
+                    planning=arguments.plan,
+                    react=arguments.react,
+                )
+            )
+        )
     if not arguments.prompt:
         parser.error("prompt is required unless --chat is used")
-    raise SystemExit(asyncio.run(run(" ".join(arguments.prompt), use_skill=not arguments.no_skill)))
+    raise SystemExit(
+        asyncio.run(
+            run(
+                " ".join(arguments.prompt),
+                use_skill=not arguments.no_skill,
+                planning=arguments.plan,
+                react=arguments.react,
+            )
+        )
+    )

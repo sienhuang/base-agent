@@ -45,6 +45,9 @@ from base_agent.models import (
 from base_agent.orchestration import (
     ModelToolStrategy,
     OrchestrationStrategy,
+    PlanningStrategy,
+    ReActResult,
+    ReActStrategy,
     RuntimeServices,
     update_execution_plan,
 )
@@ -157,6 +160,9 @@ __all__ = [
     "ModelResponse",
     "ModelToolStrategy",
     "OrchestrationStrategy",
+    "PlanningStrategy",
+    "ReActResult",
+    "ReActStrategy",
     "PendingInput",
     "PlanStatus",
     "PlanStep",

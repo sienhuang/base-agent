@@ -44,4 +44,4 @@ def test_starter_is_path_independent_copyable_and_offline_runnable(tmp_path: Pat
     assert cli.stdout.strip() == (
         "Offline starter completed the Tool loop: 3 words, 20 characters."
     )
-    assert "4 passed" in tests.stdout
+    assert "6 passed" in tests.stdout

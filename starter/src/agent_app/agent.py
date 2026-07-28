@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from base_agent import Agent, AgentProfile, SkillRegistry
+from base_agent import Agent, AgentProfile, AgentRuntime, ReActStrategy, SkillRegistry
 
 from agent_app.config import Settings
 from agent_app.providers import build_provider
@@ -11,7 +11,11 @@ from agent_app.tools import TOOLS
 SKILLS_ROOT = Path(__file__).parent / "skills"
 
 
-def build_agent(settings: Settings | None = None) -> Agent:
+def build_agent(
+    settings: Settings | None = None,
+    *,
+    react: bool = False,
+) -> Agent:
     resolved = settings or Settings.from_env()
     registry = SkillRegistry.from_directory(SKILLS_ROOT)
     return Agent(
@@ -30,4 +34,5 @@ def build_agent(settings: Settings | None = None) -> Agent:
         model=build_provider(resolved),
         tools=TOOLS,
         skill_registry=registry,
+        runtime=AgentRuntime(strategy=ReActStrategy()) if react else None,
     )

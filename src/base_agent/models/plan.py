@@ -23,6 +23,7 @@ class StepStatus(StrEnum):
     WAITING = "waiting"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
     SKIPPED = "skipped"
 
 
@@ -40,7 +41,9 @@ class PlanStep(BaseModel):
     executor: str | None = None
     dependencies: tuple[str, ...] = ()
     status: StepStatus = StepStatus.PENDING
+    success: bool | None = None
     result: Any | None = None
+    attachments: tuple[str, ...] = ()
     error: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -50,8 +53,8 @@ class PlanStep(BaseModel):
             raise ValueError("step dependencies must be unique")
         if self.id in self.dependencies:
             raise ValueError("a step cannot depend on itself")
-        if self.status is StepStatus.FAILED and not self.error:
-            raise ValueError("a failed step must include an error")
+        if self.status in {StepStatus.FAILED, StepStatus.CANCELLED} and not self.error:
+            raise ValueError("a failed or cancelled step must include an error")
         return self
 
 
@@ -122,11 +125,26 @@ class ExecutionPlan(BaseModel):
             plan_status=PlanStatus.RUNNING,
         )
 
-    def complete_step(self, step_id: str, result: Any | None = None) -> ExecutionPlan:
+    def complete_step(
+        self,
+        step_id: str,
+        result: Any | None = None,
+        *,
+        success: bool | None = None,
+        attachments: tuple[str, ...] = (),
+        metadata: dict[str, Any] | None = None,
+    ) -> ExecutionPlan:
         step = self._require_status(step_id, StepStatus.RUNNING)
         updated = self._replace_step(
             step.model_copy(
-                update={"status": StepStatus.COMPLETED, "result": result, "error": None}
+                update={
+                    "status": StepStatus.COMPLETED,
+                    "success": success,
+                    "result": result,
+                    "attachments": attachments,
+                    "error": None,
+                    "metadata": {**step.metadata, **(metadata or {})},
+                }
             )
         )
         if all(
@@ -157,6 +175,46 @@ class ExecutionPlan(BaseModel):
         return self._replace_step(
             step.model_copy(update={"status": StepStatus.RUNNING}),
             plan_status=PlanStatus.RUNNING,
+        )
+
+    def cancel(self, error: str) -> ExecutionPlan:
+        """Cancel the plan and any active step while leaving pending work untouched."""
+
+        if not error.strip():
+            raise ValueError("error must not be empty")
+        steps = tuple(
+            step.model_copy(update={"status": StepStatus.CANCELLED, "error": error})
+            if step.status in {StepStatus.RUNNING, StepStatus.WAITING}
+            else step
+            for step in self.steps
+        )
+        return self.model_copy(
+            update={
+                "steps": steps,
+                "status": PlanStatus.CANCELLED,
+                "revision": self.revision + 1,
+                "metadata": {**self.metadata, "terminal_error": error},
+            }
+        )
+
+    def fail(self, error: str) -> ExecutionPlan:
+        """Fail the plan and its active step."""
+
+        if not error.strip():
+            raise ValueError("error must not be empty")
+        steps = tuple(
+            step.model_copy(update={"status": StepStatus.FAILED, "error": error})
+            if step.status in {StepStatus.RUNNING, StepStatus.WAITING}
+            else step
+            for step in self.steps
+        )
+        return self.model_copy(
+            update={
+                "steps": steps,
+                "status": PlanStatus.FAILED,
+                "revision": self.revision + 1,
+                "metadata": {**self.metadata, "terminal_error": error},
+            }
         )
 
     def _get_step(self, step_id: str) -> PlanStep:

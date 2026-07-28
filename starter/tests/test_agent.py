@@ -48,3 +48,34 @@ async def test_offline_agent_supports_run_backed_conversation_turns() -> None:
     assert turns[0].run_id != turns[1].run_id
     assert second.messages[1].content == "my name is Xiao Ming"
     assert second.messages[2].content == first.output
+
+
+@pytest.mark.asyncio
+async def test_offline_agent_can_generate_and_execute_plan() -> None:
+    agent = build_agent(Settings(provider="offline"))
+
+    result = await agent.run("complete planned work", planning=True)
+
+    assert result.status is AgentResultStatus.COMPLETED
+    assert result.output == "Offline planned Run completed."
+    assert result.metadata["planning_requested"] is True
+    assert result.metadata["plan"]["status"] == "completed"
+    assert result.metadata["model_calls"] == 4
+    assert result.metadata["plan"]["metadata"]["replan_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_offline_agent_can_run_as_standalone_react_agent() -> None:
+    agent = build_agent(Settings(provider="offline"), react=True)
+
+    result = await agent.run("count this text", skills=("text-analysis",))
+    events = await agent.events(UUID(result.metadata["run_id"]))
+
+    assert result.status is AgentResultStatus.COMPLETED
+    assert result.output == (
+        "Offline starter completed the Tool loop: 3 words, 15 characters."
+    )
+    assert result.metadata["react"]["iteration"] == 2
+    assert EventType.REACT_ACTION_BATCH_SELECTED in [
+        event.type for event in events
+    ]

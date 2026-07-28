@@ -44,6 +44,7 @@ class RuntimeContext:
     supervision_data: dict[str, Any] = field(default_factory=dict)
     pending_input: PendingInput | None = None
     plan: ExecutionPlan | None = None
+    planning_requested: bool = False
     resource_failures: list[ResourceFailure] = field(default_factory=list)
     attachments: tuple[Attachment, ...] = ()
     artifacts: list[Artifact] = field(default_factory=list)

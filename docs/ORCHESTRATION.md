@@ -51,11 +51,80 @@ plan = plan.start_step("inspect")
 plan = plan.complete_step("inspect", result={"rows": 10})
 ```
 
-Pass an initial plan through `Agent.run(..., plan=plan)` or create one inside a strategy. Strategies
-must use `update_execution_plan(context, services, updated_plan)` when changing a running plan.
-That operation updates the Run snapshot and emits generic `plan.updated`, `step.started`,
-`step.completed`, or `step.failed` events. Plans are also serialized into waiting checkpoints, so
-human input does not break planner state.
+The default Runtime automatically executes an application-supplied plan:
+
+```python
+result = await agent.run("Build the report", plan=plan)
+```
+
+Normal `agent.run(prompt)` behavior is unchanged. With a Plan, the built-in `PlanningStrategy`
+selects the first ready Step, executes it through the same model → Tool loop, records its result,
+and then asks the Planner model to regenerate all remaining work. The Runtime retains every
+completed, failed, cancelled, or skipped Step unchanged and replaces only not-yet-executed Steps.
+The merged graph is validated again before execution continues. An empty remaining `steps` array
+ends execution, after which one Tool-free model call synthesizes the final answer.
+
+This follows a Planner/ReAct lifecycle:
+
+```text
+PLANNING → EXECUTING_STEP → UPDATING_PLAN ─┐
+                         ↑                 │
+                         └─────────────────┘
+                                      ↓
+                                SUMMARIZING
+```
+
+The updating model call returns JSON shaped as `{"steps": [...]}`. Those Steps may add, remove,
+split, merge, or reorder future work and may depend on retained historical Step IDs. They must
+start pending, use IDs distinct from retained history, and form a valid acyclic graph. Returning
+`{"steps": []}` means the original task is complete.
+
+Generate and execute a Plan inside the same Run when the application explicitly requests it:
+
+```python
+result = await agent.run("Research and publish a report", planning=True)
+```
+
+The planning model call must return a JSON `ExecutionPlan`. It is validated for identifiers,
+dependencies, cycles, initial statuses, and supported executors before any Step Tool runs. Planning,
+Step execution, and final summarization all belong to the same Run, so cancellation, Events,
+Provider usage, and actual token totals remain correlated.
+
+The HTTP equivalent is:
+
+```json
+{
+  "prompt": "Research and publish a report",
+  "planning": true
+}
+```
+
+`plan=` and `planning=True` are mutually exclusive. The built-in strategy currently executes Steps
+sequentially and accepts `executor=null`, `"model"`, or `"react"`; all three use the normal
+permissioned model/Tool loop. A `"react"` Step additionally enables observable iterations,
+multi-Tool ActionBatch/ObservationBatch events, a structured Step result, and a per-Step iteration
+limit. Unknown executor names fail before model or Tool execution. Parallel Steps, parallel Tool
+execution, custom executor registries, and retry/skip policies remain future work.
+
+Strategies must use `update_execution_plan(context, services, updated_plan)` when changing a
+running plan. That operation updates the Run snapshot and emits `plan.updated`, `step.started`,
+`step.waiting`, `step.resumed`, `step.completed`, `step.failed`, or `step.cancelled` events. Plans
+are serialized into waiting checkpoints, so human input resumes the same Run and Step.
+
+Applications may replace only Plan behavior while retaining the normal non-Plan strategy:
+
+```python
+runtime = AgentRuntime(planning_strategy=PlanningStrategy(summarize=False))
+```
+
+Applications that require a fixed supplied Plan may explicitly use
+`PlanningStrategy(replan_after_step=False)`.
+
+If an application supplies a custom primary `strategy`, the Runtime does not silently override it
+for Plans unless `planning_strategy` is also supplied.
+
+See [ReAct on the Shared Model/Tool Loop](REACT.md) for standalone ReAct, Plan Step selection,
+ActionBatch semantics, and WAITING/resume behavior.
 
 Execution plans describe orchestration state; Skills still carry reusable instructions and domain
 workflows, while Tools perform atomic effects. A BI or lineage application therefore owns its

@@ -74,6 +74,48 @@ result = await handle.result()
 
 See [Background Runs and Events](RUNS.md) for cancellation and cursor replay.
 
+## Execute a Plan
+
+Pass a validated Plan or ask the same Run to create one:
+
+```python
+from base_agent import ExecutionPlan, PlanStep
+
+plan = ExecutionPlan(
+    id="report",
+    title="Build report",
+    steps=(
+        PlanStep(id="inspect", description="Inspect the source"),
+        PlanStep(
+            id="publish",
+            description="Publish the result",
+            dependencies=("inspect",),
+        ),
+    ),
+)
+
+supplied = await agent.run("Build the report", plan=plan)
+generated = await agent.run("Build the report", planning=True)
+```
+
+Both paths use the normal Run, Tool, Event, cancellation, WAITING/resume, and token-usage
+infrastructure. After each completed Step, the Planner replaces only the remaining work while the
+Runtime preserves all executed Steps and results unchanged. Calling `agent.run(prompt)` without
+either option retains the standard model → Tool loop.
+
+Run the entire Agent as explicit ReAct while keeping the same Model/Tool runtime:
+
+```python
+from base_agent import AgentRuntime, ReActStrategy
+
+agent = Agent(
+    profile=profile,
+    model=model,
+    tools=tools,
+    runtime=AgentRuntime(strategy=ReActStrategy()),
+)
+```
+
 ## Continue learning
 
 - [Copy the application starter](../starter/README.md)
@@ -83,6 +125,8 @@ See [Background Runs and Events](RUNS.md) for cancellation and cursor replay.
 - [Background Runs and Events](RUNS.md)
 - [Conversations and Run-backed Turns](CONVERSATIONS.md)
 - [Model Providers](PROVIDERS.md)
+- [Orchestration and Plans](ORCHESTRATION.md)
+- [ReAct on the shared Model/Tool loop](REACT.md)
 - [Reference Design Decisions](REFERENCE_DESIGN.md)
 - [Troubleshooting](TROUBLESHOOTING.md)
 - [Architecture](ARCHITECTURE.md)

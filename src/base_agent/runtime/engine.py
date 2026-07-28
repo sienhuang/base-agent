@@ -26,6 +26,7 @@ from base_agent.models import (
 from base_agent.orchestration import (
     ModelToolStrategy,
     OrchestrationStrategy,
+    PlanningStrategy,
     RuntimeServices,
 )
 from base_agent.orchestration.supervision import apply_supervision_decision
@@ -57,8 +58,18 @@ logger = logging.getLogger(__name__)
 class AgentRuntime:
     """Own run lifecycle while delegating each bounded turn to a strategy."""
 
-    def __init__(self, strategy: OrchestrationStrategy | None = None) -> None:
+    def __init__(
+        self,
+        strategy: OrchestrationStrategy | None = None,
+        *,
+        planning_strategy: OrchestrationStrategy | None = None,
+    ) -> None:
         self.strategy = strategy or ModelToolStrategy()
+        self.planning_strategy = (
+            planning_strategy
+            if planning_strategy is not None
+            else (PlanningStrategy() if strategy is None else None)
+        )
 
     def create_context(
         self,
@@ -72,6 +83,7 @@ class AgentRuntime:
         skills: tuple[Skill, ...] = (),
         enabled_tool_names: tuple[str, ...] | None = None,
         plan: ExecutionPlan | None = None,
+        planning_requested: bool = False,
         attachments: tuple[Attachment, ...] = (),
     ) -> RuntimeContext:
         if not prompt.strip():
@@ -89,6 +101,8 @@ class AgentRuntime:
             raise ValueError(
                 "conversation_id and turn_sequence must be provided together"
             )
+        if plan is not None and planning_requested:
+            raise ValueError("plan and planning_requested cannot be used together")
         context = RuntimeContext(
             profile=profile,
             messages=[
@@ -103,6 +117,7 @@ class AgentRuntime:
                 profile.tools if enabled_tool_names is None else enabled_tool_names
             ),
             plan=plan,
+            planning_requested=planning_requested,
             attachments=attachments,
             input_text=prompt,
         )
@@ -190,6 +205,12 @@ class AgentRuntime:
             artifacts=artifacts,
             memories=memories,
         )
+        active_strategy = (
+            self.planning_strategy
+            if (context.plan is not None or context.planning_requested)
+            and self.planning_strategy is not None
+            else self.strategy
+        )
         logger.info(
             "runtime execution started",
             extra={
@@ -247,7 +268,7 @@ class AgentRuntime:
                 if context.state_machine.state is not ExecutionState.RUNNING:
                     break
 
-                await self.strategy.advance(context, services)
+                await active_strategy.advance(context, services)
         except asyncio.CancelledError as exc:
             execution_error = exc
             logger.warning(
@@ -276,6 +297,8 @@ class AgentRuntime:
         finally:
             context.resource_failures.extend(await resources.close(execution_error))
 
+        if isinstance(active_strategy, PlanningStrategy):
+            await active_strategy.settle(context, services)
         result = self._build_result(context)
         if context.state is ExecutionState.WAITING:
             await active_checkpoint_store.save(RuntimeCheckpoint.from_context(context))
@@ -499,6 +522,12 @@ class AgentRuntime:
                 "steps": context.step_count,
                 "tool_calls": context.tool_call_count,
                 "provider": context.provider_name,
+                "planning_requested": context.planning_requested,
+                **(
+                    {"react": context.supervision_data["react_strategy"]}
+                    if "react_strategy" in context.supervision_data
+                    else {}
+                ),
                 "model_calls": len(context.responses),
                 "pending_input": (
                     context.pending_input.model_dump(mode="json")

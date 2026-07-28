@@ -16,6 +16,7 @@ class StartRunRequest(BaseModel):
     skills: tuple[str, ...] = ()
     attachment_ids: tuple[UUID, ...] = ()
     plan: ExecutionPlan | None = None
+    planning: bool = False
 
 
 class StartRunResponse(BaseModel):

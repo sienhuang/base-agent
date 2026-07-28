@@ -144,6 +144,7 @@ def create_app(
                 skills=payload.skills,
                 attachments=attachments,
                 plan=payload.plan,
+                planning=payload.planning,
             )
             run = await handle.get_run()
         except AttachmentNotFoundError as exc:

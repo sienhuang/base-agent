@@ -129,6 +129,7 @@ class Agent:
         conversation_id: UUID | None = None,
         skills: Iterable[str] = (),
         plan: ExecutionPlan | None = None,
+        planning: bool = False,
         attachments: Iterable[Attachment] = (),
     ) -> AgentResult:
         active_run_id = run_id or uuid4()
@@ -147,6 +148,7 @@ class Agent:
                 "profile_id": self.profile.id,
                 "skill_count": len(selected_skill_names),
                 "attachment_count": len(selected_attachment_refs),
+                "planning_requested": planning,
             },
         )
         turn: ConversationTurn | None = None
@@ -188,6 +190,7 @@ class Agent:
                 skills=selected_skills,
                 enabled_tool_names=enabled_tool_names,
                 plan=plan,
+                planning_requested=planning,
                 attachments=selected_attachments,
             )
             result = await self.runtime.execute(
@@ -360,6 +363,7 @@ class Agent:
         conversation_id: UUID | None = None,
         skills: Iterable[str] = (),
         plan: ExecutionPlan | None = None,
+        planning: bool = False,
         attachments: Iterable[Attachment] = (),
     ) -> RunHandle:
         """Start a Run in the current event loop and return after its record is created."""
@@ -371,6 +375,7 @@ class Agent:
                 conversation_id=conversation_id,
                 skills=skills,
                 plan=plan,
+                planning=planning,
                 attachments=tuple(attachments),
             ),
             name=f"base-agent-run-{active_run_id}",

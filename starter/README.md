@@ -69,6 +69,25 @@ uv run agent-app --chat --no-skill
 
 Every user Turn creates a different Run linked to the same Conversation. Use `/exit` to stop.
 
+Generate and execute a Plan inside one offline Run:
+
+```bash
+uv run agent-app --plan --no-skill "complete planned work"
+```
+
+Without `--plan`, the Starter retains the normal model → Tool → model behavior.
+With `--plan`, each completed Step is preserved while the offline Planner replaces only remaining
+work; the real Provider follows the same Planner/ReAct lifecycle.
+
+Run the whole task with ReAct on the same Model/Tool loop:
+
+```bash
+uv run agent-app --react --no-skill "count this text"
+```
+
+`--react` emits observable ReAct iterations and requires a structured final result. It is mutually
+exclusive with `--plan`; normal execution remains the default.
+
 Every Agent process automatically writes rotating JSON Lines logs to `logs/base-agent.log`. Set
 `BASE_AGENT_LOG_FILE` to choose another path and `BASE_AGENT_LOG_LEVEL` to change the default
 `INFO` level. Prompts, model output, Tool arguments, and secrets are not logged.

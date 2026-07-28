@@ -26,6 +26,7 @@ Applications depend on `base-agent`; the core never imports application or domai
 | `Runtime` | Advances the model/tool loop and emits events. |
 | `OrchestrationStrategy` | Advances one bounded turn; replaceable without replacing Run lifecycle. |
 | `ExecutionPlan` | Immutable dependency graph and step lifecycle used by planning strategies. |
+| `ReActStrategy` | Opt-in iteration semantics layered on the shared Model/Tool strategy. |
 | `Resource` | Task-local stateful capability acquired and released around execution. |
 | `ModelProvider` | Converts runtime requests into provider responses. |
 | `Tool` | Typed, atomic executable capability. |

@@ -30,6 +30,7 @@ class RunTaskManager:
         skills: Iterable[str] = (),
         attachments: Iterable[Attachment] = (),
         plan: ExecutionPlan | None = None,
+        planning: bool = False,
     ) -> RunHandle:
         handle = await self.agent.start(
             prompt,
@@ -37,6 +38,7 @@ class RunTaskManager:
             skills=skills,
             attachments=attachments,
             plan=plan,
+            planning=planning,
         )
         self._handles[handle.run_id] = handle
         watcher = asyncio.create_task(

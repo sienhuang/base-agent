@@ -7,7 +7,10 @@ from base_agent.models import (
     EventType,
     Message,
     ModelRequest,
+    ModelResponse,
     PendingInput,
+    ToolCall,
+    ToolDefinition,
     ToolResult,
     ToolResultStatus,
 )
@@ -20,18 +23,20 @@ from base_agent.supervision import SupervisionAction
 from base_agent.tools import ToolContext, ToolExecutor, ToolRegistry
 
 logger = logging.getLogger(__name__)
+_SUSPENDED_ACTION_BATCH_KEY = "model_tool_suspended_action_batch"
+
+ToolObservation = tuple[ToolCall, ToolResult]
 
 
 class ModelToolStrategy:
     """The reference ReAct-style loop used by AgentRuntime by default."""
 
     async def advance(self, context: RuntimeContext, services: RuntimeServices) -> None:
+        if await self._resume_action_batch(context, services):
+            return
         context.step_count += 1
-        definitions = (
-            services.tool_registry.definitions(context.enabled_tool_names)
-            if services.tool_registry is not None
-            else ()
-        )
+        await self._before_model_request(context, services)
+        definitions = self._tool_definitions(context, services)
         request = ModelRequest(
             messages=tuple(context.messages),
             tools=definitions,
@@ -82,8 +87,11 @@ class ModelToolStrategy:
                     "error_type": type(exc).__name__,
                 },
             )
-            context.error = f"model provider '{services.provider.name}' failed: {exc}"
-            context.state_machine.transition_to(ExecutionState.FAILED)
+            await self._fail_execution(
+                context,
+                services,
+                f"model provider '{services.provider.name}' failed: {exc}",
+            )
             return
         logger.info(
             "model request completed",
@@ -114,14 +122,42 @@ class ModelToolStrategy:
         if await self._cancel_if_requested(context, services):
             return
         if not response.tool_calls:
-            context.output = response.content
-            context.state_machine.transition_to(ExecutionState.COMPLETED)
+            await self._on_iteration_completed(
+                context,
+                services,
+                response,
+                had_actions=False,
+            )
+            await self._complete_response(
+                context,
+                services,
+                response.content or "",
+            )
             return
 
+        calls = self._select_tool_calls(context, response)
+        await self._on_action_batch_selected(context, services, calls)
+        await self._execute_tool_batch(
+            context,
+            services,
+            calls,
+            response=response,
+        )
+
+    async def _execute_tool_batch(
+        self,
+        context: RuntimeContext,
+        services: RuntimeServices,
+        calls: tuple[ToolCall, ...],
+        *,
+        response: ModelResponse,
+        observations: list[ToolObservation] | None = None,
+    ) -> None:
         executor = services.tool_executor or ToolExecutor(
             services.tool_registry or ToolRegistry()
         )
-        for call in response.tool_calls:
+        collected = observations or []
+        for index, call in enumerate(calls):
             if await self._cancel_if_requested(context, services):
                 return
             call_data = {"step": context.step_count, "call": call.model_dump(mode="json")}
@@ -203,6 +239,20 @@ class ModelToolStrategy:
                 },
             )
             if result.status is ToolResultStatus.WAITING:
+                context.supervision_data[_SUSPENDED_ACTION_BATCH_KEY] = {
+                    "waiting_call": call.model_dump(mode="json"),
+                    "remaining_calls": [
+                        item.model_dump(mode="json") for item in calls[index + 1 :]
+                    ],
+                    "observations": [
+                        {
+                            "call": observed_call.model_dump(mode="json"),
+                            "result": observed_result.model_dump(mode="json"),
+                        }
+                        for observed_call, observed_result in collected
+                    ],
+                    "response": response.model_dump(mode="json"),
+                }
                 wait_data = result.data if isinstance(result.data, dict) else {}
                 prompt = wait_data.get("prompt")
                 if not isinstance(prompt, str) or not prompt.strip():
@@ -216,8 +266,11 @@ class ModelToolStrategy:
                             "tool_call_id": call.id,
                         },
                     )
-                    context.error = f"tool '{call.name}' returned an invalid input request"
-                    context.state_machine.transition_to(ExecutionState.FAILED)
+                    await self._fail_execution(
+                        context,
+                        services,
+                        f"tool '{call.name}' returned an invalid input request",
+                    )
                     return
                 metadata = wait_data.get("metadata")
                 context.pending_input = PendingInput(
@@ -236,6 +289,7 @@ class ModelToolStrategy:
                         "result": result.model_dump(mode="json"),
                     },
                 )
+                await self._wait_for_input(context, services)
                 await save_context_snapshot(context, services.run_store)
                 return
 
@@ -254,6 +308,7 @@ class ModelToolStrategy:
                 },
             )
             context.messages.append(Message.tool(result.model_dump_json(), tool_call_id=call.id))
+            collected.append((call, result))
             decision = await services.supervisor.after_tool(context, call, result)
             if decision.action is not SupervisionAction.CONTINUE:
                 await apply_supervision_decision(context, decision, services.event_store)
@@ -261,6 +316,165 @@ class ModelToolStrategy:
                 return
             if await self._cancel_if_requested(context, services):
                 return
+        await self._on_observation_batch_recorded(
+            context,
+            services,
+            tuple(collected),
+        )
+        await self._on_iteration_completed(
+            context,
+            services,
+            response,
+            had_actions=True,
+        )
+        await save_context_snapshot(context, services.run_store)
+
+    async def _resume_action_batch(
+        self,
+        context: RuntimeContext,
+        services: RuntimeServices,
+    ) -> bool:
+        raw = context.supervision_data.pop(_SUSPENDED_ACTION_BATCH_KEY, None)
+        if raw is None:
+            return False
+        try:
+            if not isinstance(raw, dict):
+                raise TypeError("suspended action batch must be an object")
+            waiting_call = ToolCall.model_validate(raw["waiting_call"])
+            remaining = tuple(
+                ToolCall.model_validate(item) for item in raw["remaining_calls"]
+            )
+            response = ModelResponse.model_validate(raw["response"])
+            observations = [
+                (
+                    ToolCall.model_validate(item["call"]),
+                    ToolResult.model_validate(item["result"]),
+                )
+                for item in raw["observations"]
+            ]
+            waiting_result = self._find_tool_result(context, waiting_call.id)
+        except (KeyError, TypeError, ValueError) as exc:
+            await self._fail_execution(
+                context,
+                services,
+                f"invalid suspended action batch: {exc}",
+            )
+            return True
+
+        observations.append((waiting_call, waiting_result))
+        if remaining:
+            await self._execute_tool_batch(
+                context,
+                services,
+                remaining,
+                response=response,
+                observations=observations,
+            )
+            return True
+        await self._on_observation_batch_recorded(
+            context,
+            services,
+            tuple(observations),
+        )
+        await self._on_iteration_completed(
+            context,
+            services,
+            response,
+            had_actions=True,
+        )
+        await save_context_snapshot(context, services.run_store)
+        return True
+
+    @staticmethod
+    def _has_suspended_action_batch(context: RuntimeContext) -> bool:
+        return _SUSPENDED_ACTION_BATCH_KEY in context.supervision_data
+
+    @staticmethod
+    def _find_tool_result(context: RuntimeContext, tool_call_id: str) -> ToolResult:
+        for message in reversed(context.messages):
+            if message.tool_call_id == tool_call_id and message.content is not None:
+                return ToolResult.model_validate_json(message.content)
+        raise ValueError(f"missing resumed ToolResult for call '{tool_call_id}'")
+
+    def _select_tool_calls(
+        self,
+        context: RuntimeContext,
+        response: ModelResponse,
+    ) -> tuple[ToolCall, ...]:
+        del context
+        return response.tool_calls
+
+    async def _before_model_request(
+        self,
+        context: RuntimeContext,
+        services: RuntimeServices,
+    ) -> None:
+        del context, services
+
+    async def _on_action_batch_selected(
+        self,
+        context: RuntimeContext,
+        services: RuntimeServices,
+        calls: tuple[ToolCall, ...],
+    ) -> None:
+        del context, services, calls
+
+    async def _on_observation_batch_recorded(
+        self,
+        context: RuntimeContext,
+        services: RuntimeServices,
+        observations: tuple[ToolObservation, ...],
+    ) -> None:
+        del context, services, observations
+
+    async def _on_iteration_completed(
+        self,
+        context: RuntimeContext,
+        services: RuntimeServices,
+        response: ModelResponse,
+        *,
+        had_actions: bool,
+    ) -> None:
+        del context, services, response, had_actions
+
+    def _tool_definitions(
+        self,
+        context: RuntimeContext,
+        services: RuntimeServices,
+    ) -> tuple[ToolDefinition, ...]:
+        return (
+            services.tool_registry.definitions(context.enabled_tool_names)
+            if services.tool_registry is not None
+            else ()
+        )
+
+    async def _complete_response(
+        self,
+        context: RuntimeContext,
+        services: RuntimeServices,
+        content: str,
+    ) -> None:
+        del services
+        context.output = content
+        context.state_machine.transition_to(ExecutionState.COMPLETED)
+
+    async def _fail_execution(
+        self,
+        context: RuntimeContext,
+        services: RuntimeServices,
+        error: str,
+    ) -> None:
+        del services
+        context.error = error
+        if context.state is ExecutionState.RUNNING:
+            context.state_machine.transition_to(ExecutionState.FAILED)
+
+    async def _wait_for_input(
+        self,
+        context: RuntimeContext,
+        services: RuntimeServices,
+    ) -> None:
+        del context, services
 
     @staticmethod
     async def _cancel_if_requested(

@@ -17,17 +17,51 @@ class OfflineModel:
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         last = request.messages[-1]
+        react_enabled = any(
+            "Use an iterative ReAct process" in (message.content or "")
+            for message in request.messages
+        )
         if last.role is MessageRole.TOOL:
             payload = json.loads(last.content or "{}")
             counts = payload.get("data", {})
-            return ModelResponse(
-                content=(
-                    "Offline starter completed the Tool loop: "
-                    f"{counts.get('words', 0)} words, "
-                    f"{counts.get('characters', 0)} characters."
+            result = (
+                "Offline starter completed the Tool loop: "
+                f"{counts.get('words', 0)} words, "
+                f"{counts.get('characters', 0)} characters."
+            )
+            if react_enabled:
+                return ModelResponse(
+                    content=json.dumps(
+                        {"success": True, "result": result, "attachments": []}
+                    )
                 )
+            return ModelResponse(
+                content=result
             )
         prompt = last.content or ""
+        if prompt.startswith("Create a concise execution plan"):
+            return ModelResponse(
+                content=json.dumps(
+                    {
+                        "id": "offline-plan",
+                        "title": "Offline planned task",
+                        "steps": [
+                            {
+                                "id": "execute",
+                                "description": "Complete the requested task",
+                                "executor": "model",
+                                "dependencies": [],
+                            }
+                        ],
+                    }
+                )
+            )
+        if prompt.startswith("Execute exactly one step"):
+            return ModelResponse(content="Offline planned step completed.")
+        if prompt.startswith("Update the execution plan"):
+            return ModelResponse(content=json.dumps({"steps": []}))
+        if prompt.startswith("The execution plan is complete"):
+            return ModelResponse(content="Offline planned Run completed.")
         return ModelResponse(
             tool_calls=(
                 ToolCall(

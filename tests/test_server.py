@@ -132,6 +132,44 @@ async def test_server_conversation_runs_share_history_through_the_normal_run_api
 
 
 @pytest.mark.asyncio
+async def test_server_can_generate_and_execute_plan_in_one_run() -> None:
+    model = FakeModel(
+        [
+            ModelResponse(
+                content=(
+                    '{"id":"http-plan","title":"HTTP plan","steps":['
+                    '{"id":"work","description":"Do the work","dependencies":[]}]}'
+                )
+            ),
+            ModelResponse(content="step done"),
+            ModelResponse(content='{"steps":[]}'),
+            ModelResponse(content="all done"),
+        ]
+    )
+    agent = Agent(
+        profile=AgentProfile(id="planning-server", instructions="Work."),
+        model=model,
+    )
+
+    async with server_client(agent) as (client, _):
+        started = await client.post(
+            "/v1/runs",
+            json={"prompt": "plan and execute", "planning": True},
+        )
+        run = await wait_for_status(
+            client,
+            started.json()["run_id"],
+            RunStatus.COMPLETED,
+        )
+
+    assert started.status_code == 202
+    assert run["metadata"]["planning_requested"] is True
+    assert run["metadata"]["plan"]["status"] == "completed"
+    assert run["output"] == "all done"
+    assert len(model.requests) == 4
+
+
+@pytest.mark.asyncio
 async def test_server_rejects_overlapping_conversation_runs() -> None:
     model = ControlledModel()
     agent = Agent(

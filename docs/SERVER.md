@@ -49,12 +49,15 @@ Start requests accept structured references, not inline binary payloads:
 {
   "prompt": "Inspect the uploaded report",
   "skills": ["report-analysis"],
-  "attachment_ids": ["2d82ad67-f683-4993-97db-4310f19b15d8"]
+  "attachment_ids": ["2d82ad67-f683-4993-97db-4310f19b15d8"],
+  "planning": true
 }
 ```
 
 `POST /v1/runs` also accepts an optional `conversation_id`. The path-scoped Conversation Run route
 is a semantic alias and uses the same `Agent.start()` and `RunTaskManager` implementation.
+Set `planning=true` to generate and execute a Plan inside that Run, or pass a validated `plan`
+object. These two fields are mutually exclusive.
 
 The referenced Attachments must already exist in the Agent's ArtifactStore. Upload policy,
 malware scanning, size limits, tenant ownership, and retention remain application concerns.

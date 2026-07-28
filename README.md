@@ -37,6 +37,7 @@ All examples are deterministic and offline. Start with the
 - [Background Runs and Events](docs/RUNS.md)
 - [Conversations and Run-backed Turns](docs/CONVERSATIONS.md)
 - [Orchestration Strategies and Plans](docs/ORCHESTRATION.md)
+- [ReAct on the Shared Model/Tool Loop](docs/REACT.md)
 - [Execution-scoped Resources](docs/RESOURCES.md)
 - [Attachments and Artifacts](docs/ARTIFACTS.md)
 - [Optional Memory Retrieval](docs/MEMORY.md)

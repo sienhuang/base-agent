@@ -49,6 +49,7 @@ class RuntimeCheckpoint(BaseModel):
     supervision_data: dict[str, Any] = Field(default_factory=dict)
     pending_input: PendingInput
     plan: ExecutionPlan | None = None
+    planning_requested: bool = False
     resource_failures: tuple[ResourceFailure, ...] = ()
     attachments: tuple[Attachment, ...] = ()
     artifacts: tuple[Artifact, ...] = ()
@@ -86,6 +87,7 @@ class RuntimeCheckpoint(BaseModel):
             supervision_data=context.supervision_data,
             pending_input=context.pending_input,
             plan=context.plan,
+            planning_requested=context.planning_requested,
             resource_failures=tuple(context.resource_failures),
             attachments=context.attachments,
             artifacts=tuple(context.artifacts),
@@ -118,6 +120,7 @@ class RuntimeCheckpoint(BaseModel):
             supervision_data=dict(self.supervision_data),
             pending_input=self.pending_input,
             plan=self.plan,
+            planning_requested=self.planning_requested,
             resource_failures=list(self.resource_failures),
             attachments=self.attachments,
             artifacts=list(self.artifacts),

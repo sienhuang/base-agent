@@ -31,15 +31,27 @@ async def update_execution_plan(
 
     previous_steps = {step.id: step for step in previous.steps}
     event_types = {
-        StepStatus.RUNNING: EventType.STEP_STARTED,
+        StepStatus.WAITING: EventType.STEP_WAITING,
         StepStatus.COMPLETED: EventType.STEP_COMPLETED,
         StepStatus.FAILED: EventType.STEP_FAILED,
+        StepStatus.CANCELLED: EventType.STEP_CANCELLED,
+        StepStatus.SKIPPED: EventType.STEP_SKIPPED,
     }
     for step in plan.steps:
         old_step = previous_steps.get(step.id)
         if old_step is None or old_step.status is step.status:
             continue
-        event_type = event_types.get(step.status)
+        event_type = (
+            EventType.STEP_RESUMED
+            if old_step is not None
+            and old_step.status is StepStatus.WAITING
+            and step.status is StepStatus.RUNNING
+            else (
+                EventType.STEP_STARTED
+                if step.status is StepStatus.RUNNING
+                else event_types.get(step.status)
+            )
+        )
         if event_type is not None:
             await services.event_store.emit(
                 context.run_id,
