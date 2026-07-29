@@ -30,6 +30,12 @@ async def count_items(value: str) -> int:
     return len(value.split())
 
 
+@tool
+async def fail_with_secret() -> None:
+    """Fail with a value that the file formatter must redact."""
+    raise RuntimeError("tool failed: api_key=should-not-be-logged")
+
+
 @pytest.mark.asyncio
 async def test_agent_automatically_writes_correlated_redacted_file_logs(
     tmp_path: Path,
@@ -168,3 +174,46 @@ async def test_http_logs_include_validated_request_id(
     assert request_records[-1]["request_id"] == "request-123"
     assert request_records[-1]["method"] == "POST"
     assert request_records[-1]["path"] == "/v1/runs"
+
+
+@pytest.mark.asyncio
+async def test_tool_failures_log_warning_with_redacted_error_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log_file = tmp_path / "tool-error.jsonl"
+    monkeypatch.setenv("BASE_AGENT_LOG_FILE", str(log_file))
+    model = FakeModel(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(id="failure-1", name="fail_with_secret", arguments={}),
+                )
+            ),
+            ModelResponse(content="handled"),
+        ]
+    )
+    agent = Agent(
+        profile=AgentProfile(
+            id="tool-error-agent",
+            instructions="Call the failing Tool.",
+            tools=("fail_with_secret",),
+        ),
+        model=model,
+        tools=(fail_with_secret,),
+    )
+
+    result = await agent.run("fail")
+    failure = next(
+        record
+        for record in _records(log_file)
+        if record.get("event") == "tool.execution.finished"
+        and record.get("status") == "error"
+    )
+
+    assert failure["run_id"] == result.metadata["run_id"]
+    assert failure["level"] == "WARNING"
+    assert failure["tool_name"] == "fail_with_secret"
+    assert failure["error_code"] == "tool_execution_error"
+    assert failure["error_message"] == "tool failed: api_key=[REDACTED]"
+    assert "should-not-be-logged" not in log_file.read_text()

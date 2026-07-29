@@ -59,10 +59,13 @@ result = await agent.run("Build the report", plan=plan)
 
 Normal `agent.run(prompt)` behavior is unchanged. With a Plan, the built-in `PlanningStrategy`
 selects the first ready Step, executes it through the same model → Tool loop, records its result,
-and then asks the Planner model to regenerate all remaining work. The Runtime retains every
-completed, failed, cancelled, or skipped Step unchanged and replaces only not-yet-executed Steps.
-The merged graph is validated again before execution continues. An empty remaining `steps` array
-ends execution, after which one Tool-free model call synthesizes the final answer.
+and then asks the Planner model to review all remaining work. The Runtime retains every completed,
+failed, cancelled, or skipped Step unchanged. If the proposed remaining Steps equal the current
+pending Steps, it emits `plan.reviewed` with `changed=false` and does not mutate the Plan or increase
+its revision. Only a structural difference replaces not-yet-executed Steps and emits
+`plan.updated`. The merged graph is validated again before execution continues. An empty remaining
+`steps` array ends execution when no pending work remains, after which one Tool-free model call
+synthesizes the final answer.
 
 This follows a Planner/ReAct lifecycle:
 
@@ -74,10 +77,11 @@ PLANNING → EXECUTING_STEP → UPDATING_PLAN ─┐
                                 SUMMARIZING
 ```
 
-The updating model call returns JSON shaped as `{"steps": [...]}`. Those Steps may add, remove,
+The review model call returns JSON shaped as `{"steps": [...]}`. Those Steps may add, remove,
 split, merge, or reorder future work and may depend on retained historical Step IDs. They must
 start pending, use IDs distinct from retained history, and form a valid acyclic graph. Returning
-`{"steps": []}` means the original task is complete.
+the existing pending Steps unchanged means no update is required. Returning `{"steps": []}` means
+the original task is complete.
 
 Generate and execute a Plan inside the same Run when the application explicitly requests it:
 
@@ -107,9 +111,11 @@ limit. Unknown executor names fail before model or Tool execution. Parallel Step
 execution, custom executor registries, and retry/skip policies remain future work.
 
 Strategies must use `update_execution_plan(context, services, updated_plan)` when changing a
-running plan. That operation updates the Run snapshot and emits `plan.updated`, `step.started`,
-`step.waiting`, `step.resumed`, `step.completed`, `step.failed`, or `step.cancelled` events. Plans
-are serialized into waiting checkpoints, so human input resumes the same Run and Step.
+running plan. Planner assessment emits `plan.reviewed`. Lifecycle changes emit `step.started`,
+`step.waiting`, `step.resumed`, `step.completed`, `step.failed`, or `step.cancelled`, each carrying
+the current Plan snapshot; they do not masquerade as a structural `plan.updated`. Only a changed
+future graph emits `plan.updated`. Plans are serialized into waiting checkpoints, so human input
+resumes the same Run and Step.
 
 Applications may replace only Plan behavior while retaining the normal non-Plan strategy:
 

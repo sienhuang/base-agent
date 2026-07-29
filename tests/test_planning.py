@@ -110,7 +110,7 @@ async def test_default_runtime_executes_supplied_plan_and_summarizes() -> None:
         "Inspected 10 rows.",
         "Published report.md.",
     ]
-    assert final_plan.metadata["replan_count"] == 2
+    assert final_plan.metadata["replan_count"] == 1
     assert stored.metadata["plan"] == result.metadata["plan"]
     assert len(model.requests) == 5
     assert "Current step [inspect]" in (model.requests[0].messages[-1].content or "")
@@ -130,7 +130,8 @@ async def test_default_runtime_executes_supplied_plan_and_summarizes() -> None:
     event_types = [event.type for event in events]
     assert event_types.count(EventType.STEP_STARTED) == 2
     assert event_types.count(EventType.STEP_COMPLETED) == 2
-    assert event_types.count(EventType.PLAN_UPDATED) == 6
+    assert event_types.count(EventType.PLAN_REVIEWED) == 2
+    assert event_types.count(EventType.PLAN_UPDATED) == 1
     assert event_types[-1] is EventType.RUN_COMPLETED
 
 
@@ -186,7 +187,6 @@ async def test_planning_flag_generates_and_executes_plan_in_same_run() -> None:
     assert final_plan.metadata == {
         "generated": True,
         "provider": "fake-model",
-        "replan_count": 1,
     }
     assert model.requests[0].tools == ()
     assert "Create a concise execution plan" in (
@@ -195,6 +195,8 @@ async def test_planning_flag_generates_and_executes_plan_in_same_run() -> None:
     assert [event.type for event in events].count(EventType.PLAN_CREATED) == 1
     assert [event.type for event in events].count(EventType.STEP_STARTED) == 1
     assert [event.type for event in events].count(EventType.STEP_COMPLETED) == 1
+    assert [event.type for event in events].count(EventType.PLAN_REVIEWED) == 1
+    assert [event.type for event in events].count(EventType.PLAN_UPDATED) == 0
 
 
 @pytest.mark.asyncio

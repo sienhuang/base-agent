@@ -104,7 +104,12 @@ class PlanningStrategy(ModelToolStrategy):
         waiting = self._step_with_status(plan, StepStatus.WAITING)
         if waiting is not None:
             plan = plan.resume_step(waiting.id)
-            await update_execution_plan(context, services, plan)
+            await update_execution_plan(
+                context,
+                services,
+                plan,
+                emit_plan_updated=False,
+            )
 
         running = self._step_with_status(plan, StepStatus.RUNNING)
         if running is None:
@@ -114,7 +119,12 @@ class PlanningStrategy(ModelToolStrategy):
                 return
             running = ready[0]
             plan = plan.start_step(running.id)
-            await update_execution_plan(context, services, plan)
+            await update_execution_plan(
+                context,
+                services,
+                plan,
+                emit_plan_updated=False,
+            )
             prompt = (
                 self._react_step_prompt(context, plan, running)
                 if running.executor == "react"
@@ -185,7 +195,12 @@ class PlanningStrategy(ModelToolStrategy):
             plan = self._require_plan(context)
             try:
                 future_steps = self._parse_replanned_steps(content)
-                updated = self._merge_replanned_steps(plan, future_steps)
+                changed = not self._future_steps_unchanged(plan, future_steps)
+                updated = (
+                    self._merge_replanned_steps(plan, future_steps)
+                    if changed
+                    else plan
+                )
                 self._validate_executors(updated)
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 await self._fail_execution(
@@ -194,7 +209,21 @@ class PlanningStrategy(ModelToolStrategy):
                     f"model generated an invalid updated execution plan: {exc}",
                 )
                 return
-            await update_execution_plan(context, services, updated)
+            await services.event_store.emit(
+                context.run_id,
+                EventType.PLAN_REVIEWED,
+                {
+                    "plan_id": plan.id,
+                    "revision": plan.revision,
+                    "changed": changed,
+                    "completed_step_id": state.get("completed_step_id"),
+                    "proposed_steps": [
+                        step.model_dump(mode="json") for step in future_steps
+                    ],
+                },
+            )
+            if changed:
+                await update_execution_plan(context, services, updated)
             state["phase"] = _PHASE_EXECUTING
             state.pop("completed_step_id", None)
             if updated.status is PlanStatus.COMPLETED:
@@ -240,7 +269,12 @@ class PlanningStrategy(ModelToolStrategy):
             state.pop("react", None)
         else:
             completed = plan.complete_step(running.id, content)
-        await update_execution_plan(context, services, completed)
+        await update_execution_plan(
+            context,
+            services,
+            completed,
+            emit_plan_updated=False,
+        )
         if self.replan_after_step:
             state["phase"] = _PHASE_UPDATING
             state["completed_step_id"] = running.id
@@ -264,7 +298,12 @@ class PlanningStrategy(ModelToolStrategy):
             PlanStatus.FAILED,
             PlanStatus.CANCELLED,
         }:
-            await update_execution_plan(context, services, plan.fail(error))
+            await update_execution_plan(
+                context,
+                services,
+                plan.fail(error),
+                emit_plan_updated=False,
+            )
         await super()._fail_execution(context, services, error)
 
     async def _wait_for_input(
@@ -281,7 +320,12 @@ class PlanningStrategy(ModelToolStrategy):
                 "planning strategy cannot suspend without an active step",
             )
             return
-        await update_execution_plan(context, services, plan.wait_step(running.id))
+        await update_execution_plan(
+            context,
+            services,
+            plan.wait_step(running.id),
+            emit_plan_updated=False,
+        )
 
     async def _settle_terminal_plan(
         self,
@@ -300,12 +344,14 @@ class PlanningStrategy(ModelToolStrategy):
                 context,
                 services,
                 plan.cancel(context.error or "run cancelled"),
+                emit_plan_updated=False,
             )
         elif context.state in {ExecutionState.FAILED, ExecutionState.LIMIT_REACHED}:
             await update_execution_plan(
                 context,
                 services,
                 plan.fail(context.error or f"run ended with {context.state.value}"),
+                emit_plan_updated=False,
             )
 
     async def _handle_no_ready_step(
@@ -545,6 +591,16 @@ class PlanningStrategy(ModelToolStrategy):
             if old_step != retained_step:
                 raise ValueError("updated plan changed settled step history")
         return updated
+
+    @staticmethod
+    def _future_steps_unchanged(
+        plan: ExecutionPlan,
+        future_steps: tuple[PlanStep, ...],
+    ) -> bool:
+        current_future = tuple(
+            step for step in plan.steps if step.status is StepStatus.PENDING
+        )
+        return current_future == future_steps
 
     @staticmethod
     def _step_with_status(

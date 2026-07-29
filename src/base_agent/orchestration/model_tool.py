@@ -24,8 +24,17 @@ from base_agent.tools import ToolContext, ToolExecutor, ToolRegistry
 
 logger = logging.getLogger(__name__)
 _SUSPENDED_ACTION_BATCH_KEY = "model_tool_suspended_action_batch"
+_TOOL_ERROR_LOG_LIMIT = 1_000
 
 ToolObservation = tuple[ToolCall, ToolResult]
+
+
+def _bounded_error_message(message: str | None) -> str | None:
+    if message is None:
+        return None
+    if len(message) <= _TOOL_ERROR_LOG_LIMIT:
+        return message
+    return f"{message[:_TOOL_ERROR_LOG_LIMIT]}…"
 
 
 class ModelToolStrategy:
@@ -225,7 +234,14 @@ class ModelToolStrategy:
                     memories=services.memories,
                 ),
             )
-            logger.info(
+            tool_log_level = (
+                logging.INFO
+                if result.status
+                in {ToolResultStatus.SUCCESS, ToolResultStatus.WAITING}
+                else logging.WARNING
+            )
+            logger.log(
+                tool_log_level,
                 "tool execution finished",
                 extra={
                     "event": "tool.execution.finished",
@@ -235,6 +251,7 @@ class ModelToolStrategy:
                     "tool_call_id": call.id,
                     "status": result.status.value,
                     "error_code": result.error_code,
+                    "error_message": _bounded_error_message(result.message),
                     "duration_ms": round((monotonic() - tool_started_at) * 1000, 3),
                 },
             )

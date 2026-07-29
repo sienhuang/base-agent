@@ -4,8 +4,52 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import replace
+from typing import cast
+from uuid import UUID
+
+from base_agent import Agent, AgentResult, EventType, RuntimeEvent
 
 from agent_app.agent import build_agent
+from agent_app.config import ProviderName, Settings
+
+
+def _print_tool_failure(event: RuntimeEvent) -> None:
+    if event.type is not EventType.TOOL_FAILED:
+        return
+    payload = event.data.get("result")
+    if not isinstance(payload, dict):
+        return
+    print(
+        f"[tool.failed] run_id={event.run_id} "
+        f"tool={payload.get('tool_name', 'unknown')} "
+        f"call_id={event.data.get('call_id', 'unknown')} "
+        f"error_code={payload.get('error_code', 'unknown')}",
+        flush=True,
+    )
+    message = payload.get("message")
+    if isinstance(message, str) and message:
+        print(f"message: {message}", flush=True)
+
+
+async def _execute(
+    agent: Agent,
+    prompt: str,
+    *,
+    skills: tuple[str, ...],
+    planning: bool,
+    conversation_id: UUID | None = None,
+) -> AgentResult:
+    result = await agent.run(
+        prompt,
+        conversation_id=conversation_id,
+        skills=skills,
+        planning=planning,
+    )
+    run_id = UUID(str(result.metadata["run_id"]))
+    for event in await agent.events(run_id):
+        _print_tool_failure(event)
+    return result
 
 
 async def run(
@@ -14,9 +58,11 @@ async def run(
     use_skill: bool = True,
     planning: bool = False,
     react: bool = False,
+    settings: Settings | None = None,
 ) -> int:
-    agent = build_agent(react=react)
-    result = await agent.run(
+    agent = build_agent(settings, react=react)
+    result = await _execute(
+        agent,
         prompt,
         skills=("text-analysis",) if use_skill else (),
         planning=planning,
@@ -34,9 +80,10 @@ async def run_chat(
     use_skill: bool = True,
     planning: bool = False,
     react: bool = False,
+    settings: Settings | None = None,
 ) -> int:
     """Run an interactive Conversation whose every user Turn is a normal Run."""
-    agent = build_agent(react=react)
+    agent = build_agent(settings, react=react)
     conversation = await agent.create_conversation()
     print(f"conversation_id={conversation.id}")
     print("Enter /exit to stop.")
@@ -46,7 +93,8 @@ async def run_chat(
             return 0
         if not prompt:
             continue
-        result = await agent.run(
+        result = await _execute(
+            agent,
             prompt,
             conversation_id=conversation.id,
             skills=("text-analysis",) if use_skill else (),
@@ -83,7 +131,42 @@ def main() -> None:
         action="store_true",
         help="Run without selecting the example text-analysis Skill",
     )
+    parser.add_argument(
+        "--provider",
+        choices=("offline", "openai", "codex-cli", "claude-cli"),
+        help="Override AGENT_PROVIDER for this invocation",
+    )
+    parser.add_argument(
+        "--model",
+        help="Override AGENT_MODEL; omit to use the local CLI default model",
+    )
+    parser.add_argument(
+        "--cli-executable",
+        help="Override the codex or claude executable path",
+    )
     arguments = parser.parse_args()
+    provider_override = (
+        cast(ProviderName, arguments.provider)
+        if arguments.provider is not None
+        else None
+    )
+    settings = Settings.from_env(provider=provider_override)
+    if (
+        provider_override in {"codex-cli", "claude-cli"}
+        and arguments.model is None
+    ):
+        settings = replace(settings, model=None)
+    if arguments.model is not None:
+        if not arguments.model.strip():
+            parser.error("--model must not be blank")
+        settings = replace(settings, model=arguments.model.strip())
+    if arguments.cli_executable is not None:
+        if not arguments.cli_executable.strip():
+            parser.error("--cli-executable must not be blank")
+        settings = replace(
+            settings,
+            cli_executable=arguments.cli_executable.strip(),
+        )
     if arguments.chat:
         raise SystemExit(
             asyncio.run(
@@ -91,6 +174,7 @@ def main() -> None:
                     use_skill=not arguments.no_skill,
                     planning=arguments.plan,
                     react=arguments.react,
+                    settings=settings,
                 )
             )
         )
@@ -103,6 +187,7 @@ def main() -> None:
                 use_skill=not arguments.no_skill,
                 planning=arguments.plan,
                 react=arguments.react,
+                settings=settings,
             )
         )
     )

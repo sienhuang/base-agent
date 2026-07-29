@@ -61,7 +61,7 @@ async def test_offline_agent_can_generate_and_execute_plan() -> None:
     assert result.metadata["planning_requested"] is True
     assert result.metadata["plan"]["status"] == "completed"
     assert result.metadata["model_calls"] == 4
-    assert result.metadata["plan"]["metadata"]["replan_count"] == 1
+    assert "replan_count" not in result.metadata["plan"]["metadata"]
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,7 @@ All examples are deterministic and offline. Start with the
 
 - [中文架构与扩展指南](docs/ARCHITECTURE_GUIDE_ZH.md)
 - [Writing Tools](docs/TOOLS.md)
+- [Built-in ToolKit](docs/BUILTIN_TOOLS.md)
 - [Writing Skills](docs/SKILLS.md)
 - [Testing Agents](docs/TESTING.md)
 - [Background Runs and Events](docs/RUNS.md)
@@ -50,6 +51,7 @@ All examples are deterministic and offline. Start with the
 - [Browser Sessions and Playwright Adapter](docs/BROWSER.md)
 - [Copyable Agent Application Starter](starter/README.md)
 - [Model Providers](docs/PROVIDERS.md)
+- [Local Codex and Claude CLI Providers](docs/CLI_PROVIDERS.md)
 - [Reference Design Decisions](docs/REFERENCE_DESIGN.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 

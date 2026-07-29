@@ -6,7 +6,7 @@ small enough to understand in one sitting but includes the boundaries most Agent
 - one composition root in `agent_app/agent.py`;
 - environment-backed Provider selection;
 - a reusable offline Provider that exercises a real Model → Tool → Model loop;
-- a typed, permissioned example Tool;
+- a typed, permissioned example Tool plus the safe built-in ToolKit;
 - a versioned Skill with an explicit allowlist;
 - an asynchronous CLI and optional FastAPI entry point;
 - Run-backed multi-Turn Conversations through the same `Agent.run()` path;
@@ -92,6 +92,9 @@ Every Agent process automatically writes rotating JSON Lines logs to `logs/base-
 `BASE_AGENT_LOG_FILE` to choose another path and `BASE_AGENT_LOG_LEVEL` to change the default
 `INFO` level. Prompts, model output, Tool arguments, and secrets are not logged.
 
+Tool failures are printed by the CLI with their `run_id`, Tool name, call ID, error code, and
+message. The file log records the failure at `WARNING` with a redacted, bounded `error_message`.
+
 ## Test and check
 
 ```bash
@@ -115,6 +118,18 @@ uv run agent-app "Analyze this request"
 Set `OPENAI_BASE_URL` for a compatible endpoint. `.env.example` documents variables, but the
 starter does not automatically read `.env`; use your deployment secret/configuration system.
 
+## Use a local Codex or Claude CLI Provider
+
+```bash
+uv run agent-app --provider codex-cli --no-skill "Analyze this request"
+uv run agent-app --provider claude-cli --model sonnet --no-skill "Analyze this request"
+```
+
+The adapters start trusted local executables without a shell, in an empty temporary directory,
+with bounded output and a five-minute timeout. Codex uses an ephemeral read-only sandbox; Claude
+has its built-in Tools and session persistence disabled. Application Tool calls return through the
+normal base-agent Runtime.
+
 ## Run the optional HTTP API
 
 ```bash
@@ -129,10 +144,18 @@ environment.
 ## What to change first
 
 1. Replace the profile id and instructions in `agent_app/agent.py`.
-2. Replace `word_count` with small domain Tools; declare permissions for reads and side effects.
+2. Replace `word_count` with small domain Tools; keep only the built-in Tools the profile needs.
 3. Replace `src/agent_app/skills/text-analysis/SKILL.md` with versioned domain procedures.
 4. Keep the offline Provider for deterministic tests even after enabling a real Provider.
 5. Add PostgreSQL, Redis, MCP, Sandbox, Browser, or Memory only when the application requires them.
+
+## Built-in tools
+
+The Starter registers the dependency-free `basic_tools()` bundle and exposes bounded user-input,
+calculation, date/time, workspace-read, attachment, and Artifact tools. Local workspace writes are
+registered but not exposed by the Starter profile; opt in by adding `workspace_write_text` and the
+`workspace:write` permission. `search_memory` is registered but not exposed until a retriever is
+configured.
 
 ## Composition rules
 

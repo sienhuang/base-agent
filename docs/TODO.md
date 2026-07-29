@@ -204,7 +204,7 @@ Implemented:
 - [x] Preserve Plan/Step state through WAITING and resume.
 - [x] Emit start, wait, resume, complete, fail, cancel, and Plan revision events.
 - [x] Produce a Tool-free final model summary after all Steps complete.
-- [x] Replan after every completed Step while retaining immutable execution history.
+- [x] Review after every completed Step and replan only when pending work changes.
 - [x] Permit new future Steps to depend on retained completed Step IDs.
 - [x] Reject replans with duplicate IDs, missing dependencies, cycles, or non-pending new Steps.
 - [x] Add standalone and Plan-Step ReAct on the shared Model/Tool loop.
@@ -232,11 +232,11 @@ payloads, and Artifact-reference handling. The detailed contract and acceptance 
 
 ## Priority 2 — Reduce starter capability duplication
 
-Status: not implemented
+Status: implemented
 
-Derive `AgentProfile.tools` from an explicit starter `ENABLED_TOOLS` collection so application
-authors do not repeat Tool names. Keep `REGISTERED_TOOLS`, enabled Tool selection, and granted
-permissions conceptually separate. Never infer granted permissions from Tool requirements.
+- [x] Derive `AgentProfile.tools` from an explicit starter `ENABLED_TOOLS` collection.
+- [x] Keep `REGISTERED_TOOLS`, enabled Tool selection, and granted permissions separate.
+- [x] Never infer granted permissions from Tool requirements.
 
 ## Priority 2 — Context budget and compaction
 

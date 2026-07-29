@@ -25,6 +25,7 @@ class EventType(StrEnum):
     TOOL_WAITING = "tool.waiting"
     INPUT_RECEIVED = "input.received"
     PLAN_CREATED = "plan.created"
+    PLAN_REVIEWED = "plan.reviewed"
     PLAN_UPDATED = "plan.updated"
     STEP_STARTED = "step.started"
     STEP_RESUMED = "step.resumed"

@@ -37,6 +37,11 @@ included where applicable. `model.request.completed` reports one Provider call, 
 `runtime.execution.finished`, `run.finished`, and `run.resume_finished` report the actual token
 usage accumulated across the whole Run together with `model_call_count`.
 
+Successful and waiting Tool completions are written at `INFO`. Denied, invalid, missing, timed-out,
+and failed Tool results are written at `WARNING` with `run_id`, `tool_name`, `tool_call_id`,
+`error_code`, and a redacted `error_message` capped at 1,000 characters. Tool arguments and result
+data remain excluded.
+
 Prompts, model response bodies, Tool arguments, resume input, HTTP bodies, and Conversation metadata
 values are intentionally excluded. The formatter also redacts common credential assignments,
 Bearer tokens, AWS access-key IDs, and OpenAI-style secret keys if they occur in an exception

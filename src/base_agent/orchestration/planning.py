@@ -10,6 +10,8 @@ async def update_execution_plan(
     context: RuntimeContext,
     services: RuntimeServices,
     plan: ExecutionPlan,
+    *,
+    emit_plan_updated: bool = True,
 ) -> None:
     """Replace a context plan, persist it, and emit generic lifecycle events."""
 
@@ -21,11 +23,12 @@ async def update_execution_plan(
             raise ValueError("an updated plan must have a newer revision")
     context.plan = plan
     await save_context_snapshot(context, services.run_store)
-    await services.event_store.emit(
-        context.run_id,
-        EventType.PLAN_CREATED if previous is None else EventType.PLAN_UPDATED,
-        {"plan": plan.model_dump(mode="json")},
-    )
+    if previous is None or emit_plan_updated:
+        await services.event_store.emit(
+            context.run_id,
+            EventType.PLAN_CREATED if previous is None else EventType.PLAN_UPDATED,
+            {"plan": plan.model_dump(mode="json")},
+        )
     if previous is None:
         return
 
@@ -56,5 +59,9 @@ async def update_execution_plan(
             await services.event_store.emit(
                 context.run_id,
                 event_type,
-                {"plan_id": plan.id, "step": step.model_dump(mode="json")},
+                {
+                    "plan_id": plan.id,
+                    "step": step.model_dump(mode="json"),
+                    "plan": plan.model_dump(mode="json"),
+                },
             )

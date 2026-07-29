@@ -99,9 +99,10 @@ generated = await agent.run("Build the report", planning=True)
 ```
 
 Both paths use the normal Run, Tool, Event, cancellation, WAITING/resume, and token-usage
-infrastructure. After each completed Step, the Planner replaces only the remaining work while the
-Runtime preserves all executed Steps and results unchanged. Calling `agent.run(prompt)` without
-either option retains the standard model → Tool loop.
+infrastructure. After each completed Step, the Planner reviews the remaining work while the Runtime
+preserves all executed Steps and results unchanged. An unchanged proposal does not mutate the Plan;
+only a structural difference replaces pending Steps. Calling `agent.run(prompt)` without either
+option retains the standard model → Tool loop.
 
 Run the entire Agent as explicit ReAct while keeping the same Model/Tool runtime:
 
