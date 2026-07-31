@@ -1,4 +1,4 @@
-"""Internal, zero-configuration file logging for base-agent."""
+"""Internal structured logging support for base-agent."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ _DEFAULT_RETENTION_DAYS = 30
 _handler_lock = threading.Lock()
 _active_handler: TimedRotatingFileHandler | None = None
 _active_path: Path | None = None
+_active_retention_days: int | None = None
 
 _request_id: ContextVar[str | None] = ContextVar("base_agent_request_id", default=None)
 _conversation_id: ContextVar[str | None] = ContextVar(
@@ -55,42 +56,56 @@ _BEARER_TOKEN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 _OPENAI_STYLE_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 
 
-def ensure_file_logging() -> Path:
+def configure_file_logging(
+    path: str | Path | None = None,
+    *,
+    level: str | int | None = None,
+    retention_days: int = _DEFAULT_RETENTION_DAYS,
+) -> Path:
     """Install one package-scoped rotating file handler and return its path."""
 
-    global _active_handler, _active_path
+    global _active_handler, _active_path, _active_retention_days
 
-    configured = os.getenv("BASE_AGENT_LOG_FILE")
+    if retention_days < 1:
+        raise ValueError("retention_days must be at least 1")
+
+    configured = path if path is not None else os.getenv("BASE_AGENT_LOG_FILE")
     desired_path = (
         Path(configured).expanduser()
-        if configured and configured.strip()
+        if configured is not None and str(configured).strip()
         else Path.cwd() / "logs" / "base-agent.log"
     )
     desired_path = desired_path.resolve()
+    configured_level = _log_level(level)
 
     with _handler_lock:
-        if _active_handler is not None and _active_path == desired_path:
-            logging.getLogger(_LOGGER_NAME).setLevel(_log_level())
+        if (
+            _active_handler is not None
+            and _active_path == desired_path
+            and _active_retention_days == retention_days
+        ):
+            logging.getLogger(_LOGGER_NAME).setLevel(configured_level)
             return desired_path
 
         try:
             desired_path.parent.mkdir(parents=True, exist_ok=True)
-            handler = _build_handler(desired_path)
+            handler = _build_handler(desired_path, retention_days)
         except OSError:
             fallback = Path(tempfile.gettempdir()) / "base-agent" / "base-agent.log"
             fallback.parent.mkdir(parents=True, exist_ok=True)
             desired_path = fallback.resolve()
-            handler = _build_handler(desired_path)
+            handler = _build_handler(desired_path, retention_days)
 
         package_logger = logging.getLogger(_LOGGER_NAME)
         if _active_handler is not None:
             package_logger.removeHandler(_active_handler)
             _active_handler.close()
         package_logger.addHandler(handler)
-        package_logger.setLevel(_log_level())
+        package_logger.setLevel(configured_level)
         package_logger.propagate = False
         _active_handler = handler
         _active_path = desired_path
+        _active_retention_days = retention_days
         return desired_path
 
 
@@ -136,12 +151,12 @@ def reset_log_context(tokens: tuple[Token[Any], ...]) -> None:
     _request_id.reset(tokens[0])
 
 
-def _build_handler(path: Path) -> TimedRotatingFileHandler:
+def _build_handler(path: Path, retention_days: int) -> TimedRotatingFileHandler:
     handler = TimedRotatingFileHandler(
         path,
         when="midnight",
         interval=1,
-        backupCount=_DEFAULT_RETENTION_DAYS,
+        backupCount=retention_days,
         encoding="utf-8",
         utc=False,
     )
@@ -149,10 +164,12 @@ def _build_handler(path: Path) -> TimedRotatingFileHandler:
     return handler
 
 
-def _log_level() -> int:
-    configured = os.getenv("BASE_AGENT_LOG_LEVEL", "INFO").strip().upper()
-    level = logging.getLevelName(configured)
-    return level if isinstance(level, int) else logging.INFO
+def _log_level(configured: str | int | None) -> int:
+    if isinstance(configured, int):
+        return configured
+    value = configured or os.environ.get("BASE_AGENT_LOG_LEVEL", "INFO")
+    resolved = logging.getLevelName(value.strip().upper())
+    return resolved if isinstance(resolved, int) else logging.INFO
 
 
 class _JsonFormatter(logging.Formatter):

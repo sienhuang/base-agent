@@ -110,6 +110,12 @@ async def test_postgres_store_implements_core_ports_and_round_trips_data() -> No
         cancelled = await store.request_cancel(run.id)
         assert cancelled.cancel_requested is True
         assert await store.is_cancel_requested(run.id) is True
+        stale_snapshot = run.model_copy(
+            update={"status": RunStatus.RUNNING},
+            deep=True,
+        )
+        await store.save(stale_snapshot)
+        assert (await store.get(run.id)).cancel_requested is True
         await store.save(cancelled.model_copy(update={"status": RunStatus.COMPLETED}))
         with pytest.raises(RunNotCancellableError):
             await store.request_cancel(run.id)

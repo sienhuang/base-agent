@@ -1,7 +1,14 @@
 # File Logging
 
-`Agent` automatically writes structured JSON Lines logs. No logging adapter or application setup is
-required.
+The core library installs only a `NullHandler`. Constructing an `Agent` does not create files or
+change propagation for the `base_agent` logger. Applications that want the built-in structured
+JSON Lines file logs must enable them explicitly:
+
+```python
+from base_agent.logging import configure_file_logging
+
+log_path = configure_file_logging()
+```
 
 The default file is resolved from the process working directory:
 
@@ -22,6 +29,20 @@ export BASE_AGENT_LOG_LEVEL=INFO
 
 A relative `BASE_AGENT_LOG_FILE` is resolved from the working directory. The default level is
 `INFO`; standard Python levels such as `DEBUG`, `WARNING`, and `ERROR` are accepted.
+
+Applications can pass configuration directly instead of using environment variables:
+
+```python
+configure_file_logging(
+    "/var/log/my-agent/runtime.log",
+    level="INFO",
+    retention_days=30,
+)
+```
+
+Explicit arguments take precedence over their corresponding environment variables. Calling the
+function again replaces the package's previous file handler when the path or retention changes.
+The Starter application calls this function from its composition root.
 
 Each record contains correlation fields when available:
 

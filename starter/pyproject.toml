@@ -15,6 +15,9 @@ openai = [
 server = [
     "base-agent[server]>=0.1,<0.2",
 ]
+coding = [
+    "docker>=7.1,<8",
+]
 
 [dependency-groups]
 dev = [
@@ -26,10 +29,21 @@ dev = [
 
 [project.scripts]
 agent-app = "agent_app.cli:main"
+agent-app-raft-worker = "agent_app.raft_worker:main"
 
 [build-system]
 requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build]
+exclude = [
+    "/.uv-cache",
+    "/.venv",
+    "/.mypy_cache",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "/dist",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_app"]

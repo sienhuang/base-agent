@@ -1,7 +1,25 @@
 """Public package for the base-agent runtime."""
 
+import logging as _stdlib_logging
+
 from base_agent.agent import Agent
 from base_agent.artifacts import ArtifactAccessError, ArtifactManager
+from base_agent.data_sources import (
+    DataCatalogPage,
+    DataColumn,
+    DataObjectKind,
+    DataQueryResult,
+    DataSourceBundle,
+    DataTable,
+    DataTableSchema,
+    InvalidMtbiCliResponseError,
+    MtbiCliDataSource,
+    MtbiCliError,
+    MtbiEngine,
+    ReadOnlyDataSource,
+    data_source_bundle,
+    data_source_tools,
+)
 from base_agent.memory import (
     InMemoryMemoryStore,
     MemoryManager,
@@ -113,8 +131,11 @@ from base_agent.supervision import (
     Supervisor,
 )
 from base_agent.toolkits import (
+    CodingBundle,
     artifact_tools,
     basic_tools,
+    coding_bundle,
+    docker_coding_bundle,
     interaction_tools,
     memory_tools,
     utility_tools,
@@ -130,6 +151,28 @@ from base_agent.tools import (
     ToolRegistry,
     tool,
 )
+from base_agent.web_search import (
+    BraveWebSearchProvider,
+    InvalidWebSearchResponseError,
+    WebSearchBundle,
+    WebSearchFreshness,
+    WebSearchProvider,
+    WebSearchProviderError,
+    WebSearchQuery,
+    WebSearchResponse,
+    WebSearchResponseLimitError,
+    WebSearchResult,
+    WebSearchTransportError,
+    web_search_bundle,
+    web_search_tools,
+)
+
+_package_logger = _stdlib_logging.getLogger(__name__)
+if not any(
+    type(handler) is _stdlib_logging.NullHandler
+    for handler in _package_logger.handlers
+):
+    _package_logger.addHandler(_stdlib_logging.NullHandler())
 
 __version__ = "0.1.0"
 
@@ -147,6 +190,7 @@ __all__ = [
     "Attachment",
     "BaseSupervisor",
     "basic_tools",
+    "BraveWebSearchProvider",
     "CheckpointStore",
     "CLIExecutableNotFoundError",
     "CLIModelProvider",
@@ -155,11 +199,23 @@ __all__ = [
     "CLIProcessTimeoutError",
     "CLIProviderError",
     "ClaudeCLIProvider",
+    "CodingBundle",
     "Conversation",
     "ConversationStore",
     "ConversationTurn",
     "CompositeSupervisor",
     "CodexCLIProvider",
+    "coding_bundle",
+    "DataCatalogPage",
+    "DataColumn",
+    "DataObjectKind",
+    "DataQueryResult",
+    "DataSourceBundle",
+    "DataTable",
+    "DataTableSchema",
+    "data_source_bundle",
+    "data_source_tools",
+    "docker_coding_bundle",
     "DuplicateToolCallDetector",
     "ExecutionState",
     "ExecutionBudget",
@@ -170,6 +226,8 @@ __all__ = [
     "ExecutionPlan",
     "InvalidPlanTransitionError",
     "InvalidStateTransitionError",
+    "InvalidMtbiCliResponseError",
+    "InvalidWebSearchResponseError",
     "interaction_tools",
     "EventStreamingNotSupportedError",
     "Message",
@@ -187,10 +245,14 @@ __all__ = [
     "ModelRequest",
     "ModelResponse",
     "ModelToolStrategy",
+    "MtbiCliDataSource",
+    "MtbiCliError",
+    "MtbiEngine",
     "OrchestrationStrategy",
     "PlanningStrategy",
     "ReActResult",
     "ReActStrategy",
+    "ReadOnlyDataSource",
     "PendingInput",
     "PlanStatus",
     "PlanStep",
@@ -241,6 +303,15 @@ __all__ = [
     "ToolResultStatus",
     "ContextualTool",
     "WaitForInput",
+    "WebSearchBundle",
+    "WebSearchFreshness",
+    "WebSearchProvider",
+    "WebSearchProviderError",
+    "WebSearchQuery",
+    "WebSearchResponse",
+    "WebSearchResponseLimitError",
+    "WebSearchResult",
+    "WebSearchTransportError",
     "FunctionTool",
     "RuntimeContext",
     "tool",
@@ -248,6 +319,8 @@ __all__ = [
     "UnsupportedAttachmentError",
     "UnsupportedMemoryError",
     "utility_tools",
+    "web_search_bundle",
+    "web_search_tools",
     "workspace_tools",
     "__version__",
 ]

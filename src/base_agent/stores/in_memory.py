@@ -321,9 +321,20 @@ class InMemoryRunStore:
 
     async def save(self, run: Run) -> None:
         async with self._lock:
-            if run.id not in self._runs:
-                raise RunNotFoundError(f"run '{run.id}' was not found")
-            self._runs[run.id] = run.model_copy(deep=True)
+            try:
+                current = self._runs[run.id]
+            except KeyError as exc:
+                raise RunNotFoundError(f"run '{run.id}' was not found") from exc
+            # Cancellation is a monotonic signal. A Runtime snapshot may have
+            # been built from a stale read that predates request_cancel().
+            # Merge under the same lock so that snapshot persistence can
+            # never clear an accepted cancellation request.
+            updated = (
+                run.model_copy(update={"cancel_requested": True}, deep=True)
+                if current.cancel_requested and not run.cancel_requested
+                else run.model_copy(deep=True)
+            )
+            self._runs[run.id] = updated
 
     async def request_cancel(self, run_id: UUID) -> Run:
         async with self._lock:

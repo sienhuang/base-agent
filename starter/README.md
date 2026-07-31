@@ -88,7 +88,8 @@ uv run agent-app --react --no-skill "count this text"
 `--react` emits observable ReAct iterations and requires a structured final result. It is mutually
 exclusive with `--plan`; normal execution remains the default.
 
-Every Agent process automatically writes rotating JSON Lines logs to `logs/base-agent.log`. Set
+The Starter composition root explicitly enables rotating JSON Lines logs at
+`logs/base-agent.log`. Core `Agent` construction does not configure file logging. Set
 `BASE_AGENT_LOG_FILE` to choose another path and `BASE_AGENT_LOG_LEVEL` to change the default
 `INFO` level. Prompts, model output, Tool arguments, and secrets are not logged.
 
@@ -141,6 +142,24 @@ The Server exposes the standard Run, resume, cancellation, event, and Artifact e
 application authentication and durable stores before exposing it outside a trusted development
 environment.
 
+## Run as a Raft External Agent
+
+Raft remains an optional hosted control plane. The application owns the Agent Runtime and connects
+through the authenticated Raft CLI:
+
+```bash
+export RAFT_PROFILE=my-external-agent
+export RAFT_AGENT_ID=00000000-0000-0000-0000-000000000000
+export RAFT_AGENT_HANDLE=my-external-agent
+export RAFT_CLI_EXECUTABLE=/absolute/path/to/raft
+uv run agent-app-raft-worker
+```
+
+Use `--once` to drain the current inbox without starting the long-lived wake bridge. The Worker
+accepts DMs, explicit `@handle` mentions, assigned tasks, and replies to waiting Runs. It owns task
+claims and moves successful tasks to `in_review`; the model never receives the Raft credential.
+See the base-agent [`docs/RAFT.md`](../docs/RAFT.md) contract before production use.
+
 ## What to change first
 
 1. Replace the profile id and instructions in `agent_app/agent.py`.
@@ -156,6 +175,41 @@ calculation, date/time, workspace-read, attachment, and Artifact tools. Local wo
 registered but not exposed by the Starter profile; opt in by adding `workspace_write_text` and the
 `workspace:write` permission. `search_memory` is registered but not exposed until a retriever is
 configured.
+
+## Opt-in data and development capabilities
+
+Coding uses a disposable Docker Sandbox and requires the optional dependency plus a preloaded
+image:
+
+```bash
+uv sync --extra coding
+docker pull python:3.12
+uv run agent-app --provider codex-cli --no-skill \
+  --coding --sandbox-image python:3.12 \
+  "Write and execute Python to calculate a confidence interval"
+```
+
+Web Search uses the Brave adapter:
+
+```bash
+export BRAVE_SEARCH_API_KEY='...'
+uv run agent-app --provider codex-cli --no-skill --web-search \
+  "Find and cite the current documentation for this API"
+```
+
+The company data path uses the installed `mtbi-cli`. Metadata is resolved through `meta`; bounded
+read-only SQL is executed through OneSQL:
+
+```bash
+uv run agent-app --provider codex-cli --no-skill \
+  --mtbi --mtbi-engine PRESTO \
+  "Inspect the relevant table metadata and summarize daily metrics"
+```
+
+Equivalent environment settings are `AGENT_ENABLE_CODING`, `AGENT_SANDBOX_IMAGE`,
+`AGENT_ENABLE_WEB_SEARCH`, `BRAVE_SEARCH_API_KEY`, `AGENT_ENABLE_MTBI`,
+`AGENT_MTBI_CLI_EXECUTABLE`, `AGENT_MTBI_ENGINE`, and `AGENT_MTBI_REGION`. Enabling a bundle adds its
+Tool names and permissions explicitly during Starter composition; none is enabled by default.
 
 ## Composition rules
 

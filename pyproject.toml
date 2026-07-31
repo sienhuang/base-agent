@@ -39,6 +39,22 @@ browser = [
 requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+exclude = [
+    "/.uv-cache",
+    "/.venv",
+    "/.mypy_cache",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "/dist",
+    "/starter/.uv-cache",
+    "/starter/.venv",
+    "/starter/.mypy_cache",
+    "/starter/.pytest_cache",
+    "/starter/.ruff_cache",
+    "/starter/dist",
+]
+
 [dependency-groups]
 dev = [
     "asyncpg>=0.30,<1",

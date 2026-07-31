@@ -97,7 +97,7 @@ Status: partially implemented
 
 Available now:
 
-- automatic daily rotating JSON Lines logs;
+- application-configured daily rotating JSON Lines logs;
 - request, Conversation, Run, Turn, Model, and Tool correlation fields;
 - per-model-call and Run-accumulated actual Provider token usage;
 - ordered Run Events, PostgreSQL persistence, Redis notification/replay, HTTP history, and SSE.
@@ -229,6 +229,23 @@ Status: designed, not implemented
 Add a provider-independent serialized ToolResult size guard, typed overflow behavior, bounded event
 payloads, and Artifact-reference handling. The detailed contract and acceptance outline live in
 [`TOOLS.md`](TOOLS.md#planned-runtime-enforcement).
+
+## Priority 1 — Data analysis and development bundles
+
+Status: first concrete versions implemented
+
+- [x] Compose isolated Sandbox Tools and Resource as an explicit `CodingBundle`.
+- [x] Add provider-neutral Web Search values, Tool, Bundle, and Brave adapter.
+- [x] Add a provider-neutral read-only DataSource Bundle and `mtbi-cli`/OneSQL adapter.
+- [x] Externalize oversized bounded DataSource query results as Run Artifacts.
+- [x] Keep Tool enablement and permission grants explicit in AgentProfile/Starter configuration.
+- [ ] Add safe project snapshot import, Patch Artifact export, and approved Patch application for
+      Coding.
+- [ ] Add a separately permissioned known-URL fetch Tool with SSRF and content-size policy.
+- [ ] Add OneSQL detach/fetch/cancel handling, query resume, and scan/cost policy for long-running
+      MTBI queries.
+- [ ] Re-evaluate a generic public Capability contract only after these concrete bundles have
+      established common lifecycle, conflict, and authorization behavior.
 
 ## Priority 2 — Reduce starter capability duplication
 

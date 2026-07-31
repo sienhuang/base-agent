@@ -79,3 +79,42 @@ async def test_offline_agent_can_run_as_standalone_react_agent() -> None:
     assert EventType.REACT_ACTION_BATCH_SELECTED in [
         event.type for event in events
     ]
+
+
+def test_starter_composes_explicit_data_and_coding_bundles() -> None:
+    agent = build_agent(
+        Settings(
+            provider="offline",
+            enable_coding=True,
+            sandbox_image="python:3.12",
+            enable_web_search=True,
+            brave_search_api_key="test-search-key",
+            enable_mtbi=True,
+        )
+    )
+
+    assert {
+        "sandbox_read_text",
+        "sandbox_write_text",
+        "sandbox_execute",
+        "web_search",
+        "data_list_tables",
+        "data_describe_table",
+        "data_query",
+    }.issubset(agent.profile.tools)
+    assert {
+        "sandbox:read",
+        "sandbox:write",
+        "sandbox:execute",
+        "web:search",
+        "data:read",
+    }.issubset(agent.profile.permissions)
+    assert [resource.name for resource in agent.resources] == ["coding-sandbox"]
+
+
+def test_starter_requires_configuration_for_enabled_external_capabilities() -> None:
+    with pytest.raises(ValueError, match="AGENT_SANDBOX_IMAGE"):
+        build_agent(Settings(provider="offline", enable_coding=True))
+
+    with pytest.raises(ValueError, match="BRAVE_SEARCH_API_KEY"):
+        build_agent(Settings(provider="offline", enable_web_search=True))

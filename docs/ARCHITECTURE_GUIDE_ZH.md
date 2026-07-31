@@ -159,6 +159,9 @@ ModelProvider / Tool / Store / Resource / Memory / Browser / Sandbox Protocol
 | `memory/` | 可选检索契约、初始化和 Tool 查询入口。 | [`manager.py`](../src/base_agent/memory/manager.py) |
 | `stores/` | Store Protocol、内存默认实现及可选持久化适配器。 | [`protocol.py`](../src/base_agent/stores/protocol.py)、[`in_memory.py`](../src/base_agent/stores/in_memory.py) |
 | `providers/` | ModelProvider Protocol 和模型厂商适配器。 | [`protocol.py`](../src/base_agent/providers/protocol.py) |
+| `toolkits/` | 基础 Tool 工厂以及具体 Coding 组合。 | [`bundle.py`](../src/base_agent/toolkits/bundle.py)、[`coding.py`](../src/base_agent/toolkits/coding.py) |
+| `web_search/` | Web Search Provider、结果模型、Tool 和 Brave 适配器。 | [`protocol.py`](../src/base_agent/web_search/protocol.py) |
+| `data_sources/` | 只读数据源端口、查询 Tool、Artifact 溢出和 MTBI CLI / OneSQL 适配器。 | [`protocol.py`](../src/base_agent/data_sources/protocol.py) |
 | `testing/` | FakeModel、ToolHarness、SkillHarness。 | [`fake_model.py`](../src/base_agent/testing/fake_model.py) |
 
 ### 4.3 可选适配器
@@ -764,6 +767,9 @@ BrowserSession 提供导航、快照、选择器交互和截图。Playwright 实
 | MCP Tool | 可选实现 | `base_agent.mcp` |
 | Docker Sandbox | 可选实现 | `base_agent.sandbox.docker` |
 | Playwright Browser | 可选实现 | `base_agent.browser.playwright` |
+| CodingBundle | 已实现、显式启用 | `docker_coding_bundle` |
+| Web Search | 已实现、显式启用 | `web_search_bundle`、`BraveWebSearchProvider` |
+| 只读 DataSource | 已实现、显式启用 | `data_source_bundle`、`MtbiCliDataSource` |
 
 ## 18. 如何增加能力
 
@@ -933,15 +939,18 @@ Tool、Skill、CLI 和 Server 如何在应用层组合，而不是塞进 Runtime
 下面是与现有架构一致、且边界已经比较清楚的后续方向：
 
 1. ToolResult 统一大小保护、Artifact 引用信封和有界事件；
-2. starter 的 enabled Tool 名称推导，减少重复配置但不自动授予权限；
-3. 上下文预算与历史压缩策略，明确 Event/Checkpoint 保真和模型上下文裁剪的区别；
-4. 独立的 Responses API Provider，支持经过授权的 Attachment 映射；
-5. Memory-capable Provider 或安全的 Memory 注入策略；
-6. 模型输出流式契约及其与 EventStream 的关系；
-7. 面向生产的外部任务 runner、lease 和进程重启恢复；
-8. 对象存储 ArtifactStore 与租户授权；
-9. 显式 Skill 选择器或 Router，但保持选择结果可观察、可验证；
-10. 应用层多 Agent Strategy，不把业务角色写死进核心。
+2. Coding 的安全项目快照、Patch Artifact 和经批准的 Patch 应用；
+3. 带 SSRF/重定向/内容上限策略的已知 URL 获取 Tool；
+4. OneSQL 长查询的 detach/fetch/cancel、恢复和扫描成本限制；
+5. 上下文预算与历史压缩策略，明确 Event/Checkpoint 保真和模型上下文裁剪的区别；
+6. 独立的 Responses API Provider，支持经过授权的 Attachment 映射；
+7. Memory-capable Provider 或安全的 Memory 注入策略；
+8. 模型输出流式契约及其与 EventStream 的关系；
+9. 面向生产的外部任务 runner、lease 和进程重启恢复；
+10. 对象存储 ArtifactStore 与租户授权；
+11. 显式 Skill 选择器或 Router，但保持选择结果可观察、可验证；
+12. 应用层多 Agent Strategy，不把业务角色写死进核心；
+13. 在 Coding/Web Search/DataSource 的真实使用边界稳定后，再评估通用 Capability API。
 
 这些能力应按第 18.8 节的顺序扩展，并优先补充测试与边界说明，再接具体厂商实现。
 详细任务、待决设计和验收标准统一记录在 [`TODO.md`](TODO.md)。
@@ -964,6 +973,9 @@ Tool、Skill、CLI 和 Server 如何在应用层组合，而不是塞进 Runtime
 - MCP：[`MCP.md`](MCP.md)
 - Sandbox：[`SANDBOX.md`](SANDBOX.md)
 - Browser：[`BROWSER.md`](BROWSER.md)
+- Coding：[`CODING.md`](CODING.md)
+- Web Search：[`WEB_SEARCH.md`](WEB_SEARCH.md)
+- 只读 DataSource：[`DATA_SOURCES.md`](DATA_SOURCES.md)
 - 测试：[`TESTING.md`](TESTING.md)
 - 故障排查：[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)
 - 可复制 starter：[`starter/README.md`](../starter/README.md)

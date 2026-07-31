@@ -1,5 +1,8 @@
 import json
 import logging
+import os
+import subprocess
+import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -16,6 +19,7 @@ from base_agent import (
     ToolCall,
     tool,
 )
+from base_agent.logging import configure_file_logging
 from base_agent.server import create_app
 from base_agent.testing import FakeModel
 
@@ -37,12 +41,13 @@ async def fail_with_secret() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_automatically_writes_correlated_redacted_file_logs(
+async def test_configured_file_logging_writes_correlated_redacted_logs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     log_file = tmp_path / "agent.jsonl"
     monkeypatch.setenv("BASE_AGENT_LOG_FILE", str(log_file))
+    configure_file_logging()
     secret_prompt = "never persist AKIAABCDEFGHIJKLMNOP or sk-super-secret-value"
     model = FakeModel(
         [
@@ -145,6 +150,7 @@ async def test_http_logs_include_validated_request_id(
 ) -> None:
     log_file = tmp_path / "http.jsonl"
     monkeypatch.setenv("BASE_AGENT_LOG_FILE", str(log_file))
+    configure_file_logging()
     agent = Agent(
         profile=AgentProfile(id="http-logged-agent", instructions="Work."),
         model=FakeModel([ModelResponse(content="done")]),
@@ -183,6 +189,7 @@ async def test_tool_failures_log_warning_with_redacted_error_message(
 ) -> None:
     log_file = tmp_path / "tool-error.jsonl"
     monkeypatch.setenv("BASE_AGENT_LOG_FILE", str(log_file))
+    configure_file_logging()
     model = FakeModel(
         [
             ModelResponse(
@@ -217,3 +224,64 @@ async def test_tool_failures_log_warning_with_redacted_error_message(
     assert failure["error_code"] == "tool_execution_error"
     assert failure["error_message"] == "tool failed: api_key=[REDACTED]"
     assert "should-not-be-logged" not in log_file.read_text()
+
+
+def test_agent_construction_does_not_configure_file_logging(
+    tmp_path: Path,
+) -> None:
+    script = """
+import logging
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
+
+from base_agent import Agent, AgentProfile
+from base_agent.testing import FakeModel
+
+Agent(
+    profile=AgentProfile(id="quiet-agent", instructions="Work."),
+    model=FakeModel([]),
+)
+package_logger = logging.getLogger("base_agent")
+assert any(type(handler) is logging.NullHandler for handler in package_logger.handlers)
+assert not any(
+    isinstance(handler, TimedRotatingFileHandler)
+    for handler in package_logger.handlers
+)
+assert not Path("logs/base-agent.log").exists()
+"""
+    environment = os.environ.copy()
+    environment.pop("BASE_AGENT_LOG_FILE", None)
+    environment.pop("BASE_AGENT_LOG_LEVEL", None)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_configure_file_logging_accepts_explicit_settings(
+    tmp_path: Path,
+) -> None:
+    log_file = tmp_path / "explicit.jsonl"
+
+    configured_path = configure_file_logging(
+        log_file,
+        level="WARNING",
+        retention_days=7,
+    )
+    package_logger = logging.getLogger("base_agent")
+    handler = next(
+        handler
+        for handler in package_logger.handlers
+        if isinstance(handler, TimedRotatingFileHandler)
+    )
+
+    assert configured_path == log_file.resolve()
+    assert package_logger.level == logging.WARNING
+    assert handler.backupCount == 7

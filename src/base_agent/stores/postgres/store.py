@@ -297,15 +297,30 @@ class PostgresStore:
         await self._save_run(item)
 
     async def _save_run(self, run: Run) -> None:
-        statement = (
-            update(self.tables.runs)
-            .where(self.tables.runs.c.id == run.id)
-            .values(**_run_values(run))
-        )
         async with self.engine.begin() as connection:
-            result = await connection.execute(statement)
-            if result.rowcount == 0:
+            payload = (
+                await connection.execute(
+                    select(self.tables.runs.c.payload)
+                    .where(self.tables.runs.c.id == run.id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if payload is None:
                 raise RunNotFoundError(f"run '{run.id}' was not found")
+            current = Run.model_validate(payload)
+            # Serialize snapshot saves with request_cancel() and preserve the
+            # cancellation signal once accepted. Both payload and the indexed
+            # cancel_requested column must receive the same merged Run.
+            updated = (
+                run.model_copy(update={"cancel_requested": True}, deep=True)
+                if current.cancel_requested and not run.cancel_requested
+                else run
+            )
+            await connection.execute(
+                update(self.tables.runs)
+                .where(self.tables.runs.c.id == run.id)
+                .values(**_run_values(updated))
+            )
 
     async def request_cancel(self, run_id: UUID) -> Run:
         async with self.engine.begin() as connection:

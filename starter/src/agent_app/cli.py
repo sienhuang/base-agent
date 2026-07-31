@@ -144,6 +144,41 @@ def main() -> None:
         "--cli-executable",
         help="Override the codex or claude executable path",
     )
+    parser.add_argument(
+        "--coding",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable the isolated CodingBundle",
+    )
+    parser.add_argument(
+        "--sandbox-image",
+        help="Docker image for --coding, for example python:3.12",
+    )
+    parser.add_argument(
+        "--web-search",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable Brave Web Search; the API key comes from BRAVE_SEARCH_API_KEY",
+    )
+    parser.add_argument(
+        "--mtbi",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable the mtbi-cli metadata and bounded OneSQL DataSource",
+    )
+    parser.add_argument(
+        "--mtbi-cli-executable",
+        help="Override AGENT_MTBI_CLI_EXECUTABLE (default: mtbi-cli)",
+    )
+    parser.add_argument(
+        "--mtbi-engine",
+        choices=("PRESTO", "SPARK", "DORIS"),
+        help="OneSQL execution engine",
+    )
+    parser.add_argument(
+        "--mtbi-region",
+        help="Override the mtbi-cli region",
+    )
     arguments = parser.parse_args()
     provider_override = (
         cast(ProviderName, arguments.provider)
@@ -167,6 +202,37 @@ def main() -> None:
             settings,
             cli_executable=arguments.cli_executable.strip(),
         )
+    if arguments.coding is not None:
+        settings = replace(settings, enable_coding=arguments.coding)
+    if arguments.sandbox_image is not None:
+        if not arguments.sandbox_image.strip():
+            parser.error("--sandbox-image must not be blank")
+        settings = replace(
+            settings,
+            enable_coding=True,
+            sandbox_image=arguments.sandbox_image.strip(),
+        )
+    if arguments.web_search is not None:
+        settings = replace(settings, enable_web_search=arguments.web_search)
+    if arguments.mtbi is not None:
+        settings = replace(settings, enable_mtbi=arguments.mtbi)
+    if arguments.mtbi_cli_executable is not None:
+        if not arguments.mtbi_cli_executable.strip():
+            parser.error("--mtbi-cli-executable must not be blank")
+        settings = replace(
+            settings,
+            mtbi_cli_executable=arguments.mtbi_cli_executable.strip(),
+        )
+    if arguments.mtbi_engine is not None:
+        settings = replace(settings, mtbi_engine=arguments.mtbi_engine)
+    if arguments.mtbi_region is not None:
+        if not arguments.mtbi_region.strip():
+            parser.error("--mtbi-region must not be blank")
+        settings = replace(settings, mtbi_region=arguments.mtbi_region.strip())
+    if settings.enable_coding and settings.sandbox_image is None:
+        parser.error("--coding requires --sandbox-image or AGENT_SANDBOX_IMAGE")
+    if settings.enable_web_search and settings.brave_search_api_key is None:
+        parser.error("--web-search requires BRAVE_SEARCH_API_KEY")
     if arguments.chat:
         raise SystemExit(
             asyncio.run(

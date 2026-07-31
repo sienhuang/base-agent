@@ -63,4 +63,22 @@ from base_agent.sandbox import sandbox_tools
 ```
 
 They are not enabled by `basic_tools()` because they need execution-scoped resources and broader
-permissions. Business actions such as metric queries or lineage repair remain application Tools.
+permissions. Business-specific mutations such as lineage repair remain application Tools.
+
+## Concrete data and development bundles
+
+The following first-party bundles intentionally remain opt-in:
+
+| Bundle | Composition | Permission |
+| --- | --- | --- |
+| `CodingBundle` | Sandbox read/write/argv Tools plus one Sandbox Resource | `sandbox:*` selected by action |
+| `WebSearchBundle` | Bounded `web_search` over a configured Provider | `web:search` |
+| `DataSourceBundle` | Catalog/schema Tools plus bounded MTBI / OneSQL queries | `data:read` |
+
+They expose `tools`, `tool_names`, and `required_permissions`; Coding additionally exposes
+`resources`. Applications still make the authorization decision by selecting Tool names and
+granting permissions in `AgentProfile`.
+
+These are concrete compositions, not a new generic Capability layer. Their common shape will be
+evaluated after real adapters and application usage establish stable lifecycle and permission
+requirements.

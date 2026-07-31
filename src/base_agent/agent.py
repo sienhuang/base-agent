@@ -7,11 +7,7 @@ from time import monotonic
 from typing import Any
 from uuid import UUID, uuid4
 
-from base_agent._logging import (
-    ensure_file_logging,
-    reset_log_context,
-    set_log_context,
-)
+from base_agent._logging import reset_log_context, set_log_context
 from base_agent.memory import MemoryRetriever
 from base_agent.models import (
     AgentResult,
@@ -79,7 +75,6 @@ class Agent:
         memory_failure_mode: MemoryFailureMode = MemoryFailureMode.BEST_EFFORT,
         conversation_history_limit: int = 40,
     ) -> None:
-        log_path = ensure_file_logging()
         self.profile = profile
         self.model = model
         self.runtime = runtime or AgentRuntime()
@@ -117,7 +112,6 @@ class Agent:
                 "model_provider": model.name,
                 "tool_count": len(self.tool_registry),
                 "resource_count": len(self.resources),
-                "log_file": str(log_path),
             },
         )
 

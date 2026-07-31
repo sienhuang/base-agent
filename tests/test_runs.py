@@ -11,6 +11,7 @@ from base_agent import (
     EventType,
     InMemoryEventStore,
     InMemoryRunStore,
+    ModelRequest,
     ModelResponse,
     Run,
     RunStatus,
@@ -141,6 +142,53 @@ async def test_cancellation_does_not_start_the_next_tool_or_model_step() -> None
     assert len(model.requests) == 1
     assert [event.type for event in events].count(EventType.TOOL_REQUESTED) == 1
     assert events[-1].type is EventType.RUN_CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_stale_runtime_snapshot_cannot_clear_cancellation_request() -> None:
+    class CancellationRaceRunStore(InMemoryRunStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.arm_snapshot_race = False
+            self.snapshot_read = asyncio.Event()
+            self.release_snapshot = asyncio.Event()
+            self._intercepted = False
+
+        async def get(self, run_id: UUID) -> Run:
+            run = await super().get(run_id)
+            if self.arm_snapshot_race and not self._intercepted:
+                self._intercepted = True
+                self.snapshot_read.set()
+                await self.release_snapshot.wait()
+            return run
+
+    store = CancellationRaceRunStore()
+
+    class ArmRaceModel(FakeModel):
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            response = await super().complete(request)
+            store.arm_snapshot_race = True
+            return response
+
+    agent = Agent(
+        profile=AgentProfile(id="cancel-race", instructions="Work."),
+        model=ArmRaceModel([ModelResponse(content="too late")]),
+        run_store=store,
+    )
+    run_id = uuid4()
+
+    task = asyncio.create_task(agent.run("work", run_id=run_id))
+    await asyncio.wait_for(store.snapshot_read.wait(), timeout=1)
+    requested = await agent.cancel(run_id)
+    store.release_snapshot.set()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    stored = await agent.get_run(run_id)
+    assert requested.cancel_requested is True
+    assert result.status is AgentResultStatus.CANCELLED
+    assert stored.status is RunStatus.CANCELLED
+    assert stored.cancel_requested is True
+    assert (await agent.events(run_id))[-1].type is EventType.RUN_CANCELLED
 
 
 @pytest.mark.asyncio
