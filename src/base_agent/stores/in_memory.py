@@ -398,6 +398,7 @@ class InMemoryEventStore:
             EventType.RUN_COMPLETED,
             EventType.RUN_FAILED,
             EventType.RUN_CANCELLED,
+            EventType.RUN_INTERRUPTED,
             EventType.RUN_LIMIT_REACHED,
             EventType.RUN_WAITING,
         }

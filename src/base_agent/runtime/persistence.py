@@ -10,6 +10,36 @@ async def save_context_snapshot(context: RuntimeContext, run_store: RunStore) ->
     """Persist the current mutable runtime context into the immutable Run aggregate."""
 
     existing = await run_store.get(context.run_id)
+    metadata = {
+        **existing.metadata,
+        "pending_input": (
+            context.pending_input.model_dump(mode="json")
+            if context.pending_input is not None
+            else None
+        ),
+        "plan": (
+            context.plan.model_dump(mode="json") if context.plan is not None else None
+        ),
+        "resource_failures": [
+            failure.model_dump(mode="json")
+            for failure in context.resource_failures
+        ],
+        "memory": {
+            "initialized": context.memory_initialized,
+            "error": context.memory_error,
+            "matches": [
+                {"id": str(match.record.id), "score": match.score}
+                for match in context.memories
+            ],
+        },
+        "model_calls": len(context.responses),
+        "planning_requested": context.planning_requested,
+    }
+    if context.state is RunStatus.INTERRUPTED:
+        metadata["interruption"] = {
+            "source": "asyncio_task_cancelled",
+            "recoverable": False,
+        }
     updated = existing.model_copy(
         update={
             "status": RunStatus(context.state_machine.state),
@@ -20,31 +50,7 @@ async def save_context_snapshot(context: RuntimeContext, run_store: RunStore) ->
             "error": context.error,
             "attachments": context.attachments,
             "artifacts": tuple(context.artifacts),
-            "metadata": {
-                **existing.metadata,
-                "pending_input": (
-                    context.pending_input.model_dump(mode="json")
-                    if context.pending_input is not None
-                    else None
-                ),
-                "plan": (
-                    context.plan.model_dump(mode="json") if context.plan is not None else None
-                ),
-                "resource_failures": [
-                    failure.model_dump(mode="json")
-                    for failure in context.resource_failures
-                ],
-                "memory": {
-                    "initialized": context.memory_initialized,
-                    "error": context.memory_error,
-                    "matches": [
-                        {"id": str(match.record.id), "score": match.score}
-                        for match in context.memories
-                    ],
-                },
-                "model_calls": len(context.responses),
-                "planning_requested": context.planning_requested,
-            },
+            "metadata": metadata,
             "updated_at": utc_now(),
         },
         deep=True,

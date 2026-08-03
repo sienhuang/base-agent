@@ -11,13 +11,19 @@ class InvalidStateTransitionError(RuntimeError):
 
 _ALLOWED_TRANSITIONS: dict[ExecutionState, frozenset[ExecutionState]] = {
     ExecutionState.CREATED: frozenset(
-        {ExecutionState.RUNNING, ExecutionState.CANCELLED, ExecutionState.FAILED}
+        {
+            ExecutionState.RUNNING,
+            ExecutionState.CANCELLED,
+            ExecutionState.FAILED,
+            ExecutionState.INTERRUPTED,
+        }
     ),
     ExecutionState.RUNNING: frozenset(
         {
             ExecutionState.COMPLETED,
             ExecutionState.FAILED,
             ExecutionState.CANCELLED,
+            ExecutionState.INTERRUPTED,
             ExecutionState.LIMIT_REACHED,
             ExecutionState.WAITING,
         }
@@ -25,9 +31,15 @@ _ALLOWED_TRANSITIONS: dict[ExecutionState, frozenset[ExecutionState]] = {
     ExecutionState.COMPLETED: frozenset(),
     ExecutionState.FAILED: frozenset(),
     ExecutionState.CANCELLED: frozenset(),
+    ExecutionState.INTERRUPTED: frozenset(),
     ExecutionState.LIMIT_REACHED: frozenset(),
     ExecutionState.WAITING: frozenset(
-        {ExecutionState.RUNNING, ExecutionState.CANCELLED, ExecutionState.FAILED}
+        {
+            ExecutionState.RUNNING,
+            ExecutionState.CANCELLED,
+            ExecutionState.FAILED,
+            ExecutionState.INTERRUPTED,
+        }
     ),
 }
 

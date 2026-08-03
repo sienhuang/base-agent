@@ -185,6 +185,37 @@ async def test_concurrent_resume_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_task_cancellation_interrupts_resume_and_removes_checkpoint() -> None:
+    model = BlockingResumeModel()
+    agent = Agent(
+        profile=AgentProfile(
+            id="interrupted-resume",
+            instructions="Ask.",
+            tools=("ask_user",),
+        ),
+        model=model,
+        tools=(ask_user,),
+    )
+    waiting = await agent.run("Begin")
+    run_id = uuid_from(waiting.metadata["run_id"])
+    resume_task = asyncio.create_task(agent.resume(run_id, "yes"))
+    await asyncio.wait_for(model.resumed.wait(), timeout=1)
+
+    resume_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await resume_task
+
+    stored = await agent.get_run(run_id)
+    assert stored.status is RunStatus.INTERRUPTED
+    assert stored.metadata["interruption"]["recoverable"] is False
+    assert (await agent.events(run_id))[-1].type is EventType.RUN_INTERRUPTED
+    with pytest.raises(CheckpointNotFoundError):
+        await agent.checkpoint_store.load(run_id)
+    with pytest.raises(ValueError, match="not waiting"):
+        await agent.resume(run_id, "again")
+
+
+@pytest.mark.asyncio
 async def test_invalid_resume_input_does_not_consume_checkpoint() -> None:
     agent, _ = make_agent(
         [waiting_response("call-1", "Region?"), ModelResponse(content="done")]

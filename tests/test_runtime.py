@@ -136,6 +136,23 @@ def test_waiting_state_can_resume_or_be_cancelled() -> None:
     assert resumable.is_terminal is True
 
 
+@pytest.mark.parametrize(
+    "initial",
+    [ExecutionState.CREATED, ExecutionState.RUNNING, ExecutionState.WAITING],
+)
+def test_active_states_can_be_interrupted(initial: ExecutionState) -> None:
+    state_machine = RuntimeStateMachine()
+    if initial is not ExecutionState.CREATED:
+        state_machine.transition_to(ExecutionState.RUNNING)
+    if initial is ExecutionState.WAITING:
+        state_machine.transition_to(ExecutionState.WAITING)
+
+    state_machine.transition_to(ExecutionState.INTERRUPTED)
+
+    assert state_machine.state is ExecutionState.INTERRUPTED
+    assert state_machine.is_terminal is True
+
+
 @pytest.mark.parametrize("prompt", ["", "   "])
 def test_runtime_rejects_empty_prompts(prompt: str) -> None:
     runtime = AgentRuntime()

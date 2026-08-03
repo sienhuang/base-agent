@@ -62,6 +62,7 @@ cancel_requested False
 ## BUG-002：恢复任务被取消后 Run 停在 RUNNING 且检查点丢失
 
 严重度：P1
+状态：已修复（2026-08-03）
 
 涉及位置：
 
@@ -97,13 +98,24 @@ checkpoint missing
 
 ### 修复建议
 
-- 为 Checkpoint claim 增加租约或事务语义。
-- 在包括 `CancelledError` 在内的所有未完成路径中，原子恢复：
-  - Run 状态为 `WAITING`；
-  - 原检查点；
-  - Conversation Turn 状态。
-- 对首次运行的任务级取消，将 durable Run 明确最终化为 `CANCELLED`。
-- 增加恢复期间取消、重复恢复和进程中断的回归测试。
+- 区分显式业务取消与底层 asyncio 任务中断，避免混用 `CANCELLED`。
+- 当前不承诺恢复运行中任务；任务中断必须持久化为明确的不可恢复终态。
+- 中断收尾必须删除 Checkpoint、释放 Conversation Turn，并发送唯一终态事件。
+- 增加首次运行、恢复、Conversation 和事件流的确定性回归测试。
+
+### 修复结果
+
+- 新增 `INTERRUPTED` Run、Execution 和 Result 状态，以及永久终态事件
+  `RUN_INTERRUPTED`。
+- Runtime 捕获 `CancelledError` 后先释放 Resource，再持久化不可恢复的
+  `INTERRUPTED`、删除 Checkpoint、释放 Conversation Turn 并发送一次
+  `RUN_INTERRUPTED`，最后继续向调用方传播 `CancelledError`。
+- 如果 Run 已经接受了显式 `Agent.cancel()` 请求，业务取消优先，仍以
+  `CANCELLED` / `RUN_CANCELLED` 收尾。
+- Agent facade 覆盖创建 Run 和 claim Checkpoint 附近的边缘中断；幂等兜底不会重复发送
+  终态事件。
+- 新增首次运行中断、恢复中断、Conversation 释放、Checkpoint 删除、状态机转换和事件流
+  永久边界测试。当前版本不支持恢复 `INTERRUPTED` Run。
 
 ## BUG-003：Browser 私网策略存在 DNS rebinding 绕过
 

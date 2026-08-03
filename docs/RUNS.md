@@ -27,7 +27,7 @@ next Conversation Turn and injects completed prior Turn history. See
 - `get_run()` returns the latest Run snapshot.
 - `events()` returns the currently persisted event history.
 - `stream()` replays persisted events and follows new events until the Run completes, fails, is
-  cancelled, reaches a limit, or waits for input.
+  cancelled, is interrupted, reaches a limit, or waits for input.
 
 ## Cursor replay
 
@@ -51,6 +51,14 @@ implement only history listing remain valid `EventStore` implementations, but
 process restart. Durable servers should persist Runs and Events, schedule work through an external
 runner, and reconstruct API responses from the store ports. That infrastructure stays outside the
 core execution loop.
+
+Cancelling the execution Task is distinct from `Agent.cancel()`. An explicit `Agent.cancel()` is a
+business cancellation and produces `CANCELLED` / `run.cancelled`. If the asyncio Task itself
+receives `CancelledError` without an accepted cancellation request, the Runtime releases its
+resources, persists the permanent `INTERRUPTED` state, removes any WAITING checkpoint, releases the
+Conversation Turn, emits `run.interrupted`, and then propagates `CancelledError`. Interrupted Runs
+are deliberately not recoverable yet. Cancelling only a `RunHandle.result()` waiter remains
+shielded and does not interrupt the underlying Run.
 
 ## Wait for human input and resume
 

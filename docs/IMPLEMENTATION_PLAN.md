@@ -140,6 +140,7 @@ tool.failed
 run.completed
 run.failed
 run.cancelled
+run.interrupted
 ```
 
 Acceptance:
@@ -147,6 +148,7 @@ Acceptance:
 - a run can be inspected and replayed from ordered events;
 - terminal state agrees with the terminal event;
 - cancellation prevents subsequent model and tool execution;
+- asyncio task interruption persists an unrecoverable `INTERRUPTED` terminal state and event;
 - no process-global task registry is required.
 
 Verification result:

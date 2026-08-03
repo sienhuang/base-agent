@@ -145,6 +145,83 @@ async def test_cancellation_does_not_start_the_next_tool_or_model_step() -> None
 
 
 @pytest.mark.asyncio
+async def test_task_cancellation_persists_an_unrecoverable_interruption() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingModel:
+        name = "interruptible"
+
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            del request
+            started.set()
+            await release.wait()
+            return ModelResponse(content="too late")
+
+    agent = Agent(
+        profile=AgentProfile(id="interrupted", instructions="Work."),
+        model=BlockingModel(),
+    )
+    run_id = uuid4()
+    task = asyncio.create_task(agent.run("work", run_id=run_id))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    stored = await agent.get_run(run_id)
+    events = await agent.events(run_id)
+    assert stored.status is RunStatus.INTERRUPTED
+    assert stored.error == "runtime task interrupted"
+    assert stored.cancel_requested is False
+    assert stored.metadata["interruption"] == {
+        "source": "asyncio_task_cancelled",
+        "recoverable": False,
+    }
+    assert [event.type for event in events].count(EventType.RUN_INTERRUPTED) == 1
+    assert events[-1].type is EventType.RUN_INTERRUPTED
+    assert events[-1].data["interruption_source"] == "asyncio_task_cancelled"
+    assert events[-1].data["recoverable"] is False
+
+
+@pytest.mark.asyncio
+async def test_accepted_business_cancellation_wins_over_task_interruption() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingModel:
+        name = "cancel-then-interrupt"
+
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            del request
+            started.set()
+            await release.wait()
+            return ModelResponse(content="too late")
+
+    agent = Agent(
+        profile=AgentProfile(id="cancel-then-interrupt", instructions="Work."),
+        model=BlockingModel(),
+    )
+    run_id = uuid4()
+    task = asyncio.create_task(agent.run("work", run_id=run_id))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    requested = await agent.cancel(run_id)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    stored = await agent.get_run(run_id)
+    events = await agent.events(run_id)
+    assert requested.cancel_requested is True
+    assert stored.status is RunStatus.CANCELLED
+    assert stored.cancel_requested is True
+    assert events[-1].type is EventType.RUN_CANCELLED
+    assert EventType.RUN_INTERRUPTED not in {event.type for event in events}
+
+
+@pytest.mark.asyncio
 async def test_stale_runtime_snapshot_cannot_clear_cancellation_request() -> None:
     class CancellationRaceRunStore(InMemoryRunStore):
         def __init__(self) -> None:
@@ -212,6 +289,21 @@ async def test_in_memory_stores_enforce_identity_and_copy_boundaries() -> None:
 
     assert replayed[0].data["nested"]["value"] == 1
     assert replayed[0].sequence == 1
+
+
+@pytest.mark.asyncio
+async def test_interrupted_event_is_a_permanent_stream_boundary() -> None:
+    event_store = InMemoryEventStore()
+    run_id = uuid4()
+    await event_store.emit(run_id, EventType.RUN_CREATED)
+    await event_store.emit(run_id, EventType.RUN_INTERRUPTED)
+
+    replayed = [
+        event.type
+        async for event in event_store.subscribe(run_id, after_sequence=0)
+    ]
+
+    assert replayed == [EventType.RUN_CREATED, EventType.RUN_INTERRUPTED]
 
 
 @pytest.mark.asyncio

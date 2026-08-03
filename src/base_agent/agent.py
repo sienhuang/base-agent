@@ -25,7 +25,11 @@ from base_agent.models import (
 from base_agent.profiles import AgentProfile
 from base_agent.providers import ModelProvider
 from base_agent.resources import ResourceSpec
-from base_agent.run_handle import RunHandle, request_cancellation
+from base_agent.run_handle import (
+    RunHandle,
+    finalize_task_interruption,
+    request_cancellation,
+)
 from base_agent.runtime import AgentRuntime
 from base_agent.skills import (
     Skill,
@@ -205,13 +209,22 @@ class Agent:
                 memory_failure_mode=self.memory_failure_mode,
             )
         except BaseException as exc:
-            if conversation_id is not None and turn is not None:
+            interrupted_run: Run | None = None
+            if isinstance(exc, asyncio.CancelledError):
+                interrupted_run = await self._settle_task_interruption(
+                    active_run_id, exc
+                )
+            if (
+                conversation_id is not None
+                and turn is not None
+                and interrupted_run is None
+            ):
                 try:
                     await self.conversation_store.finish_turn(
                         conversation_id,
                         run_id=active_run_id,
                         status=(
-                            RunStatus.CANCELLED
+                            RunStatus.INTERRUPTED
                             if isinstance(exc, asyncio.CancelledError)
                             else RunStatus.FAILED
                         ),
@@ -279,6 +292,8 @@ class Agent:
         try:
             checkpoint = await self.checkpoint_store.claim(run_id)
         except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                await self._settle_task_interruption(run_id, exc)
             logger.exception(
                 "run resume claim failed",
                 extra={
@@ -324,6 +339,8 @@ class Agent:
                 reset_log_context(log_tokens)
             raise
         except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                await self._settle_task_interruption(run_id, exc)
             logger.warning(
                 "run resume interrupted",
                 extra={
@@ -467,6 +484,27 @@ class Agent:
 
     async def list_artifacts(self, run_id: UUID) -> tuple[Artifact, ...]:
         return await self.artifact_store.list_artifacts(run_id)
+
+    async def _settle_task_interruption(
+        self,
+        run_id: UUID,
+        interruption: asyncio.CancelledError,
+    ) -> Run | None:
+        try:
+            return await asyncio.shield(
+                finalize_task_interruption(
+                    run_id,
+                    run_store=self.run_store,
+                    event_store=self.event_store,
+                    checkpoint_store=self.checkpoint_store,
+                    conversation_store=self.conversation_store,
+                )
+            )
+        except Exception as interruption_error:
+            interruption.add_note(
+                f"failed to finalize interrupted Run: {interruption_error}"
+            )
+            return None
 
     async def _resolve_attachments(
         self, attachments: tuple[Attachment, ...]

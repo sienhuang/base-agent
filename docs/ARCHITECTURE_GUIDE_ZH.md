@@ -490,13 +490,16 @@ Supervisor 适合运行保护和策略干预，不适合放业务工作流。业
 CREATED ──► RUNNING ──► COMPLETED
                   ├──► FAILED
                   ├──► CANCELLED
+                  ├──► INTERRUPTED
                   ├──► LIMIT_REACHED
                   └──► WAITING ──► RUNNING
                                 ├► CANCELLED
+                                ├► INTERRUPTED
                                 └► FAILED
 ```
 
-终态不能再次转换。
+`INTERRUPTED` 表示底层 asyncio 执行任务被中断，而不是用户通过 `Agent.cancel()` 发起的
+业务取消；当前版本将其作为不可恢复终态。所有终态均不能再次转换。
 
 ### 10.1 同步等待与后台运行
 

@@ -16,6 +16,7 @@ from base_agent.stores import (
     EventStream,
     RunStore,
 )
+from base_agent.stores.errors import RunNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -122,3 +123,67 @@ async def request_cancellation(
         return cancelled
     finally:
         reset_log_context(log_tokens)
+
+
+async def finalize_task_interruption(
+    run_id: UUID,
+    *,
+    run_store: RunStore,
+    event_store: EventStore,
+    checkpoint_store: CheckpointStore,
+    conversation_store: ConversationStore | None = None,
+) -> Run | None:
+    """Finalize an asyncio task interruption without treating it as a user request."""
+
+    try:
+        existing = await run_store.get(run_id)
+    except RunNotFoundError:
+        return None
+    if existing.status not in {
+        RunStatus.CREATED,
+        RunStatus.RUNNING,
+        RunStatus.WAITING,
+    }:
+        return existing
+
+    requested = existing.cancel_requested
+    status = RunStatus.CANCELLED if requested else RunStatus.INTERRUPTED
+    error = "run cancellation requested" if requested else "runtime task interrupted"
+    metadata = dict(existing.metadata)
+    if not requested:
+        metadata["interruption"] = {
+            "source": "asyncio_task_cancelled",
+            "recoverable": False,
+        }
+    finalized = existing.model_copy(
+        update={
+            "status": status,
+            "error": error,
+            "metadata": metadata,
+            "updated_at": utc_now(),
+        },
+        deep=True,
+    )
+    if finalized.conversation_id is not None and conversation_store is not None:
+        await conversation_store.finish_turn(
+            finalized.conversation_id,
+            run_id=run_id,
+            status=status,
+        )
+    await run_store.save(finalized)
+    await checkpoint_store.delete(run_id)
+    event_type = (
+        EventType.RUN_CANCELLED if requested else EventType.RUN_INTERRUPTED
+    )
+    event_data: dict[str, object] = {"error": error}
+    if requested:
+        event_data["cancel_source"] = "requested"
+    else:
+        event_data.update(
+            {
+                "interruption_source": "asyncio_task_cancelled",
+                "recoverable": False,
+            }
+        )
+    await event_store.emit(run_id, event_type, event_data)
+    return finalized

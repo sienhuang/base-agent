@@ -49,6 +49,7 @@ class EventType(StrEnum):
     RUN_COMPLETED = "run.completed"
     RUN_FAILED = "run.failed"
     RUN_CANCELLED = "run.cancelled"
+    RUN_INTERRUPTED = "run.interrupted"
     RUN_LIMIT_REACHED = "run.limit_reached"
     RUN_WAITING = "run.waiting"
 

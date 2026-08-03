@@ -346,7 +346,11 @@ class PlanningStrategy(ModelToolStrategy):
                 plan.cancel(context.error or "run cancelled"),
                 emit_plan_updated=False,
             )
-        elif context.state in {ExecutionState.FAILED, ExecutionState.LIMIT_REACHED}:
+        elif context.state in {
+            ExecutionState.FAILED,
+            ExecutionState.INTERRUPTED,
+            ExecutionState.LIMIT_REACHED,
+        }:
             await update_execution_plan(
                 context,
                 services,

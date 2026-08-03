@@ -123,6 +123,28 @@ async def test_conversation_rejects_overlapping_active_runs() -> None:
     assert (await agent.get_conversation(conversation.id)).active_run_id is None
 
 
+@pytest.mark.asyncio
+async def test_task_interruption_releases_the_conversation_turn() -> None:
+    model = ControlledModel()
+    agent = Agent(
+        profile=AgentProfile(id="interrupted-chat", instructions="Work."),
+        model=model,
+    )
+    conversation = await agent.create_conversation()
+    task = asyncio.create_task(
+        agent.run("work", conversation_id=conversation.id)
+    )
+    await asyncio.wait_for(model.started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    turns = await agent.conversation_turns(conversation.id)
+    assert turns[0].status is RunStatus.INTERRUPTED
+    assert (await agent.get_conversation(conversation.id)).active_run_id is None
+
+
 @tool
 async def ask_user(question: str) -> WaitForInput:
     """Request required information."""

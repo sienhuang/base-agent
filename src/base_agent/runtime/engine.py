@@ -271,6 +271,22 @@ class AgentRuntime:
                 await active_strategy.advance(context, services)
         except asyncio.CancelledError as exc:
             execution_error = exc
+            if await active_run_store.is_cancel_requested(context.run_id):
+                context.error = "run cancellation requested"
+                if context.state in {
+                    ExecutionState.CREATED,
+                    ExecutionState.RUNNING,
+                    ExecutionState.WAITING,
+                }:
+                    context.state_machine.transition_to(ExecutionState.CANCELLED)
+            else:
+                context.error = "runtime task interrupted"
+                if context.state in {
+                    ExecutionState.CREATED,
+                    ExecutionState.RUNNING,
+                    ExecutionState.WAITING,
+                }:
+                    context.state_machine.transition_to(ExecutionState.INTERRUPTED)
             logger.warning(
                 "runtime task cancelled",
                 extra={
@@ -279,7 +295,6 @@ class AgentRuntime:
                     "duration_ms": round((monotonic() - runtime_started_at) * 1000, 3),
                 },
             )
-            raise
         except Exception as exc:
             execution_error = exc
             logger.exception(
@@ -332,6 +347,8 @@ class AgentRuntime:
                 "resource_failure_count": len(context.resource_failures),
             },
         )
+        if isinstance(execution_error, asyncio.CancelledError):
+            raise execution_error
         return result
 
     @staticmethod
@@ -439,6 +456,7 @@ class AgentRuntime:
             ExecutionState.COMPLETED: EventType.RUN_COMPLETED,
             ExecutionState.FAILED: EventType.RUN_FAILED,
             ExecutionState.CANCELLED: EventType.RUN_CANCELLED,
+            ExecutionState.INTERRUPTED: EventType.RUN_INTERRUPTED,
             ExecutionState.LIMIT_REACHED: EventType.RUN_LIMIT_REACHED,
             ExecutionState.WAITING: EventType.RUN_WAITING,
         }
@@ -448,45 +466,45 @@ class AgentRuntime:
             raise InvalidStateTransitionError(
                 f"cannot finalize state {context.state_machine.state.value}"
             ) from exc
-        await event_store.emit(
-            context.run_id,
-            event_type,
-            {
-                "steps": context.step_count,
-                "tool_calls": context.tool_call_count,
-                "output": context.output,
-                "error": context.error,
-                "usage": context.usage.model_dump(mode="json"),
-                "model_calls": len(context.responses),
-                "pending_input": (
-                    context.pending_input.model_dump(mode="json")
-                    if context.pending_input is not None
-                    else None
-                ),
-                "plan": (
-                    context.plan.model_dump(mode="json") if context.plan is not None else None
-                ),
-                "resource_failures": [
-                    failure.model_dump(mode="json")
-                    for failure in context.resource_failures
+        event_data: dict[str, object] = {
+            "steps": context.step_count,
+            "tool_calls": context.tool_call_count,
+            "output": context.output,
+            "error": context.error,
+            "usage": context.usage.model_dump(mode="json"),
+            "model_calls": len(context.responses),
+            "pending_input": (
+                context.pending_input.model_dump(mode="json")
+                if context.pending_input is not None
+                else None
+            ),
+            "plan": (
+                context.plan.model_dump(mode="json") if context.plan is not None else None
+            ),
+            "resource_failures": [
+                failure.model_dump(mode="json")
+                for failure in context.resource_failures
+            ],
+            "attachments": [
+                attachment.model_dump(mode="json")
+                for attachment in context.attachments
+            ],
+            "artifacts": [
+                artifact.model_dump(mode="json") for artifact in context.artifacts
+            ],
+            "memory": {
+                "initialized": context.memory_initialized,
+                "error": context.memory_error,
+                "matches": [
+                    {"id": str(match.record.id), "score": match.score}
+                    for match in context.memories
                 ],
-                "attachments": [
-                    attachment.model_dump(mode="json")
-                    for attachment in context.attachments
-                ],
-                "artifacts": [
-                    artifact.model_dump(mode="json") for artifact in context.artifacts
-                ],
-                "memory": {
-                    "initialized": context.memory_initialized,
-                    "error": context.memory_error,
-                    "matches": [
-                        {"id": str(match.record.id), "score": match.score}
-                        for match in context.memories
-                    ],
-                },
             },
-        )
+        }
+        if context.state is ExecutionState.INTERRUPTED:
+            event_data["interruption_source"] = "asyncio_task_cancelled"
+            event_data["recoverable"] = False
+        await event_store.emit(context.run_id, event_type, event_data)
 
     @staticmethod
     def _build_result(context: RuntimeContext) -> AgentResult:
@@ -494,6 +512,7 @@ class AgentRuntime:
             ExecutionState.COMPLETED: AgentResultStatus.COMPLETED,
             ExecutionState.FAILED: AgentResultStatus.FAILED,
             ExecutionState.CANCELLED: AgentResultStatus.CANCELLED,
+            ExecutionState.INTERRUPTED: AgentResultStatus.INTERRUPTED,
             ExecutionState.LIMIT_REACHED: AgentResultStatus.LIMIT_REACHED,
             ExecutionState.WAITING: AgentResultStatus.WAITING,
         }

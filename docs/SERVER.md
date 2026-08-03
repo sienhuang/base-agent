@@ -73,8 +73,9 @@ data: {"id":"...","run_id":"...","sequence":5,...}
 ```
 
 Reconnect using either `?after_sequence=5` or `Last-Event-ID: 5`. If both are supplied, the larger
-cursor wins. A stream ends at COMPLETED, FAILED, CANCELLED, LIMIT_REACHED, or the current WAITING
-boundary. A new stream after the WAITING cursor can follow events emitted by resume.
+cursor wins. A stream ends at COMPLETED, FAILED, CANCELLED, INTERRUPTED, LIMIT_REACHED, or the
+current WAITING boundary. A new stream after the WAITING cursor can follow events emitted by
+resume.
 
 The configured EventStore must implement `EventStream`. History-only stores receive a clear `501`
 instead of a simulated polling stream.
