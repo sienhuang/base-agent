@@ -30,3 +30,13 @@ class ContextualTool(Protocol):
         arguments: Mapping[str, Any],
         context: ToolContext,
     ) -> Any: ...
+
+
+@runtime_checkable
+class ArgumentValidatingTool(Protocol):
+    """Optional extension that validates before side-effect evidence is started."""
+
+    def validate_arguments(
+        self,
+        arguments: Mapping[str, Any],
+    ) -> Mapping[str, Any]: ...

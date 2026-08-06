@@ -11,7 +11,11 @@ from mcp.types import CallToolResult, ListToolsResult
 from mcp.types import Tool as SDKTool
 
 from base_agent.models import ToolDefinition
-from base_agent.tools import ToolInvalidArgumentsError
+from base_agent.tools import (
+    ToolConfirmationMode,
+    ToolInvalidArgumentsError,
+    ToolSideEffectMode,
+)
 
 
 class MCPSession(Protocol):
@@ -41,6 +45,8 @@ class MCPTool:
         name: str | None = None,
         permissions: frozenset[str] = frozenset({"mcp:invoke"}),
         timeout_seconds: float = 30.0,
+        side_effect: ToolSideEffectMode = ToolSideEffectMode.UNSPECIFIED,
+        confirmation: ToolConfirmationMode = ToolConfirmationMode.NONE,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("tool timeout_seconds must be greater than zero")
@@ -56,6 +62,23 @@ class MCPTool:
         )
         self._permissions = permissions
         self._timeout_seconds = timeout_seconds
+        if side_effect is ToolSideEffectMode.IDEMPOTENT:
+            raise ValueError(
+                "MCPTool cannot propagate a downstream idempotency key"
+            )
+        self._side_effect_mode = side_effect
+        if (
+            confirmation is ToolConfirmationMode.REQUIRED
+            and side_effect
+            not in {
+                ToolSideEffectMode.UNSAFE,
+                ToolSideEffectMode.IDEMPOTENT,
+            }
+        ):
+            raise ValueError(
+                "Tool confirmation requires an unsafe or idempotent side effect"
+            )
+        self._confirmation_mode = confirmation
 
     @property
     def definition(self) -> ToolDefinition:
@@ -73,7 +96,18 @@ class MCPTool:
     def timeout_seconds(self) -> float:
         return self._timeout_seconds
 
-    async def invoke(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    @property
+    def side_effect_mode(self) -> ToolSideEffectMode:
+        return self._side_effect_mode
+
+    @property
+    def confirmation_mode(self) -> ToolConfirmationMode:
+        return self._confirmation_mode
+
+    def validate_arguments(
+        self,
+        arguments: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
         payload = dict(arguments)
         try:
             self._validator.validate(payload)
@@ -81,6 +115,10 @@ class MCPTool:
             location = ".".join(str(part) for part in exc.absolute_path)
             prefix = f"{location}: " if location else ""
             raise ToolInvalidArgumentsError(f"{prefix}{exc.message}") from exc
+        return payload
+
+    async def invoke(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        payload = dict(self.validate_arguments(arguments))
 
         result = await self._session.call_tool(self._remote_name, payload)
         if result.isError:

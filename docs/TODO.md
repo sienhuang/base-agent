@@ -21,7 +21,7 @@ of the core package. They belong in applications or optional adapters.
 
 ## Priority 0 — Event data security policy
 
-Status: not implemented
+Status: partially implemented
 
 Current file logs omit prompts, model bodies, Tool arguments, resume input, and HTTP bodies.
 Runtime Events do not currently provide the same protection: `model.requested`, `model.responded`,
@@ -78,11 +78,24 @@ Required capability:
 
 - [ ] Define a `RunExecutor` boundary independent of HTTP and the Agent Runtime.
 - [ ] Keep `LocalRunExecutor` as the zero-infrastructure default.
+- [x] Add queue-independent Flow claim, heartbeat, fencing, loss cancellation, and graceful
+      release primitives.
+- [x] Add in-memory and PostgreSQL Flow work sources with idempotent enqueue, delivery fencing,
+      timeout redelivery, and delayed retry.
+- [x] Compose Flow delivery and execution ownership in a polling worker with dual heartbeats,
+      cancellation-safe retry, and graceful stop.
+- [x] Resolve exact Flow definition versions, verify fingerprints, and route uncertain recovery
+      boundaries to a durable BLOCKED state instead of automatic replay.
+- [x] Add a separate trusted Operator review port with BLOCKED listing, idempotent approve/reject,
+      atomic PostgreSQL audit, delayed retry, and terminal discard.
+- [x] Add a metadata-only Flow side-effect ledger with in-memory/PostgreSQL adapters and gate active
+      Invocation recovery on explicit replay safety.
 - [ ] Add an optional queue/worker executor with leases, heartbeats, retry ownership, and graceful
       shutdown.
 - [ ] Define recovery behavior for `CREATED`, `RUNNING`, and `WAITING` Runs after worker loss.
 - [ ] Preserve cancellation, single-active Conversation Turn rules, event ordering, and idempotency.
-- [ ] Ensure a redelivered job cannot repeat completed side effects silently.
+- [x] Block active recovery unless recorded side effects are known unstarted/aborted or protected
+      by downstream idempotency.
 
 Acceptance:
 
@@ -142,15 +155,17 @@ Acceptance:
 
 Status: partially implemented
 
-- [ ] Classify read-only and side-effecting Tools explicitly.
-- [ ] Add application confirmation policy for important side effects.
-- [ ] Define idempotency keys and retry rules for side-effecting Tool calls.
+- [x] Classify Tool behavior as unspecified, read-only, unsafe, or downstream-idempotent.
+- [x] Add typed pre-execution confirmation with approve/reject resume semantics and audit events.
+- [x] Define the Flow-side idempotency evidence and retry rules for interrupted side effects.
+- [x] Connect explicitly governed Flow Tool execution to the side-effect ledger.
 - [ ] Add Tool argument/result redaction and audit metadata.
-- [ ] Enforce output-size limits and Artifact-reference overflow handling.
+- [x] Enforce serialized UTF-8 ToolResult limits before Message/Event/Checkpoint persistence.
+- [ ] Add an explicit opt-in Artifact overflow policy with media type, access, and retention rules.
 - [ ] Define Sandbox filesystem, process, and network policy boundaries.
 
-The concrete ToolResult size-guard work is tracked in
-[`TOOLS.md`](TOOLS.md#planned-runtime-enforcement).
+The concrete ToolResult and Artifact boundary is documented in
+[`TOOLS.md`](TOOLS.md#bound-tool-results).
 
 ## Priority 2 — Database operations and retention
 
@@ -224,11 +239,11 @@ Remaining:
 
 ## Priority 1 — Bound Tool results
 
-Status: designed, not implemented
+Status: core size guard implemented
 
-Add a provider-independent serialized ToolResult size guard, typed overflow behavior, bounded event
-payloads, and Artifact-reference handling. The detailed contract and acceptance outline live in
-[`TOOLS.md`](TOOLS.md#planned-runtime-enforcement).
+The provider-independent UTF-8 size guard, typed overflow result, Agent configuration, bounded
+event/message behavior, and deterministic tests are implemented. Explicit opt-in Artifact
+externalization remains; see [`TOOLS.md`](TOOLS.md#artifact-overflow-boundary).
 
 ## Priority 1 — Data analysis and development bundles
 

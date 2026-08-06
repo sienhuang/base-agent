@@ -50,7 +50,13 @@ from base_agent.stores import (
     RunStore,
 )
 from base_agent.supervision import SupervisionAction, Supervisor, build_default_supervisor
-from base_agent.tools import ToolExecutor, ToolRegistry
+from base_agent.tools import (
+    ToolConfirmation,
+    ToolConfirmationDecision,
+    ToolConfirmationRequest,
+    ToolExecutor,
+    ToolRegistry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +91,7 @@ class AgentRuntime:
         plan: ExecutionPlan | None = None,
         planning_requested: bool = False,
         attachments: tuple[Attachment, ...] = (),
+        run_metadata: dict[str, object] | None = None,
     ) -> RuntimeContext:
         if not prompt.strip():
             raise ValueError("prompt must not be empty")
@@ -120,6 +127,7 @@ class AgentRuntime:
             planning_requested=planning_requested,
             attachments=attachments,
             input_text=prompt,
+            run_metadata=dict(run_metadata or {}),
         )
         if run_id is not None:
             context.run_id = run_id
@@ -160,6 +168,7 @@ class AgentRuntime:
         memory_limit: int = 5,
         memory_namespace: str | None = None,
         memory_failure_mode: MemoryFailureMode = MemoryFailureMode.BEST_EFFORT,
+        confirmation: ToolConfirmation | None = None,
     ) -> AgentResult:
         runtime_started_at = monotonic()
         correlation = {
@@ -241,6 +250,7 @@ class AgentRuntime:
             await self._prepare_resume(
                 context,
                 resume_input,
+                confirmation,
                 provider=provider,
                 run_store=active_run_store,
                 event_store=active_event_store,
@@ -355,39 +365,109 @@ class AgentRuntime:
     async def _prepare_resume(
         context: RuntimeContext,
         resume_input: str | None,
+        confirmation: ToolConfirmation | None,
         *,
         provider: ModelProvider,
         run_store: RunStore,
         event_store: EventStore,
     ) -> None:
-        if resume_input is None or not resume_input.strip():
-            raise ValueError("resume input must not be empty")
         pending = context.pending_input
         if pending is None:
             raise InvalidStateTransitionError("waiting context has no pending input")
-        tool_result = ToolResult(
-            tool_name=pending.tool_name,
-            status=ToolResultStatus.SUCCESS,
-            data={"input": resume_input},
-        )
-        context.messages.append(
-            Message.tool(tool_result.model_dump_json(), tool_call_id=pending.tool_call_id)
-        )
+        rejected_result: ToolResult | None = None
+        is_confirmation = pending.metadata.get("kind") == "tool_confirmation"
+        if is_confirmation:
+            if resume_input is not None:
+                raise ValueError(
+                    "pending Tool confirmation requires Agent.confirm()"
+                )
+            if confirmation is None:
+                raise ValueError("Tool confirmation decision is required")
+            try:
+                request = ToolConfirmationRequest.model_validate(
+                    pending.metadata["request"]
+                )
+            except (KeyError, ValueError) as exc:
+                raise InvalidStateTransitionError(
+                    "pending Tool confirmation metadata is invalid"
+                ) from exc
+            if confirmation.request_id != request.id:
+                raise ValueError("Tool confirmation targets another request")
+            context.supervision_data["tool_confirmation_decision"] = (
+                confirmation.model_dump(mode="json")
+            )
+            if confirmation.decision is ToolConfirmationDecision.REJECT:
+                rejected_result = ToolResult(
+                    tool_name=pending.tool_name,
+                    status=ToolResultStatus.DENIED,
+                    error_code="tool_confirmation_rejected",
+                    message="Tool execution was rejected",
+                )
+                context.messages.append(
+                    Message.tool(
+                        rejected_result.model_dump_json(),
+                        tool_call_id=pending.tool_call_id,
+                    )
+                )
+        else:
+            if confirmation is not None:
+                raise ValueError(
+                    "pending input does not accept a Tool confirmation"
+                )
+            if resume_input is None or not resume_input.strip():
+                raise ValueError("resume input must not be empty")
+            tool_result = ToolResult(
+                tool_name=pending.tool_name,
+                status=ToolResultStatus.SUCCESS,
+                data={"input": resume_input},
+            )
+            context.messages.append(
+                Message.tool(
+                    tool_result.model_dump_json(),
+                    tool_call_id=pending.tool_call_id,
+                )
+            )
         context.pending_input = None
         context.output = None
         context.error = None
         context.provider_name = provider.name
         context.state_machine.transition_to(ExecutionState.RUNNING)
         await save_context_snapshot(context, run_store)
-        await event_store.emit(
-            context.run_id,
-            EventType.INPUT_RECEIVED,
-            {
-                "tool_call_id": pending.tool_call_id,
-                "tool_name": pending.tool_name,
-                "input": resume_input,
-            },
-        )
+        if is_confirmation:
+            assert confirmation is not None
+            await event_store.emit(
+                context.run_id,
+                EventType.TOOL_CONFIRMATION_DECIDED,
+                {
+                    "request_id": str(confirmation.request_id),
+                    "tool_call_id": pending.tool_call_id,
+                    "tool_name": pending.tool_name,
+                    "decision": confirmation.decision.value,
+                    "subject_id": confirmation.subject_id,
+                    "reason_code": confirmation.reason_code,
+                    "decided_at": confirmation.decided_at.isoformat(),
+                },
+            )
+            if rejected_result is not None:
+                await event_store.emit(
+                    context.run_id,
+                    EventType.TOOL_FAILED,
+                    {
+                        "step": context.step_count,
+                        "call_id": pending.tool_call_id,
+                        "result": rejected_result.model_dump(mode="json"),
+                    },
+                )
+        else:
+            await event_store.emit(
+                context.run_id,
+                EventType.INPUT_RECEIVED,
+                {
+                    "tool_call_id": pending.tool_call_id,
+                    "tool_name": pending.tool_name,
+                    "input": resume_input,
+                },
+            )
         await event_store.emit(
             context.run_id,
             EventType.RUN_RESUMED,
@@ -408,6 +488,7 @@ class AgentRuntime:
             skills=tuple(skill.manifest.reference() for skill in context.skills),
             attachments=context.attachments,
             artifacts=tuple(context.artifacts),
+            metadata=context.run_metadata,
         )
         await run_store.create(run)
         await event_store.emit(
@@ -421,6 +502,7 @@ class AgentRuntime:
                     else None
                 ),
                 "turn_sequence": context.turn_sequence,
+                **_flow_invocation_correlation(context.run_metadata),
             },
         )
         for selected_skill in context.skills:
@@ -570,3 +652,20 @@ class AgentRuntime:
                 },
             },
         )
+
+
+def _flow_invocation_correlation(
+    metadata: dict[str, object],
+) -> dict[str, object]:
+    if metadata.get("execution_scope") != "flow_invocation":
+        return {}
+    keys = (
+        "execution_scope",
+        "flow_run_id",
+        "invocation_id",
+        "agent_key",
+        "definition_id",
+        "definition_version",
+        "definition_fingerprint",
+    )
+    return {key: metadata[key] for key in keys if key in metadata}

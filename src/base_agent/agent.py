@@ -22,7 +22,7 @@ from base_agent.models import (
     RunStatus,
     RuntimeEvent,
 )
-from base_agent.profiles import AgentProfile
+from base_agent.profiles import AgentDefinition, AgentProfile
 from base_agent.providers import ModelProvider
 from base_agent.resources import ResourceSpec
 from base_agent.run_handle import (
@@ -50,7 +50,17 @@ from base_agent.stores import (
 )
 from base_agent.stores.errors import RunNotFoundError
 from base_agent.supervision import Supervisor, build_default_supervisor
-from base_agent.tools import Tool, ToolExecutor, ToolRegistry
+from base_agent.tools import (
+    BoundedToolResultPolicy,
+    Tool,
+    ToolConfirmation,
+    ToolConfirmationPolicy,
+    ToolExecutor,
+    ToolRegistry,
+    ToolResultLimits,
+    ToolResultPolicy,
+    ToolSideEffectRecorder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +71,8 @@ class Agent:
     def __init__(
         self,
         *,
-        profile: AgentProfile,
+        profile: AgentProfile | None = None,
+        definition: AgentDefinition | None = None,
         model: ModelProvider,
         tools: Iterable[Tool] = (),
         runtime: AgentRuntime | None = None,
@@ -78,21 +89,47 @@ class Agent:
         memory_namespace: str | None = None,
         memory_failure_mode: MemoryFailureMode = MemoryFailureMode.BEST_EFFORT,
         conversation_history_limit: int = 40,
+        side_effect_recorder: ToolSideEffectRecorder | None = None,
+        confirmation_policy: ToolConfirmationPolicy | None = None,
+        tool_result_policy: ToolResultPolicy | None = None,
     ) -> None:
-        self.profile = profile
+        if (profile is None) == (definition is None):
+            raise ValueError("provide exactly one of profile or definition")
+        resolved_profile = (
+            definition.to_profile() if definition is not None else profile
+        )
+        if resolved_profile is None:  # Defensive narrowing for static type checkers.
+            raise ValueError("provide exactly one of profile or definition")
+        self.definition = definition
+        self.profile = resolved_profile
         self.model = model
         self.runtime = runtime or AgentRuntime()
         self.tool_registry = ToolRegistry(tools)
-        self.tool_registry.require(profile.tools)
-        self.tool_executor = ToolExecutor(self.tool_registry)
+        self.tool_registry.require(resolved_profile.tools)
+        self.tool_executor = ToolExecutor(
+            self.tool_registry,
+            side_effect_recorder=side_effect_recorder,
+            confirmation_policy=confirmation_policy,
+            result_policy=(
+                tool_result_policy
+                or BoundedToolResultPolicy(
+                    ToolResultLimits(
+                        max_bytes=resolved_profile.max_tool_result_bytes
+                    )
+                )
+            ),
+        )
+        self.side_effect_recorder = side_effect_recorder
+        self.confirmation_policy = confirmation_policy
+        self.tool_result_policy = self.tool_executor.result_policy
         self.run_store = run_store or InMemoryRunStore()
         self.event_store = event_store or InMemoryEventStore()
         self.checkpoint_store = checkpoint_store or InMemoryCheckpointStore()
         self.conversation_store = conversation_store or InMemoryConversationStore()
         self.skill_registry = skill_registry or SkillRegistry()
-        for skill_name in profile.skills:
+        for skill_name in resolved_profile.skills:
             self.skill_registry.manifest(skill_name)
-        self.supervisor = supervisor or build_default_supervisor(profile)
+        self.supervisor = supervisor or build_default_supervisor(resolved_profile)
         self.resources = tuple(resources)
         self.artifact_store = artifact_store or InMemoryArtifactStore()
         if memory_limit < 1 or memory_limit > 100:
@@ -112,7 +149,13 @@ class Agent:
             "agent initialized",
             extra={
                 "event": "agent.initialized",
-                "profile_id": profile.id,
+                "profile_id": resolved_profile.id,
+                "definition_version": (
+                    definition.version if definition is not None else None
+                ),
+                "definition_fingerprint": (
+                    definition.fingerprint if definition is not None else None
+                ),
                 "model_provider": model.name,
                 "tool_count": len(self.tool_registry),
                 "resource_count": len(self.resources),
@@ -129,6 +172,62 @@ class Agent:
         plan: ExecutionPlan | None = None,
         planning: bool = False,
         attachments: Iterable[Attachment] = (),
+    ) -> AgentResult:
+        return await self._execute(
+            prompt,
+            run_id=run_id,
+            conversation_id=conversation_id,
+            skills=skills,
+            plan=plan,
+            planning=planning,
+            attachments=attachments,
+            run_metadata=None,
+        )
+
+    async def execute_invocation(
+        self,
+        prompt: str,
+        *,
+        flow_run_id: UUID,
+        invocation_id: UUID,
+        agent_key: str,
+        attachments: Iterable[Attachment] = (),
+    ) -> AgentResult:
+        """Execute one Flow-owned invocation through this Agent's Runtime."""
+        if self.definition is None:
+            raise ValueError(
+                "Flow invocation requires an Agent constructed from AgentDefinition"
+            )
+        return await self._execute(
+            prompt,
+            run_id=invocation_id,
+            conversation_id=None,
+            skills=self.definition.skills,
+            plan=None,
+            planning=False,
+            attachments=attachments,
+            run_metadata={
+                "execution_scope": "flow_invocation",
+                "flow_run_id": str(flow_run_id),
+                "invocation_id": str(invocation_id),
+                "agent_key": agent_key,
+                "definition_id": self.definition.id,
+                "definition_version": self.definition.version,
+                "definition_fingerprint": self.definition.fingerprint,
+            },
+        )
+
+    async def _execute(
+        self,
+        prompt: str,
+        *,
+        run_id: UUID | None,
+        conversation_id: UUID | None,
+        skills: Iterable[str],
+        plan: ExecutionPlan | None,
+        planning: bool,
+        attachments: Iterable[Attachment],
+        run_metadata: Mapping[str, object] | None,
     ) -> AgentResult:
         active_run_id = run_id or uuid4()
         selected_skill_names = tuple(skills)
@@ -190,6 +289,7 @@ class Agent:
                 plan=plan,
                 planning_requested=planning,
                 attachments=selected_attachments,
+                run_metadata=dict(run_metadata or {}),
             )
             result = await self.runtime.execute(
                 context,
@@ -269,6 +369,31 @@ class Agent:
         """Complete a pending input Tool call and continue the same Run."""
         if not user_input.strip():
             raise ValueError("resume input must not be empty")
+        return await self._continue_waiting(
+            run_id,
+            resume_input=user_input,
+            confirmation=None,
+        )
+
+    async def confirm(
+        self,
+        run_id: UUID,
+        confirmation: ToolConfirmation,
+    ) -> AgentResult:
+        """Approve or reject one exact pending Tool confirmation request."""
+        return await self._continue_waiting(
+            run_id,
+            resume_input=None,
+            confirmation=confirmation,
+        )
+
+    async def _continue_waiting(
+        self,
+        run_id: UUID,
+        *,
+        resume_input: str | None,
+        confirmation: ToolConfirmation | None,
+    ) -> AgentResult:
         run = await self.run_store.get(run_id)
         if run.status is not RunStatus.WAITING:
             raise ValueError(f"run '{run_id}' is not waiting for input")
@@ -322,7 +447,8 @@ class Agent:
                 memory_limit=self.memory_limit,
                 memory_namespace=self.memory_namespace,
                 memory_failure_mode=self.memory_failure_mode,
-                resume_input=user_input,
+                resume_input=resume_input,
+                confirmation=confirmation,
             )
         except Exception as exc:
             try:

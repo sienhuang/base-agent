@@ -2,6 +2,7 @@
 
 import logging
 from time import monotonic
+from uuid import UUID
 
 from base_agent.models import (
     EventType,
@@ -10,6 +11,8 @@ from base_agent.models import (
     ModelResponse,
     PendingInput,
     ToolCall,
+    ToolConfirmation,
+    ToolConfirmationDecision,
     ToolDefinition,
     ToolResult,
     ToolResultStatus,
@@ -161,57 +164,67 @@ class ModelToolStrategy:
         *,
         response: ModelResponse,
         observations: list[ToolObservation] | None = None,
+        resumed_confirmations: dict[str, ToolConfirmation] | None = None,
     ) -> None:
         executor = services.tool_executor or ToolExecutor(
             services.tool_registry or ToolRegistry()
         )
         collected = observations or []
+        confirmations = resumed_confirmations or {}
         for index, call in enumerate(calls):
             if await self._cancel_if_requested(context, services):
                 return
-            call_data = {"step": context.step_count, "call": call.model_dump(mode="json")}
-            await services.event_store.emit(
-                context.run_id, EventType.TOOL_REQUESTED, call_data
-            )
-            decision = await services.supervisor.before_tool(context, call)
-            if decision.action is not SupervisionAction.CONTINUE:
-                await apply_supervision_decision(
-                    context,
-                    decision,
-                    services.event_store,
-                    append_message=False,
-                )
-                if decision.action is SupervisionAction.STOP:
-                    return
-                context.tool_call_count += 1
-                blocked = ToolResult(
-                    tool_name=call.name,
-                    status=ToolResultStatus.DENIED,
-                    error_code="supervisor_intervention",
-                    message=decision.reason,
-                )
-                context.messages.append(
-                    Message.tool(blocked.model_dump_json(), tool_call_id=call.id)
-                )
-                if decision.message:
-                    context.messages.append(Message.system(decision.message))
+            confirmation = confirmations.get(call.id)
+            call_data = {
+                "step": context.step_count,
+                "call": call.model_dump(mode="json"),
+            }
+            if confirmation is None:
                 await services.event_store.emit(
-                    context.run_id,
-                    EventType.TOOL_FAILED,
-                    {
-                        "step": context.step_count,
-                        "call_id": call.id,
-                        "result": blocked.model_dump(mode="json"),
-                    },
+                    context.run_id, EventType.TOOL_REQUESTED, call_data
                 )
-                await save_context_snapshot(context, services.run_store)
-                return
+                decision = await services.supervisor.before_tool(context, call)
+                if decision.action is not SupervisionAction.CONTINUE:
+                    await apply_supervision_decision(
+                        context,
+                        decision,
+                        services.event_store,
+                        append_message=False,
+                    )
+                    if decision.action is SupervisionAction.STOP:
+                        return
+                    context.tool_call_count += 1
+                    blocked = ToolResult(
+                        tool_name=call.name,
+                        status=ToolResultStatus.DENIED,
+                        error_code="supervisor_intervention",
+                        message=decision.reason,
+                    )
+                    context.messages.append(
+                        Message.tool(
+                            blocked.model_dump_json(),
+                            tool_call_id=call.id,
+                        )
+                    )
+                    if decision.message:
+                        context.messages.append(Message.system(decision.message))
+                    await services.event_store.emit(
+                        context.run_id,
+                        EventType.TOOL_FAILED,
+                        {
+                            "step": context.step_count,
+                            "call_id": call.id,
+                            "result": blocked.model_dump(mode="json"),
+                        },
+                    )
+                    await save_context_snapshot(context, services.run_store)
+                    return
 
-            context.tool_call_count += 1
-            await save_context_snapshot(context, services.run_store)
-            await services.event_store.emit(
-                context.run_id, EventType.TOOL_STARTED, call_data
-            )
+                context.tool_call_count += 1
+                await save_context_snapshot(context, services.run_store)
+                await services.event_store.emit(
+                    context.run_id, EventType.TOOL_STARTED, call_data
+                )
             tool_started_at = monotonic()
             logger.info(
                 "tool execution started",
@@ -232,6 +245,10 @@ class ModelToolStrategy:
                     resources=services.resources,
                     artifacts=services.artifacts,
                     memories=services.memories,
+                    flow_run_id=_metadata_uuid(context, "flow_run_id"),
+                    invocation_id=_metadata_uuid(context, "invocation_id"),
+                    tool_call_id=call.id,
+                    confirmation=confirmation,
                 ),
             )
             tool_log_level = (
@@ -297,6 +314,25 @@ class ModelToolStrategy:
                     metadata=metadata if isinstance(metadata, dict) else {},
                 )
                 context.state_machine.transition_to(ExecutionState.WAITING)
+                if (
+                    isinstance(metadata, dict)
+                    and metadata.get("kind") == "tool_confirmation"
+                ):
+                    request = metadata.get("request")
+                    request_id = (
+                        request.get("id")
+                        if isinstance(request, dict)
+                        else None
+                    )
+                    await services.event_store.emit(
+                        context.run_id,
+                        EventType.TOOL_CONFIRMATION_REQUESTED,
+                        {
+                            "request_id": request_id,
+                            "tool_call_id": call.id,
+                            "tool_name": call.name,
+                        },
+                    )
                 await services.event_store.emit(
                     context.run_id,
                     EventType.TOOL_WAITING,
@@ -369,7 +405,22 @@ class ModelToolStrategy:
                 )
                 for item in raw["observations"]
             ]
-            waiting_result = self._find_tool_result(context, waiting_call.id)
+            raw_confirmation = context.supervision_data.pop(
+                "tool_confirmation_decision",
+                None,
+            )
+            confirmation = (
+                ToolConfirmation.model_validate(raw_confirmation)
+                if raw_confirmation is not None
+                else None
+            )
+            waiting_result = (
+                None
+                if confirmation is not None
+                and confirmation.decision
+                is ToolConfirmationDecision.APPROVE
+                else self._find_tool_result(context, waiting_call.id)
+            )
         except (KeyError, TypeError, ValueError) as exc:
             await self._fail_execution(
                 context,
@@ -378,6 +429,20 @@ class ModelToolStrategy:
             )
             return True
 
+        if (
+            confirmation is not None
+            and confirmation.decision is ToolConfirmationDecision.APPROVE
+        ):
+            await self._execute_tool_batch(
+                context,
+                services,
+                (waiting_call, *remaining),
+                response=response,
+                observations=observations,
+                resumed_confirmations={waiting_call.id: confirmation},
+            )
+            return True
+        assert waiting_result is not None
         observations.append((waiting_call, waiting_result))
         if remaining:
             await self._execute_tool_batch(
@@ -502,3 +567,13 @@ class ModelToolStrategy:
         context.error = "run cancellation requested"
         context.state_machine.transition_to(ExecutionState.CANCELLED)
         return True
+
+
+def _metadata_uuid(context: RuntimeContext, key: str) -> UUID | None:
+    value = context.run_metadata.get(key)
+    if value is None:
+        return None
+    try:
+        return UUID(str(value))
+    except ValueError:
+        return None

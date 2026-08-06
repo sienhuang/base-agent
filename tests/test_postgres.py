@@ -7,11 +7,25 @@ import pytest
 
 from base_agent import (
     Agent,
+    AgentDefinition,
     AgentProfile,
     AgentResultStatus,
     Conversation,
     ConversationStore,
     EventType,
+    FlowAgent,
+    FlowDefinition,
+    FlowEventDraft,
+    FlowLeaseLostError,
+    FlowLifecycle,
+    FlowRevisionConflictError,
+    FlowSideEffect,
+    FlowSideEffectPhase,
+    FlowSideEffectRetryMode,
+    FlowWorkCommand,
+    FlowWorkReview,
+    FlowWorkReviewDecision,
+    FlowWorkStatus,
     ModelResponse,
     Run,
     RunStatus,
@@ -31,7 +45,12 @@ from base_agent.stores import (
     RunNotCancellableError,
     RunStore,
 )
-from base_agent.stores.postgres import PostgresStore
+from base_agent.stores.postgres import (
+    PostgresFlowRepository,
+    PostgresFlowSideEffectLedger,
+    PostgresFlowWorkSource,
+    PostgresStore,
+)
 from base_agent.stores.postgres.schema import build_tables
 from base_agent.testing import FakeModel
 
@@ -49,7 +68,63 @@ async def request_region(question: str) -> WaitForInput:
 
 
 def test_schema_name_is_validated_before_building_metadata() -> None:
-    assert build_tables("agent_data").metadata.schema == "agent_data"
+    tables = build_tables("agent_data")
+    assert tables.metadata.schema == "agent_data"
+    assert tables.flow_runs.name == "base_agent_flow_runs"
+    assert tables.flow_events.name == "base_agent_flow_events"
+    assert tables.flow_leases.name == "base_agent_flow_leases"
+    assert tables.flow_work_items.name == "base_agent_flow_work_items"
+    assert tables.flow_work_reviews.name == "base_agent_flow_work_reviews"
+    assert tables.flow_side_effects.name == "base_agent_flow_side_effects"
+    assert {column.name for column in tables.flow_runs.columns} == {
+        "id",
+        "revision",
+        "status",
+        "updated_at",
+        "payload",
+    }
+    assert {column.name for column in tables.flow_events.primary_key} == {
+        "run_id",
+        "sequence",
+    }
+    assert {column.name for column in tables.flow_leases.columns} == {
+        "run_id",
+        "token",
+        "owner_id",
+        "attempt",
+        "active",
+        "acquired_at",
+        "heartbeat_at",
+        "expires_at",
+    }
+    assert {
+        "run_id",
+        "idempotency_key",
+        "status",
+        "attempt",
+        "delivery_token",
+        "lease_expires_at",
+        "blocked_reason",
+        "payload",
+    } <= {column.name for column in tables.flow_work_items.columns}
+    assert {
+        "work_id",
+        "decision",
+        "reviewer_id",
+        "reason_code",
+        "idempotency_key",
+        "payload",
+    } <= {column.name for column in tables.flow_work_reviews.columns}
+    assert {
+        "run_id",
+        "invocation_id",
+        "operation_key",
+        "operation_name",
+        "retry_mode",
+        "phase",
+        "revision",
+        "payload",
+    } <= {column.name for column in tables.flow_side_effects.columns}
     with pytest.raises(ValueError, match="invalid PostgreSQL schema"):
         build_tables("agent-data;drop schema public")
 
@@ -62,6 +137,172 @@ async def open_store() -> AsyncIterator[PostgresStore]:
         yield store
     finally:
         await store.close()
+
+
+def postgres_flow_definition() -> FlowDefinition:
+    return FlowDefinition(
+        id="postgres-flow",
+        version="1.0.0",
+        agents=(
+            FlowAgent(
+                key="writer",
+                definition=AgentDefinition(
+                    id="postgres-writer",
+                    version="1.0.0",
+                    instructions="Write the result.",
+                ),
+            ),
+        ),
+        strategy="sequential",
+    )
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_postgres_flow_repository_is_durable_and_rejects_stale_writes() -> None:
+    async for store in open_store():
+        repository = PostgresFlowRepository(store.engine)
+        lifecycle = FlowLifecycle(repository)
+        created = await lifecycle.create(postgres_flow_definition())
+        stale = await repository.get(created.run_id)
+        lease = await repository.acquire_execution(
+            created.run_id,
+            owner_id="postgres-worker",
+            ttl_seconds=30,
+        )
+
+        with pytest.raises(FlowLeaseLostError):
+            await lifecycle.start(created.run_id)
+        started = await FlowLifecycle(
+            repository,
+            execution_lease=lease,
+        ).start(created.run_id)
+
+        reopened = PostgresFlowRepository(store.engine)
+        assert await reopened.get(created.run_id) == started
+        assert [event.type for event in await reopened.events(created.run_id)] == [
+            EventType.FLOW_CREATED,
+            EventType.FLOW_STARTED,
+        ]
+        with pytest.raises(FlowRevisionConflictError, match="revision conflict"):
+            await reopened.commit(
+                stale.start(),
+                expected_revision=stale.revision,
+                events=(FlowEventDraft(type=EventType.FLOW_STARTED),),
+                execution_token=lease.token,
+            )
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_postgres_flow_work_source_deduplicates_and_fences_delivery() -> None:
+    async for store in open_store():
+        repository = PostgresFlowRepository(store.engine)
+        created = await FlowLifecycle(repository).create(postgres_flow_definition())
+        source = PostgresFlowWorkSource(store.engine)
+        idempotency_key = f"postgres-work:{uuid4()}"
+
+        first, duplicate = await asyncio.gather(
+            source.enqueue(
+                FlowWorkCommand(
+                    run_id=created.run_id,
+                    idempotency_key=idempotency_key,
+                    data={"request_id": "postgres-request"},
+                )
+            ),
+            source.enqueue(
+                FlowWorkCommand(
+                    run_id=created.run_id,
+                    idempotency_key=idempotency_key,
+                    data={"request_id": "postgres-request"},
+                )
+            ),
+        )
+        assert first == duplicate
+
+        claimed = await source.claim(
+            owner_id="postgres-worker",
+            ttl_seconds=30,
+        )
+        assert claimed is not None
+        assert claimed.id == first.id
+        assert claimed.delivery_token is not None
+        completed = await source.complete(
+            claimed.id,
+            delivery_token=claimed.delivery_token,
+        )
+        repeated = await source.complete(
+            claimed.id,
+            delivery_token=claimed.delivery_token,
+        )
+        assert completed == repeated
+        assert completed.status is FlowWorkStatus.COMPLETED
+
+        review_command = FlowWorkCommand(
+            run_id=created.run_id,
+            idempotency_key=f"postgres-review-work:{uuid4()}",
+        )
+        review_item = await source.enqueue(review_command)
+        review_claim = await source.claim(
+            owner_id="postgres-review-worker",
+            ttl_seconds=30,
+        )
+        assert review_claim is not None
+        assert review_claim.id == review_item.id
+        assert review_claim.delivery_token is not None
+        blocked = await source.block(
+            review_claim.id,
+            delivery_token=review_claim.delivery_token,
+            reason_code="active_invocation_uncertain",
+        )
+        assert blocked in await source.list_blocked()
+        review = FlowWorkReview(
+            work_id=blocked.id,
+            decision=FlowWorkReviewDecision.APPROVE_RETRY,
+            reviewer_id="postgres-operator",
+            reason_code="idempotency_verified",
+            idempotency_key=f"postgres-review:{uuid4()}",
+        )
+        reviewed = await source.review(review)
+        repeated_review = await source.review(review)
+        assert reviewed == repeated_review
+        assert reviewed.item.status is FlowWorkStatus.PENDING
+        assert await source.list_reviews(blocked.id) == (reviewed.review,)
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_postgres_flow_side_effect_ledger_is_durable_and_fenced() -> None:
+    async for store in open_store():
+        repository = PostgresFlowRepository(store.engine)
+        created = await FlowLifecycle(repository).create(postgres_flow_definition())
+        ledger = PostgresFlowSideEffectLedger(store.engine)
+        invocation_id = uuid4()
+        effect = FlowSideEffect(
+            flow_run_id=created.run_id,
+            invocation_id=invocation_id,
+            operation_key="postgres-tool-call",
+            operation_name="payments.charge",
+            retry_mode=FlowSideEffectRetryMode.IDEMPOTENT,
+            idempotency_key_digest="a" * 64,
+        )
+
+        prepared, duplicate = await asyncio.gather(
+            ledger.prepare(effect),
+            ledger.prepare(effect.model_copy(update={"id": uuid4()})),
+        )
+        assert prepared == duplicate
+        started = await ledger.mark_started(
+            prepared.id,
+            expected_revision=prepared.revision,
+        )
+        reopened = PostgresFlowSideEffectLedger(store.engine)
+        assert await reopened.list_for_invocation(invocation_id) == (started,)
+        confirmed = await reopened.confirm(
+            started.id,
+            expected_revision=started.revision,
+        )
+        assert confirmed.phase is FlowSideEffectPhase.CONFIRMED
 
 
 @requires_postgres

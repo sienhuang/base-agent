@@ -14,7 +14,7 @@
 负责把以下对象组合成一次可观察、可限制、可暂停和可恢复的 Run：
 
 ```text
-AgentProfile       静态配置：指令、能力名单、权限和预算
+AgentDefinition    版本化业务定义：指令、能力名单、权限和预算
 ModelProvider      模型边界：ModelRequest -> ModelResponse
 Tool               原子能力：结构化参数 -> 结构化结果
 Skill              版本化流程说明：允许哪些 Tool、需要哪些权限
@@ -79,6 +79,15 @@ ModelProvider
 - Resource、Artifact、Memory 等通用能力端口；
 - 内存实现和若干可选基础设施适配器。
 
+它首先面向 Agent 应用开发者，而不是只面向 Runtime 或基础设施开发者。首要产品目标是：
+
+> 让 Agent 开发者专注编写 Prompt、Tool、Skill 和少量 Agent/Flow 编排策略，通过组合
+> 而不是开发 Runtime，就能快速构建一个可运行、可测试、可扩展的单 Agent 或简单
+> 多 Agent 应用。
+
+Harness、Run、Event、Checkpoint、Store、Worker 和治理能力是框架为实现这个目标而吸收
+的工程复杂度，不应成为普通 Agent 开发者必须理解和重复实现的前置知识。
+
 ### 2.2 它不是什么
 
 核心包本身不是：
@@ -106,7 +115,7 @@ starter / 业务应用 / CLI / HTTP 服务
                 │
                 ▼
 公共门面层
-Agent / AgentProfile / RunHandle
+Agent / AgentDefinition / AgentProfile / RunHandle
                 │
                 ▼
 运行时与编排层
@@ -128,6 +137,142 @@ ModelProvider / Tool / Store / Resource / Memory / Browser / Sandbox Protocol
 3. 核心不能依赖 FastAPI、数据库、Docker、浏览器或具体业务。
 4. Tool 和 Skill 不应该直接创建全局基础设施客户端。
 5. 活的连接、容器和页面对象不能进入消息、Run 或 Checkpoint。
+
+### 3.1 从 Harness Engineering 视角理解 base-agent
+
+在 LLM Agent 语境中，Harness 不是某一个类，也不只是 Model → Tool → Model 循环。它是
+围绕模型、让 Agent 能够可靠执行的整套运行框架，包括执行环境、Tool、上下文、编排、
+可观察性、验证和治理。
+
+从这个视角看，`base-agent` 当前已经是一个正在成形的 Agent Harness：
+
+- `AgentRuntime` 是生命周期内核，统一控制 Run 状态、模型/Tool 迭代、取消、等待、恢复
+  和终态提交；
+- `OrchestrationStrategy` 决定一次有界执行如何推进，但不拥有完整 Run 生命周期；
+- Tool、Resource、Sandbox 和 Browser 决定 Agent 能够在什么环境中执行哪些动作；
+- Message、Skill、Memory、Attachment 和 Artifact 共同构成模型看到和执行过程中保留的
+  上下文；
+- Event、日志、Store 和 SSE 使执行过程可观察、可回放；
+- Supervisor、权限和资源边界提供当前已有的运行控制与部分治理能力。
+
+可以把产品定位概括为：
+
+> 一个面向 Agent 开发者、规范驱动、可观察、可验证、可治理的 Agent Harness 与任务
+> 执行内核；它隐藏通用 Runtime 复杂度，并提供受控的简单多 Agent 编排。
+
+其中各部分有明确的主次关系：
+
+1. **开发者价值是首要目标**：开发者主要编写 Prompt、Tool、Skill、Agent 和少量 Flow；
+2. **组合是主要扩展方式**：通过 Profile、Definition、Toolkit、Skill、Policy、Strategy
+   和 Adapter 组合能力，不要求复制 Runtime 或建立深继承树；
+3. **Harness 是技术底座**：统一吸收生命周期、状态、上下文、执行环境、观察、验证和
+   治理复杂度；
+4. **任务执行内核提供可靠性**：Run、Event、Checkpoint、取消、等待、恢复和持久化采用
+   一致语义；
+5. **多 Agent 保持受控和简单**：支持命名 Agent、固定 Flow、路由和
+   Planner/Executor 分工，但不演进为自治 Agent 社会或通用分布式工作流平台。
+
+因此，后续设计不应在 `AgentRuntime` 旁边再创建一套重复的“大 Harness Runtime”。更合理
+的方向是把现有执行内核明确视为 **Harness Kernel**，继续通过小型 Protocol、Policy 和
+Adapter 补齐缺失能力。`Agent` 仍然是面向应用开发者的简单组合入口，不要求普通开发者
+理解 Harness 内部细节。
+
+这里的 Harness 与 `testing/` 中的 `ToolHarness`、`SkillHarness` 含义不同：
+
+- **Agent Harness / Harness Kernel**：生产执行所依赖的完整运行框架；
+- **Testing Harness**：隔离测试 Tool、Skill、Agent 或 Flow 的测试工具。
+
+### 3.2 ETCLOVG 七层映射
+
+可以使用 ETCLOVG 分类检查 Harness 是否完整。该分类不是新的包结构要求，而是跨现有模块
+的架构视图：
+
+| 层 | 关注点 | 当前对应模块与能力 | 当前判断 |
+| --- | --- | --- | --- |
+| E — Execution environment | Agent 在哪里运行、资源如何隔离和回收 | `resources/`、`sandbox/`、`browser/` | 已有执行段资源生命周期和可选隔离环境；生产网络、文件和资源策略仍需强化 |
+| T — Tool interface | Tool schema、调用协议、权限、超时和结果边界 | `tools/`、`toolkits/`、`mcp/`、`data_sources/` | 已有副作用分类、确认、Flow 账本、幂等键注入和统一结果上限 |
+| C — Context management | 模型每一步看到什么，记忆和历史如何选择、压缩 | `RuntimeContext`、Message、Skill、Memory、Attachment、Artifact | 已有结构化来源；尚缺统一 Context budget、选择和 compaction 契约 |
+| L — Lifecycle / Orchestration | Run、Plan、ReAct、取消、等待、恢复和故障语义 | `runtime/`、`orchestration/`、`RunHandle`、Checkpoint | 当前最成熟；仍缺进程重启后的 durable executor、lease 和恢复 |
+| O — Observability | 执行是否可检查、关联、回放、度量和追踪 | Runtime Event、日志、PostgreSQL、Redis、SSE、TokenUsage | 已有有序事实和回放；仍缺统一 Metrics、Trace 和安全的 Event payload policy |
+| V — Verification | 运行前是否就绪，结果和轨迹是否正确可信 | 结构化模型、测试、部分 Supervisor 策略 | 当前明显不足；尚无独立 Verifier、trajectory evaluation 和 trace-to-regression 契约 |
+| G — Governance | 身份、租户、权限、副作用、安全、审计和保留 | Profile permissions、ToolExecutor、Supervisor、Sandbox 边界 | 有最小权限基础；缺租户授权、确认、数据策略、保留和完整审计 |
+
+前四层决定 Agent 如何执行，O/V/G 是贯穿所有执行层的控制面。Observability、Verification
+和 Governance 不应被隐藏成某个 Strategy 的内部回调，因为它们需要独立的契约、配置、
+事件、测试和生产运维责任。
+
+特别需要区分：
+
+- **Supervisor** 回答“这一步是否允许继续、是否超过预算、是否陷入无进展循环”；
+- **Verifier** 回答“环境是否就绪、最终结果是否正确、执行轨迹是否可信”；
+- **Governance Policy** 回答“谁有权执行或读取、哪些副作用需要确认、数据如何审计和
+  保留”。
+
+当前 Supervisor 不能代替 Verification 或完整 Governance。
+
+### 3.3 AgentDemo、mock-manus 与 base-agent 的关系
+
+`AgentDemo` 和 `mock-manus` 都已经包含项目内的隐式 Harness，但它们应作为参考实现和
+下游消费者，而不是核心依赖：
+
+```text
+AgentDemo ────┐
+mock-manus ───┼──> base-agent Harness Kernel
+业务 Agent ───┘
+```
+
+从 `AgentDemo` 提炼的重点包括有界步骤循环、无进展检测、可替换的 ReAct/Planning、
+规范化 Tool 集合和可选 Memory。从 `mock-manus` 提炼的重点包括后台 Task、类型化事件、
+Planner/ReAct Flow、Sandbox/Browser 生命周期、Attachment/Artifact 和人工等待。
+
+抽取原则是：
+
+1. 通用生命周期、状态、事件和安全边界进入 `base-agent`；
+2. 业务 Prompt、角色、UI、会话产品语义和领域 Tool 留在应用；
+3. 不直接复制同时构造 LLM、数据库、Sandbox、Browser 和 Flow 的应用级大类；
+4. 每项抽取能力必须能使用内存实现和 FakeModel 做确定性测试；
+5. `base-agent` 不导入或暴露以 AgentDemo、mock-manus 命名的类型。
+
+详细的已采纳模式和明确不复制的模式见
+[`REFERENCE_DESIGN.md`](REFERENCE_DESIGN.md)。
+
+### 3.4 Harness 配置快照与可复现性
+
+同一个模型在不同 Tool schema、Context policy、Sandbox、重试规则或 Verifier 下可能产生
+完全不同的结果，这称为 Harness coupling。一次评估实际测量的是
+**model–harness–environment** 组合，而不是模型本身。
+
+目标架构应逐步引入声明式、不可变的 Harness 配置，例如：
+
+```python
+HarnessSpec(
+    execution=ExecutionPolicy(...),
+    tools=ToolPolicy(...),
+    context=ContextPolicy(...),
+    lifecycle=LifecyclePolicy(...),
+    observability=ObservabilityPolicy(...),
+    verification=VerificationPolicy(...),
+    governance=GovernancePolicy(...),
+)
+```
+
+`HarnessSpec` 是目标概念，当前尚未成为公共 API。它不负责重新实现 Runtime，而是组合七层
+已有或待实现的 Policy 和 Adapter。普通应用应能选择安全默认配置，而不是逐项构造全部
+策略。
+
+每个 Run 还应记录不可变的 `HarnessSnapshot` 或等价审计信封，至少包含：
+
+- Provider、模型和执行环境版本；
+- 已启用 Tool 的名称、schema、版本、权限和副作用分类；
+- Context budget、检索和压缩策略；
+- Strategy、超时、重试、Checkpoint 和恢复策略；
+- Event payload、Verifier 和 Governance policy 版本；
+- 整体配置 hash。
+
+`HarnessSnapshot` 同样属于目标设计，当前 Run 尚未完整保存这些信息。引入它的目的不是让
+模型看到更多配置，而是支持问题归因、运行复现、基准比较、审计和回归测试。目标架构及
+实施顺序以 [`ARCHITECTURE_DESIGN_ZH.md`](ARCHITECTURE_DESIGN_ZH.md) 和
+[`TODO.md`](TODO.md) 为准。
 
 ## 4. 目录和文件职责
 
@@ -151,6 +296,7 @@ ModelProvider / Tool / Store / Resource / Memory / Browser / Sandbox Protocol
 | `models/` | Provider 中立、可序列化的数据契约。 | [`model.py`](../src/base_agent/models/model.py)、[`run.py`](../src/base_agent/models/run.py) |
 | `runtime/` | 生命周期、状态机、Checkpoint 和 Run 快照。 | [`engine.py`](../src/base_agent/runtime/engine.py) |
 | `orchestration/` | 一轮执行策略、默认模型工具循环和计划更新。 | [`model_tool.py`](../src/base_agent/orchestration/model_tool.py) |
+| `flows/` | FlowDefinition、显式 Handoff 和 AgentInvoker 调用边界。 | [`models.py`](../src/base_agent/flows/models.py) |
 | `tools/` | Tool Protocol、装饰器、注册表、执行器和 ToolContext。 | [`decorator.py`](../src/base_agent/tools/decorator.py)、[`executor.py`](../src/base_agent/tools/executor.py) |
 | `skills/` | Skill Manifest、延迟加载、注册和校验。 | [`loader.py`](../src/base_agent/skills/loader.py)、[`validator.py`](../src/base_agent/skills/validator.py) |
 | `supervision/` | 模型和工具调用前后的运行保护策略。 | [`policies.py`](../src/base_agent/supervision/policies.py) |
@@ -162,7 +308,7 @@ ModelProvider / Tool / Store / Resource / Memory / Browser / Sandbox Protocol
 | `toolkits/` | 基础 Tool 工厂以及具体 Coding 组合。 | [`bundle.py`](../src/base_agent/toolkits/bundle.py)、[`coding.py`](../src/base_agent/toolkits/coding.py) |
 | `web_search/` | Web Search Provider、结果模型、Tool 和 Brave 适配器。 | [`protocol.py`](../src/base_agent/web_search/protocol.py) |
 | `data_sources/` | 只读数据源端口、查询 Tool、Artifact 溢出和 MTBI CLI / OneSQL 适配器。 | [`protocol.py`](../src/base_agent/data_sources/protocol.py) |
-| `testing/` | FakeModel、ToolHarness、SkillHarness。 | [`fake_model.py`](../src/base_agent/testing/fake_model.py) |
+| `testing/` | FakeModel、ToolHarness、SkillHarness、AgentTestHarness。 | [`harness.py`](../src/base_agent/testing/harness.py) |
 
 ### 4.3 可选适配器
 
@@ -178,13 +324,15 @@ ModelProvider / Tool / Store / Resource / Memory / Browser / Sandbox Protocol
 
 ## 5. 核心对象之间的关系
 
-### 5.1 AgentProfile：静态声明
+### 5.1 AgentDefinition：版本化业务定义
 
-[`AgentProfile`](../src/base_agent/profiles.py) 描述一个 Agent 的固定配置：
+[`AgentDefinition`](../src/base_agent/profiles.py) 描述一个 Agent“是谁、能做什么、受到哪些
+限制”。它是不可变、可版本化的应用定义：
 
 ```python
-AgentProfile(
+definition = AgentDefinition(
     id="order-agent",
+    version="1.0.0",
     instructions="Help with orders.",
     model="model-route",
     tools=("get_order",),
@@ -195,12 +343,35 @@ AgentProfile(
 )
 ```
 
+`definition.fingerprint` 是定义内容的稳定 SHA-256，用于变更识别，并为后续
+HarnessSnapshot、Flow compatibility 和运行审计提供基础。它不是 Secret，也不会自动进入
+模型 Prompt。
+
+具体 Provider、Tool 实现、Store、Resource、Supervisor 和 Runtime 不进入
+`AgentDefinition`，仍由应用 composition root 注入：
+
+```python
+agent = Agent(
+    definition=definition,
+    model=provider,
+    tools=tools,
+    skill_registry=skills,
+    resources=resources,
+)
+```
+
+`AgentProfile` 是向后兼容的 Runtime 配置类型。现有应用可以继续使用
+`Agent(profile=AgentProfile(...))`；新应用优先使用
+`Agent(definition=AgentDefinition(...))`。二者必须且只能提供一个。当前 Runtime 和
+Checkpoint 仍消费从 Definition 投影得到的 AgentProfile，因此此变更不修改既有执行和
+恢复语义。
+
 需要区分三个概念：
 
 ```text
 Agent(tools=...)          注册：应用里有哪些 Tool 实现
-profile.tools             启用：当前 Agent 可以向模型暴露哪些 Tool
-profile.permissions       授权：执行器允许当前 Agent 使用哪些权限
+definition.tools          启用：当前 Agent 可以向模型暴露哪些 Tool
+definition.permissions    授权：执行器允许当前 Agent 使用哪些权限
 ```
 
 注册不等于启用，启用也不等于授权。这个区分用于避免管理类或高风险 Tool 因为“已经注册”
@@ -224,7 +395,7 @@ starter 可以从一个明确的 `ENABLED_TOOLS` 集合推导 `profile.tools`，
 
 ```python
 agent = Agent(
-    profile=profile,
+    definition=definition,
     model=provider,
     tools=tools,
     skill_registry=skills,
@@ -354,8 +525,14 @@ Message.tool(
 因此 ToolResult 会在下一轮模型请求中出现。失败结果通常也会回到模型，让模型改变策略或
 解释失败；`WAITING` 是例外，它会暂停 Run。
 
-大结果不能直接返回。当前 Runtime 尚无通用 ToolResult 大小保护，详细设计和计划能力见
-[`TOOLS.md`](TOOLS.md#bound-tool-results)。
+大结果不能直接返回。`BoundedToolResultPolicy` 现在会在统一 ToolExecutor 边界测量完整
+ToolResult JSON 的 UTF-8 字节数；默认上限 262,144 字节，并可通过
+`AgentDefinition.max_tool_result_bytes` 固定。超限时原数据被替换为
+`tool_result_too_large`，只保留原大小、上限、原状态和 rejected 动作。它不截断 JSON，
+因此模型消息、Event 和后续 Checkpoint 看到的都是有效且有界的结果。
+
+Runtime 不自动把未知大结果写成 Artifact，因为通用层无法判断敏感性、media type、访问权和
+保留策略。Tool 应通过 `ToolContext.artifacts` 显式保存获准的 bulk data，再返回有界引用。
 
 ## 7. Tool 架构
 
@@ -740,17 +917,180 @@ BrowserSession 提供导航、快照、选择器交互和截图。Playwright 实
 - 将截图写成 Artifact，不把 base64 放入 ToolResult；
 - 不开放任意 JavaScript、下载、上传、扩展或宿主浏览器 Profile。
 
+### 16.5 Flow 定义与调用边界
+
+当前已经实现简单多 Agent Flow 的定义层、持久化生命周期内核和第一个可执行顺序策略：
+
+- `FlowDefinition`：版本化 Flow ID、命名 Agent 绑定、Strategy 名称和调用上限；
+- `FlowAgent`：稳定 `agent_key` 到 `AgentDefinition` 的绑定；
+- `AgentHandoff`：Agent 间显式传递的摘要、JSON 数据和 Artifact 引用；
+- `AgentInvocationRequest/Result`：带 flow_run_id、invocation_id、sequence 和 agent_key 的
+  调用信封；
+- `FlowRunState/AgentInvocation`：不可变、可序列化的顶层 Flow 与子调用生命周期；
+- `FlowLifecycle`：统一推进 Flow 状态，并将新快照与事件作为一个原子提交；
+- `FlowRepository`：以 revision/CAS 防止并发覆盖的持久化端口；
+- `InMemoryFlowRepository`：为测试和单进程应用提供连续事件序列与防御性副本；
+- `PostgresFlowRepository`：在独立 Flow 表中持久化快照与连续事件，并把一次状态转换
+  及其全部事件放入同一个数据库事务；
+- `FlowExecutionLease/FlowLeaseRepository`：为 worker 提供单所有者认领、续租、释放、
+  单调 attempt 和随机 fencing token；
+- `FlowExecutionRunner`：在队列无关的执行边界中统一 claim、自动 heartbeat、丢失所有权
+  后取消本地 handler，以及 finally release；
+- `FlowWorkSource/FlowWorkCommand`：提供幂等投递、延迟 retry、超时重投，以及独立于
+  execution lease 的 delivery fencing；
+- `AgentInvoker`：FlowStrategy 调用或恢复 Agent 的 Protocol；
+- `FlowInput/FlowResult`：面向应用的顶层输入和聚合结果；
+- `SequentialFlowStrategy`：按声明顺序各调用一个命名 Agent，并显式构造 Handoff；
+- `FlowBudget/FlowBudgetPolicy`：统一约束 Invocation、Token、模型调用、Tool 调用和墙钟时间；
+- `AgentRuntimeInvoker`：将命名 Agent 映射到已配置的现有 Agent Runtime；
+- `CancellableAgentInvoker`：把已提交的 Flow 终态传播到活动子执行；
+- `DefaultAgentInvocationPromptBuilder`：仅把原始任务与受限 Handoff 构造成模型上下文；
+- `ScriptedAgentInvoker`：不执行真实 Agent 的确定性 Flow 测试替身。
+
+Handoff 不包含上一个 Agent 的完整 Message 历史，不继承其 Tool 和权限，也不携带活的
+Resource。详细契约见 [`FLOWS.md`](FLOWS.md)。
+
+`FlowRunState` 已经约束单一活动 Invocation、连续 sequence、Definition fingerprint、
+WAITING/resume、Usage 聚合和终态传播。每次转换递增 revision；`FlowLifecycle` 将替换
+快照与 Flow/AgentInvocation Event 原子写入，WAITING 和父子终止事件也不会出现半提交。
+`SequentialFlowStrategy` 现在能够自动完成顺序推进、Usage 聚合、失败短路、调用上限、
+WAITING/resume 和取消传播。resume 会先原子认领 WAITING 状态并写入 resumed 事件，再调用
+外部 transport，避免两个协调者同时执行恢复副作用。
+
+`AgentRuntimeInvoker` 要求每个 Agent 的 Definition fingerprint 与 Flow 绑定完全一致。
+不同 Agent 可以保留各自的 Run、Event、Checkpoint 和 Artifact Store，普通开发者因此能
+直接组合独立构造的 Agent；需要统一持久化边界的生产应用仍可在 composition root 注入共享
+Store。子执行以 `invocation_id` 作为内部 Runtime Run ID，同时在 Run metadata 和
+`run.created` 事件中记录 `flow_run_id`、`agent_key` 与 Definition identity；因此它不是
+游离根 Run。不同 Agent 仍保留各自的 Prompt、Tool、Skill、权限、模型和 Resource 配置。
+默认上下文构造器不会合并上一 Agent 的 Message 历史，只传递显式 Handoff，并限制序列化
+大小。
+
+`FlowBudget` 属于 FlowDefinition fingerprint 和持久化 FlowRunState，而不是某一个
+Agent。Harness 在每次 invoke/resume 前后基于已提交的 InvocationResult 计算总
+Invocation、输入/输出/总 Token、模型调用、Tool 调用和经过时间。恰好用满预算时允许当前
+Flow 完成，但不能再发起 transport；结果一旦超过预算则立即进入 `LIMIT_REACHED`。
+墙钟预算直接包围 Agent transport，超时会取消正在运行的调用。终态事件只记录结构化的
+预算 kind、limit 和 actual，不复制 Prompt 或输出。各 Agent 自己的 max_steps 和
+max_tool_calls 仍然独立生效，形成“Agent 子边界 + Flow 总边界”。
+
+外部取消通过 `SequentialFlowStrategy.cancel()` 进入统一路径：Harness 先原子提交 Flow
+与活动 AgentInvocation 的 CANCELLED 终态，再通过 `CancellableAgentInvoker` 通知子
+Runtime。WAITING 子 Run 会删除 Checkpoint；RUNNING 子 Run 接受已有的协作式取消信号；
+随后晚到的子结果只能读取父终态，不能覆盖它。重复取消已取消 Flow 是幂等操作。如果第三方
+Invoker 不支持取消或传播失败，Flow 仍保持 CANCELLED，并追加
+`agent_invocation.cancellation_propagation_failed`；事件只保存关联 ID、Flow 状态和错误
+类型，不保存异常正文。
+
+Flow Repository 已提供内存与 PostgreSQL 实现。PostgreSQL 适配器通过 Flow 行锁分配连续
+事件 sequence，以 revision/CAS 拒绝陈旧协调者，并在同一事务提交快照与该转换的全部事件。
+内存与 PostgreSQL Repository 均已支持执行 lease：同一 Flow 只能有一个未过期 owner；
+接管会增加 attempt 并更换 fencing token。旧 worker 即使恢复运行，也无法再提交状态或
+追加事件。Flow 一旦进入 lease 模式，后续写入不能退化成无 token 写入。
+
+`FlowExecutionRunner` 已在这些原语上提供自动 heartbeat：续租丢失时立即取消本地 handler，
+外层取消或 handler 异常时也会执行 release。Repository fencing 仍是最终保护，因此即使
+下游代码延迟响应 asyncio cancellation，旧 token 也不能写入。
+
+Runner 本身不轮询 work source，也不负责 Definition 解析、恢复决策和外部副作用账本；
+远程异步 Invoker 后续还需要取消 acknowledgement 或自己的 lease 语义。
+
+现在已提供 `InMemoryFlowWorkSource` 与 `PostgresFlowWorkSource`。PostgreSQL 实现使用
+idempotency key 去重，并通过 `FOR UPDATE SKIP LOCKED` 让多个 worker 领取不同的可执行行。
+每次 delivery 都有自己的 attempt 和 token：超时后新 delivery 会更换 token，旧 worker
+不能 complete 或 retry 新任务。长任务通过 `renew()` 延长 delivery，但不改变 attempt
+和 token。delivery token 只治理队列任务结算；真正修改 Flow 时仍必须持有
+`FlowExecutionLease`，两层 fencing 不能合并。
+
+WorkCommand 的 `data` 是持久业务数据而非 Event。若其中保存恢复输入或其他敏感内容，宿主
+应用必须为它提供与 Run 数据一致的加密、授权、保留和删除策略。
+
+`FlowPollingWorker` 已把 work source 与 execution runner 组合为单并发 durable worker：
+每个任务同时维护 delivery heartbeat 和 Flow execution heartbeat；任一所有权丢失都会取消
+本地 handler。成功时 complete，handler 失败时按配置延迟 retry，worker task 被取消时会
+先尝试把仍持有的任务重新排队。`run_once()` 用于确定性测试和外部循环，`run_forever()`
+提供轮询，`stop()` 在当前任务结算后优雅停止。
+
+通用 Worker 不猜测中断副作用是否可重做。应用 handler 仍需根据 WorkCommand、持久 Flow
+状态和固定 Definition 做恢复决策。默认日志和 WorkItem 只记录异常类型，不复制异常正文，
+避免异常消息携带 Prompt 或用户数据。
+
+现在这层决策也有了明确契约：
+
+- `FlowDefinitionResolver` 按 Run 中固定的 ID 和 version 解析不可变 Definition；
+- `DefinitionResolvingFlowWorkHandler` 在 dispatcher 前校验 fingerprint；
+- `FlowRecoveryPolicy` 只对白名单安全边界返回 START、ADVANCE、RESUME、FINALIZE 或
+  CANCEL；
+- 已经终态的 Run 返回 NOOP，保证重复投递不会创建第二个终态；
+- 活动 RUNNING Invocation 一律返回 MANUAL_REVIEW；副作用账本证据可供 Operator 判断，
+  但默认策略不自动重放一个结果尚未提交的 Agent 调用；
+- 缺少恢复输入、Definition 缺失或 fingerprint 改变，统一返回 MANUAL_REVIEW。
+
+MANUAL_REVIEW 会通过 metadata-only `FlowWorkBlockedError` 把任务结算为 `BLOCKED`，只保存
+有限 reason code，不保存异常正文。BLOCKED 任务不会再次被普通 worker 领取，避免 poison
+job 无限 retry。
+
+`FlowWorkReviewStore` 现在提供独立的可信 Operator 端口，与普通 `FlowWorkSource` 权限面
+分离。Operator 可以查看 BLOCKED、批准延迟重试、拒绝归档为 DISCARDED，以及读取不可变
+review 历史。审批记录包含 reviewer ID、有限 reason code、decision、delay、idempotency
+key 和时间戳；审批记录与 WorkItem 状态在一个事务提交。重复请求不会重复应用，两个并发
+冲突决策只有一个能够把任务移出 BLOCKED。
+
+这里的 reviewer ID 只是审计字段，不代表已经授权。核心库不直接暴露无认证 HTTP 管理
+接口；宿主应用必须先完成操作员身份、租户/Run ownership 和决策权限校验，再调用 Review
+Store。reason code 不允许承载 Prompt、恢复输入或异常正文。
+
+`FlowSideEffectLedger` 已提供 metadata-only 的副作用证据契约，以及内存和 PostgreSQL
+实现。每条记录只保存 Flow Run ID、Invocation ID、稳定 operation key/name、retry mode、
+下游幂等键的 SHA-256 摘要、PREPARED/STARTED/CONFIRMED/ABORTED 阶段、revision 和时间戳；
+不保存原始幂等键、Tool 参数、结果、Prompt 或异常正文。Recovery Worker 只依赖更窄的
+`FlowSideEffectEvidenceReader`，不能通过恢复端口改写证据。
+
+状态转换刻意保守：PREPARED 可以进入 STARTED 或 ABORTED；ABORTED 可以在后续已知安全的
+尝试中重新进入 STARTED；STARTED 只能进入 CONFIRMED。
+STARTED 之后发生超时或进程退出时继续保留 STARTED，不能武断写成“失败”。PREPARED/ABORTED
+代表已知未执行；STARTED/CONFIRMED 的 retry mode 与幂等键摘要可辅助人工判断。默认恢复
+策略仍会阻止所有活动 Invocation 自动重放。没有账本记录视为“缺少证据”，而不是“没有副作用”。
+
+Tool 侧现在通过 `ToolSideEffectMode` 显式声明 UNSPECIFIED、READ_ONLY、UNSAFE 或
+IDEMPOTENT。该元数据属于 Harness 治理面，不进入模型可见的 Tool schema。为了兼容现有
+Tool，默认值是 UNSPECIFIED；它不等同于 READ_ONLY，也不产生安全性声明。
+
+`FlowToolSideEffectRecorder` 已把 `ToolExecutor` 自动接到账本：参数和权限校验先于
+PREPARED/STARTED；正常返回后写 CONFIRMED；超时、异常、取消或进程退出保留 STARTED。
+IDEMPOTENT Tool 必须接收 `ToolContext`，并把其中稳定的 `idempotency_key` 传给真正提供
+幂等保证的下游系统，账本只保存 key 摘要。UNSAFE Tool 的相同 operation 一旦已经
+STARTED/CONFIRMED，会在再次进入业务函数前被拒绝。
+
+重要副作用还可以声明 `ToolConfirmationMode.REQUIRED`。首次调用在进入账本和业务函数前
+返回 WAITING，并持久化绑定 Run、ToolCall、Tool 名称和参数摘要的有限确认请求。确认不复用
+自由文本 `resume()`：宿主必须构造带 request ID、APPROVE/REJECT、subject ID 和 reason
+code 的 `ToolConfirmation`，通过 `Agent.confirm()` 或
+`SequentialFlowStrategy.confirm()` 提交。批准后恢复原始 ToolCall，不重复计数；拒绝不启动
+Tool 或账本，而是向模型追加结构化 DENIED 观察。错误 request ID 不消费 Checkpoint。
+
+确认请求和决定会产生 metadata-only Event，不复制 Tool 参数。subject ID 只是审计字段，
+核心库不把它当作认证；宿主仍须校验操作员身份、租户/Run ownership 和具体副作用权限。
+
+账本是恢复判断的证据，不是自动重放许可。应用必须把同一个 recorder 注入 Flow-owned
+Agent，并把同一 ledger 的只读证据端口注入恢复 handler。如果应用将来实现自己的主动
+Invocation 恢复策略，必须恢复原 Invocation 中持久化的原 ToolCall；重新询问模型产生的新
+ToolCall ID 是一个新的 operation，不能复用旧幂等键。
+
 ## 17. 已支持能力总览
 
 | 能力 | 状态 | 入口 |
 | --- | --- | --- |
 | 离线确定性 Agent | 已实现 | `FakeModel`、starter `OfflineModel` |
+| 完整 Agent 场景测试 | 已实现 | `AgentTestHarness`、`AgentTestRun` |
+| 完整 Flow 场景测试 | 已实现 | `FlowTestHarness`、`FlowTestRun` |
 | Model → Tool → Model | 已实现 | `ModelToolStrategy` |
 | 同步/异步 Tool | 已实现 | `@tool`、`FunctionTool` |
 | Tool 参数 Schema 与校验 | 已实现 | Pydantic 动态模型 |
 | Tool allowlist、权限和超时 | 已实现 | `ToolExecutor` |
 | ToolContext 注入 | 已实现 | `ContextualTool` |
-| Tool 大结果通用上限 | 尚未实现 | 设计见 `docs/TOOLS.md` |
+| Tool 副作用分类、确认与 Flow 账本埋点 | 已实现（显式启用） | `ToolSideEffectMode`、`ToolConfirmationMode`、`FlowToolSideEffectRecorder` |
+| Tool 大结果通用上限 | 已实现 | `BoundedToolResultPolicy`、`max_tool_result_bytes`、UTF-8 测量 |
 | Skill Manifest 和显式选择 | 已实现 | `SkillRegistry` |
 | 语义 Skill 自动选择 | 尚未实现 | 应作为独立选择策略 |
 | Run/Event/后台执行 | 已实现 | `RunHandle` |
@@ -758,7 +1098,23 @@ BrowserSession 提供导航、快照、选择器交互和截图。Playwright 实
 | 协作式取消 | 已实现 | RunStore cancel flag |
 | 执行预算和无进展检测 | 已实现 | Supervisor |
 | 可替换编排策略和 Plan | 已实现 | `OrchestrationStrategy` |
-| 多 Agent 核心编排 | 未内置 | 应由应用或新 Strategy 设计 |
+| 多 Agent Flow 定义与调用契约 | 已实现 | `FlowDefinition`、Handoff、`AgentInvoker` |
+| 简单顺序 Flow 门面 | 已实现（进程内） | `Flow.sequence(...)`、`FlowRun` |
+| Flow 生命周期状态契约 | 已实现 | `FlowRunState`、`AgentInvocation` |
+| Flow 原子状态与事件仓储 | 已实现（内存与 PostgreSQL） | `FlowLifecycle`、revision/CAS、`InMemoryFlowRepository`、`PostgresFlowRepository` |
+| 顺序多 Agent Flow | 已实现（内存/测试 Invoker） | `SequentialFlowStrategy`、显式 Handoff、WAITING/resume |
+| Agent Runtime 调用适配器 | 已实现（进程内） | `AgentRuntimeInvoker`、Definition pinning、关联子 Run |
+| Flow 统一预算 | 已实现 | Invocation、Token、模型/Tool 调用、wall-clock timeout |
+| Flow 主动取消传播 | 已实现（进程内） | WAITING 清理、RUNNING 信号、晚到结果保护、失败事件 |
+| Flow worker ownership | 已实现（底层原语） | claim、heartbeat、release、attempt、fencing token |
+| Flow execution runner | 已实现（队列无关） | 自动 claim/heartbeat、丢失 lease 后取消、finally release |
+| Flow durable work source | 已实现（内存与 PostgreSQL） | 幂等 enqueue、`SKIP LOCKED` claim、delivery fencing、延迟 retry |
+| Flow polling worker | 已实现（单并发） | 双 heartbeat、handler、complete/retry、取消重排、优雅停止 |
+| Flow Definition resolution | 已实现 | 精确 ID/version 解析、fingerprint pinning |
+| Flow recovery policy | 已实现（保守默认） | 安全边界白名单、NOOP、MANUAL_REVIEW、BLOCKED |
+| Flow operator review | 已实现（核心端口） | BLOCKED 查询、批准重试、拒绝归档、幂等审计 |
+| Flow 副作用恢复证据 | 已实现（核心端口） | metadata-only 账本、CAS 状态机、内存/PostgreSQL、人工恢复判断证据 |
+| 耐久 Flow Runtime | 部分实现 | 原子仓储、worker、恢复、账本、Tool 埋点与人工闭环已完成；仍需 Checkpoint 恢复策略 |
 | 执行期 Resource | 已实现 | `ResourceSpec`、`ResourceManager` |
 | Attachment/Artifact | 已实现 | `ArtifactStore` |
 | Memory 检索端口 | 已实现 | `MemoryRetriever` |
@@ -786,7 +1142,8 @@ BrowserSession 提供导航、快照、选择器交互和截图。Playwright 实
 4. 从明确的 enabled 集合推导 Profile Tool 名称；
 5. 显式授予 Profile permissions；
 6. 用 ToolHarness 测试成功、无权限、参数错误、超时和大结果边界；
-7. 再用 FakeModel 测试完整模型工具循环。
+7. 用 FakeModel 构造应用 Agent，再通过 AgentTestHarness 验证完整模型工具循环、Run 和
+   Event。
 
 ### 18.2 增加一个 Skill
 
@@ -794,7 +1151,7 @@ BrowserSession 提供导航、快照、选择器交互和截图。Playwright 实
 2. 声明版本、allowlist、required Tool 和 permissions；
 3. 在 Profile 中允许 Skill；
 4. 用 SkillHarness 检查 Manifest 和 Profile；
-5. 用 FakeModel 验证 Skill 指令、Tool 边界和最终结果。
+5. 用 AgentTestHarness 验证 Skill 指令、Tool 边界、Run 事件和最终结果。
 
 业务流程优先放 Skill，原子动作放 Tool。
 
@@ -901,7 +1258,7 @@ uv build
 ### 阶段一：最小 Agent
 
 1. 运行 [`examples/hello_agent.py`](../examples/hello_agent.py)；
-2. 阅读 `AgentProfile`、`Agent`、`FakeModel`；
+2. 阅读 `AgentDefinition`、`Agent`、`FakeModel`；
 3. 理解 Provider 中立的 request/response。
 
 ### 阶段二：Tool 循环
@@ -941,19 +1298,22 @@ Tool、Skill、CLI 和 Server 如何在应用层组合，而不是塞进 Runtime
 
 下面是与现有架构一致、且边界已经比较清楚的后续方向：
 
-1. ToolResult 统一大小保护、Artifact 引用信封和有界事件；
-2. Coding 的安全项目快照、Patch Artifact 和经批准的 Patch 应用；
-3. 带 SSRF/重定向/内容上限策略的已知 URL 获取 Tool；
-4. OneSQL 长查询的 detach/fetch/cancel、恢复和扫描成本限制；
-5. 上下文预算与历史压缩策略，明确 Event/Checkpoint 保真和模型上下文裁剪的区别；
-6. 独立的 Responses API Provider，支持经过授权的 Attachment 映射；
-7. Memory-capable Provider 或安全的 Memory 注入策略；
-8. 模型输出流式契约及其与 EventStream 的关系；
-9. 面向生产的外部任务 runner、lease 和进程重启恢复；
-10. 对象存储 ArtifactStore 与租户授权；
-11. 显式 Skill 选择器或 Router，但保持选择结果可观察、可验证；
-12. 应用层多 Agent Strategy，不把业务角色写死进核心；
-13. 在 Coding/Web Search/DataSource 的真实使用边界稳定后，再评估通用 Capability API。
+1. 定义 Harness 配置审计信封，逐步形成 `HarnessSpec`、`HarnessSnapshot` 或等价契约；
+2. 增加独立 Verification 契约，覆盖 preflight、outcome、trajectory 和 evaluator；
+3. 完成 Event payload 安全策略、HTTP 租户授权和 Tool 副作用治理；
+4. ToolResult 统一大小保护、Artifact 引用信封和有界事件；
+5. Coding 的安全项目快照、Patch Artifact 和经批准的 Patch 应用；
+6. 带 SSRF/重定向/内容上限策略的已知 URL 获取 Tool；
+7. OneSQL 长查询的 detach/fetch/cancel、恢复和扫描成本限制；
+8. 上下文预算与历史压缩策略，明确 Event/Checkpoint 保真和模型上下文裁剪的区别；
+9. 独立的 Responses API Provider，支持经过授权的 Attachment 映射；
+10. Memory-capable Provider 或安全的 Memory 注入策略；
+11. 模型输出流式契约及其与 EventStream 的关系；
+12. 面向生产的外部任务 runner、lease 和进程重启恢复；
+13. 对象存储 ArtifactStore 与租户授权；
+14. 显式 Skill 选择器或 Router，但保持选择结果可观察、可验证；
+15. 应用层多 Agent Strategy，不把业务角色写死进核心；
+16. 在 Coding/Web Search/DataSource 的真实使用边界稳定后，再评估通用 Capability API。
 
 这些能力应按第 18.8 节的顺序扩展，并优先补充测试与边界说明，再接具体厂商实现。
 详细任务、待决设计和验收标准统一记录在 [`TODO.md`](TODO.md)。
@@ -962,10 +1322,13 @@ Tool、Skill、CLI 和 Server 如何在应用层组合，而不是塞进 Runtime
 
 - 后续任务：[`TODO.md`](TODO.md)
 - 总体边界：[`ARCHITECTURE.md`](ARCHITECTURE.md)
+- 目标架构设计：[`ARCHITECTURE_DESIGN_ZH.md`](ARCHITECTURE_DESIGN_ZH.md)
+- AgentDemo/mock-manus 参考决策：[`REFERENCE_DESIGN.md`](REFERENCE_DESIGN.md)
 - Tool：[`TOOLS.md`](TOOLS.md)
 - Skill：[`SKILLS.md`](SKILLS.md)
 - Run 与 Event：[`RUNS.md`](RUNS.md)
 - 编排与 Plan：[`ORCHESTRATION.md`](ORCHESTRATION.md)
+- Flow 定义与调用边界：[`FLOWS.md`](FLOWS.md)
 - Resource：[`RESOURCES.md`](RESOURCES.md)
 - Attachment/Artifact：[`ARTIFACTS.md`](ARTIFACTS.md)
 - Memory：[`MEMORY.md`](MEMORY.md)

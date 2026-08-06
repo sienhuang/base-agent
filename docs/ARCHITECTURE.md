@@ -22,7 +22,34 @@ Applications depend on `base-agent`; the core never imports application or domai
 | Concept | Responsibility |
 | --- | --- |
 | `Agent` | Small public facade used to start or resume a run. |
-| `AgentProfile` | Instructions, enabled capabilities, model route, and execution limits. |
+| `AgentDefinition` | Immutable, versioned Prompt, enabled capabilities, model route, permissions, and limits. |
+| `AgentProfile` | Backwards-compatible Runtime projection used by existing applications and checkpoints. |
+| `Flow` | Small public facade for composing and running simple in-process Agent sequences. |
+| `FlowRun` | Resumable handle exposing output, pending input, confirmation, cancellation, and events. |
+| `FlowDefinition` | Versioned bindings from stable Agent keys to Agent definitions and a Flow strategy name. |
+| `FlowBudget` | Versioned aggregate limits for invocations, Tokens, model/Tool calls, and wall-clock time. |
+| `AgentInvoker` | Boundary through which a Flow invokes or resumes one named Agent. |
+| `CancellableAgentInvoker` | Optional capability for propagating a committed Flow terminal state to child execution. |
+| `AgentRuntimeInvoker` | Definition-pinned adapter from Flow invocations to configured Agent Runtime instances. |
+| `AgentHandoff` | Explicit summary, JSON data, and Artifact references passed between Agents. |
+| `FlowRunState` | Serializable top-level Flow lifecycle and ordered AgentInvocation state. |
+| `AgentInvocation` | One named Agent execution record owned by a Flow Run. |
+| `FlowLifecycle` | Advances a Flow aggregate and atomically commits its ordered events. |
+| `FlowRepository` | Version-checked persistence boundary for Flow snapshots and events. |
+| `PostgresFlowRepository` | Optional durable adapter that commits a Flow snapshot and transition events together. |
+| `FlowExecutionLease` | Time-bounded worker ownership with an attempt number and write-fencing token. |
+| `FlowLeaseRepository` | Claims, renews, and releases Flow execution ownership. |
+| `FlowExecutionRunner` | Queue-independent claim/heartbeat/cancel/release lifecycle around one Flow handler. |
+| `FlowWorkSource` | Idempotent durable enqueue and fenced at-least-once delivery of Flow work. |
+| `FlowWorkCommand` | Version-neutral Run target, operation kind, idempotency key, and bounded application data. |
+| `FlowPollingWorker` | Sequential durable worker composing delivery heartbeat, execution lease, handler, and settlement. |
+| `FlowDefinitionResolver` | Resolves the exact immutable Flow definition version pinned by a Run. |
+| `FlowRecoveryPolicy` | Whitelists safe automatic boundaries and routes uncertain execution to manual review. |
+| `DefinitionResolvingFlowWorkHandler` | Applies definition fingerprint checks and recovery policy before dispatch. |
+| `FlowWorkReviewStore` | Trusted operator port for listing BLOCKED work and atomically auditing approve/reject decisions. |
+| `FlowStrategy` | Application-level policy that advances a Flow only through AgentInvoker and FlowLifecycle. |
+| `SequentialFlowStrategy` | Runs named Agents once in declaration order with explicit bounded handoffs. |
+| `FlowBudgetPolicy` | Evaluates persisted aggregate consumption before and after Agent transport. |
 | `Runtime` | Advances the model/tool loop and emits events. |
 | `OrchestrationStrategy` | Advances one bounded turn; replaceable without replacing Run lifecycle. |
 | `ExecutionPlan` | Immutable dependency graph and step lifecycle used by planning strategies. |
@@ -62,6 +89,7 @@ src/base_agent/
 ├── models/
 ├── runtime/
 ├── orchestration/
+├── flows/               # Flow definitions, lifecycle repository, and AgentInvoker boundary
 ├── resources/
 ├── server/             # optional FastAPI import boundary
 ├── mcp/                # optional remote Tool transport

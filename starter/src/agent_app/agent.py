@@ -4,7 +4,7 @@ from pathlib import Path
 
 from base_agent import (
     Agent,
-    AgentProfile,
+    AgentDefinition,
     AgentRuntime,
     BraveWebSearchProvider,
     MtbiCliDataSource,
@@ -86,8 +86,9 @@ def build_agent(
         or resolved.enable_mtbi
     )
     return Agent(
-        profile=AgentProfile(
+        definition=AgentDefinition(
             id="starter-agent",
+            version="1.0.0",
             instructions=(
                 "Answer clearly. Use declared Tools when required and follow selected Skills."
             ),

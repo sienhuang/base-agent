@@ -24,6 +24,7 @@ and durable execution plans without a server or queue.
 uv sync
 uv run python examples/hello_agent.py
 uv run python examples/tool_agent.py
+uv run python examples/analysis_report_flow.py
 uv run python examples/skill_agent/run.py
 ```
 
@@ -31,6 +32,7 @@ All examples are deterministic and offline. Start with the
 [`Getting Started`](docs/GETTING_STARTED.md) guide, then continue with:
 
 - [中文架构与扩展指南](docs/ARCHITECTURE_GUIDE_ZH.md)
+- [整体架构设计](docs/ARCHITECTURE_DESIGN_ZH.md)
 - [Writing Tools](docs/TOOLS.md)
 - [Built-in ToolKit](docs/BUILTIN_TOOLS.md)
 - [Coding Bundle](docs/CODING.md)

@@ -68,6 +68,15 @@ def test_skill_harness_reports_valid_and_invalid_profiles() -> None:
     [
         ("examples/hello_agent.py", "Hello from base-agent!"),
         ("examples/tool_agent.py", "Shanghai is sunny."),
+        (
+            "examples/analysis_report_flow.py",
+            (
+                "2026-Q2 showed healthy growth: revenue increased 12.4% "
+                "to 1.24M while active customers rose 7.1% to 8,420. "
+                "The faster revenue growth suggests improved value per "
+                "customer."
+            ),
+        ),
         ("examples/skill_agent/run.py", "Verified result: Shanghai is sunny."),
     ],
 )

@@ -2,7 +2,7 @@
 
 import asyncio
 
-from base_agent import Agent, AgentProfile, ModelResponse, ToolCall, tool
+from base_agent import Agent, AgentDefinition, ModelResponse, ToolCall, tool
 from base_agent.testing import FakeModel
 
 
@@ -28,8 +28,9 @@ async def main() -> None:
         ]
     )
     agent = Agent(
-        profile=AgentProfile(
+        definition=AgentDefinition(
             id="weather-agent",
+            version="1.0.0",
             instructions="Use the weather tool before answering.",
             tools=("get_weather",),
         ),

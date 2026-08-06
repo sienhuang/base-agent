@@ -3,7 +3,12 @@
 from base_agent.models.artifact import Artifact, Attachment
 from base_agent.models.conversation import Conversation, ConversationTurn
 from base_agent.models.event import EventType, RuntimeEvent
-from base_agent.models.input import PendingInput, WaitForInput
+from base_agent.models.input import (
+    PendingInput,
+    ToolConfirmation,
+    ToolConfirmationDecision,
+    WaitForInput,
+)
 from base_agent.models.memory import (
     MemoryFailureMode,
     MemoryMatch,
@@ -58,6 +63,8 @@ __all__ = [
     "StepStatus",
     "TokenUsage",
     "ToolCall",
+    "ToolConfirmation",
+    "ToolConfirmationDecision",
     "ToolChoice",
     "ToolDefinition",
     "ToolResult",

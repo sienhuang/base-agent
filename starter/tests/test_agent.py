@@ -21,6 +21,8 @@ async def test_offline_agent_runs_model_tool_model_with_selected_skill() -> None
     )
     assert run.skills[0].name == "text-analysis"
     assert EventType.TOOL_COMPLETED in [event.type for event in events]
+    assert agent.definition is not None
+    assert agent.definition.version == "1.0.0"
 
 
 @pytest.mark.asyncio

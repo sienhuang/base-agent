@@ -52,6 +52,7 @@ class RuntimeContext:
     memories: tuple[MemoryMatch, ...] = ()
     memory_initialized: bool = False
     memory_error: str | None = None
+    run_metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def state(self) -> ExecutionState:

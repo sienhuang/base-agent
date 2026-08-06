@@ -12,6 +12,7 @@ No API key, database, queue, container runtime, or network service is required f
 ```bash
 uv sync
 uv run python examples/hello_agent.py
+uv run python examples/analysis_report_flow.py
 ```
 
 Expected output:
@@ -26,12 +27,13 @@ An Agent composes a profile, model provider, optional Tools, optional Skills, st
 Supervisor. It does not require subclassing.
 
 ```python
-from base_agent import Agent, AgentProfile, ModelResponse
+from base_agent import Agent, AgentDefinition, ModelResponse
 from base_agent.testing import FakeModel
 
 agent = Agent(
-    profile=AgentProfile(
+    definition=AgentDefinition(
         id="assistant",
+        version="1.0.0",
         instructions="Answer clearly.",
     ),
     model=FakeModel([ModelResponse(content="Done")]),
@@ -43,6 +45,12 @@ assert result.output == "Done"
 
 `FakeModel` is intentionally part of the supported developer API. Use it to make application tests
 deterministic before adding a real provider adapter.
+
+`AgentDefinition` is the immutable, versioned application definition: Prompt, model route, enabled
+Tool and Skill names, permissions, and execution limits. Concrete Provider, Tool implementations,
+stores, Resources, Supervisor, and Runtime remain explicit composition-root dependencies. Existing
+applications may continue to pass `profile=AgentProfile(...)`; new applications should prefer
+`definition=AgentDefinition(...)`.
 
 ## Continue across user Turns
 
@@ -127,6 +135,7 @@ agent = Agent(
 - [Conversations and Run-backed Turns](CONVERSATIONS.md)
 - [Model Providers](PROVIDERS.md)
 - [Orchestration and Plans](ORCHESTRATION.md)
+- [Controlled Agent Flow contracts](FLOWS.md)
 - [ReAct on the shared Model/Tool loop](REACT.md)
 - [Reference Design Decisions](REFERENCE_DESIGN.md)
 - [Troubleshooting](TROUBLESHOOTING.md)

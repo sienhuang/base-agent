@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, create_model
 
 from base_agent.models import ToolDefinition
 from base_agent.tools.context import ToolContext
+from base_agent.tools.effects import ToolConfirmationMode, ToolSideEffectMode
 
 
 class FunctionTool:
@@ -24,6 +25,8 @@ class FunctionTool:
         description: str | None = None,
         permissions: frozenset[str] = frozenset(),
         timeout_seconds: float = 30.0,
+        side_effect: ToolSideEffectMode = ToolSideEffectMode.UNSPECIFIED,
+        confirmation: ToolConfirmationMode = ToolConfirmationMode.NONE,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("tool timeout_seconds must be greater than zero")
@@ -40,6 +43,27 @@ class FunctionTool:
         )
         self._permissions = permissions
         self._timeout_seconds = timeout_seconds
+        self._side_effect_mode = side_effect
+        self._confirmation_mode = confirmation
+        if (
+            confirmation is ToolConfirmationMode.REQUIRED
+            and side_effect
+            not in {
+                ToolSideEffectMode.UNSAFE,
+                ToolSideEffectMode.IDEMPOTENT,
+            }
+        ):
+            raise ValueError(
+                "Tool confirmation requires an unsafe or idempotent side effect"
+            )
+        if (
+            side_effect is ToolSideEffectMode.IDEMPOTENT
+            and not self._uses_context
+        ):
+            raise ValueError(
+                "idempotent Tools must accept ToolContext to use the "
+                "downstream idempotency key"
+            )
 
     @property
     def definition(self) -> ToolDefinition:
@@ -52,6 +76,20 @@ class FunctionTool:
     @property
     def timeout_seconds(self) -> float:
         return self._timeout_seconds
+
+    @property
+    def side_effect_mode(self) -> ToolSideEffectMode:
+        return self._side_effect_mode
+
+    @property
+    def confirmation_mode(self) -> ToolConfirmationMode:
+        return self._confirmation_mode
+
+    def validate_arguments(
+        self,
+        arguments: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        return self._argument_model.model_validate(dict(arguments)).model_dump()
 
     async def invoke(self, arguments: Mapping[str, Any]) -> Any:
         return await self._invoke(arguments, context=None)
@@ -69,8 +107,7 @@ class FunctionTool:
         *,
         context: ToolContext | None,
     ) -> Any:
-        validated = self._argument_model.model_validate(dict(arguments))
-        keyword_arguments = validated.model_dump()
+        keyword_arguments = dict(self.validate_arguments(arguments))
         if self._uses_context:
             if context is None:
                 raise RuntimeError("tool requires an execution context")
@@ -133,6 +170,8 @@ def tool(
     description: str | None = None,
     permissions: frozenset[str] = frozenset(),
     timeout_seconds: float = 30.0,
+    side_effect: ToolSideEffectMode = ToolSideEffectMode.UNSPECIFIED,
+    confirmation: ToolConfirmationMode = ToolConfirmationMode.NONE,
 ) -> Callable[[Callable[..., Any]], FunctionTool]: ...
 
 
@@ -144,6 +183,8 @@ def tool(
     description: str | None = None,
     permissions: frozenset[str] = frozenset(),
     timeout_seconds: float = 30.0,
+    side_effect: ToolSideEffectMode = ToolSideEffectMode.UNSPECIFIED,
+    confirmation: ToolConfirmationMode = ToolConfirmationMode.NONE,
 ) -> FunctionTool | Callable[[Callable[..., Any]], FunctionTool]:
     """Decorate an async or sync typed function as a runtime Tool."""
 
@@ -154,6 +195,8 @@ def tool(
             description=description,
             permissions=permissions,
             timeout_seconds=timeout_seconds,
+            side_effect=side_effect,
+            confirmation=confirmation,
         )
 
     return wrap(function) if function is not None else wrap

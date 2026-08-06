@@ -57,6 +57,7 @@ class RuntimeCheckpoint(BaseModel):
     memories: tuple[MemoryMatch, ...] = ()
     memory_initialized: bool = False
     memory_error: str | None = None
+    run_metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_waiting_state(self) -> RuntimeCheckpoint:
@@ -95,6 +96,7 @@ class RuntimeCheckpoint(BaseModel):
             memories=context.memories,
             memory_initialized=context.memory_initialized,
             memory_error=context.memory_error,
+            run_metadata=context.run_metadata,
         )
 
     def restore(self) -> RuntimeContext:
@@ -128,4 +130,5 @@ class RuntimeCheckpoint(BaseModel):
             memories=self.memories,
             memory_initialized=self.memory_initialized,
             memory_error=self.memory_error,
+            run_metadata=dict(self.run_metadata),
         )

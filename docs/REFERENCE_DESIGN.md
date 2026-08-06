@@ -62,6 +62,21 @@ depends on base-agent public APIs in the same direction as any external applicat
 6. optional memory retrieval port with explicit failure policy (implemented);
 7. transport and infrastructure adapters outside the core loop (FastAPI, PostgreSQL, Redis, MCP,
    Docker Sandbox, and Playwright Browser adapters implemented).
+8. versioned Flow definitions, explicit handoff models, the AgentInvoker boundary, and immutable
+   FlowRunState/AgentInvocation lifecycle contracts (implemented);
+9. revision-checked Flow lifecycle persistence with atomically ordered events and an in-memory
+   repository (implemented);
+10. a bounded SequentialFlowStrategy with explicit handoffs, WAITING/resume, failure and
+    cancellation propagation (implemented);
+11. a definition-pinned AgentRuntimeInvoker with shared execution stores and correlated child
+    Runtime records (implemented);
+12. versioned Flow-wide invocation, Token, model-call, Tool-call, and wall-clock budgets with
+    structured limit events (implemented);
+13. state-before-transport cancellation propagation with waiting-checkpoint cleanup, running
+    cancellation signals, late-result protection, and failure events (implemented; durable
+    distributed execution is not);
+14. a whole-Flow deterministic test harness capturing result, state, events, handoffs, resumes,
+    budgets, and cancellation evidence (implemented).
 
 Each extracted capability must work with in-memory fakes and without importing either reference
 application.
