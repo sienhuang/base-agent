@@ -9,6 +9,67 @@
 Run、Event、Checkpoint、Worker 和持久化是支撑这一目标的运行时能力，不是
 `base-agent` 对使用者呈现的主要复杂度。
 
+## 0. 约束后续设计的产品契约
+
+`base-agent` 首先是 **Agent SDK**，其次才是 Harness 基础设施库。所有设计和代码评审都
+必须先回答：它是否让 Agent 应用更容易定义、运行、测试和治理？
+
+### 0.1 Agent 开发者只负责什么
+
+主路径中的开发者只需要负责：
+
+1. **Prompt**：定义 Agent 的角色、目标和行为边界；
+2. **Tool**：实现有类型的原子业务动作；
+3. **Skill**：描述可复用的任务知识和 Tool 使用约束；
+4. **Agent**：组合 Prompt、模型、Tool、Skill、权限和预算；
+5. **Flow**：用少量声明组合命名 Agent，并定义明确的数据交接；
+6. **应用配置**：选择 Provider，以及显式启用需要的生产适配器。
+
+普通 Agent 应用不实现 Runtime、状态机、Event sequence、Checkpoint 提交、Worker lease、
+恢复决策或存储事务。
+
+### 0.2 Harness 必须在背后统一承担什么
+
+SDK 在不扩大 Agent 权限的前提下，统一承担：
+
+- **运行**：模型/Tool 循环、生命周期、预算、取消、等待、恢复和资源清理；
+- **观察**：Run 状态、有序 Event、用量、日志和关联标识；
+- **验证**：Tool、Skill、Agent 和 Flow 的离线确定性测试；
+- **治理**：Tool 启用、权限、参数、超时、结果边界、副作用分类和人工确认；
+- **基础设施适配**：Provider、Store、Artifact、Resource 及可选的 HTTP/Worker Adapter。
+
+这些能力默认服务于 `Agent.run()` 和 `Flow.run()`，不能要求应用开发者逐项组装。
+
+### 0.3 三层 API 可见性
+
+后续公共 API 按以下三层管理：
+
+| 层级 | 面向对象 | 典型类型 | 规则 |
+| --- | --- | --- | --- |
+| SDK 主路径 | Agent 应用开发者 | `AgentDefinition`、`Agent`、`@tool`、`Skill`、`Flow`、`FlowRun` | 必须短小、稳定、有安全默认值 |
+| 扩展接口 | Provider/存储/策略开发者 | `ModelProvider`、`Tool`、`OrchestrationStrategy`、Store/Resource Protocol | 按需导入，不进入入门主路径 |
+| Harness 内部 | SDK 维护者和生产 Adapter | Lifecycle、Repository、Lease、Worker、Recovery、Operator review | 不应从根包平铺暴露，不应出现在普通示例 |
+
+“已经实现”不等于“应该成为 SDK 主路径”。高级能力可以保留，但必须隐藏在明确命名的
+子模块后面。
+
+当前导出盘点、SDK 白名单和兼容性收口顺序见
+[`API_SURFACE_ZH.md`](API_SURFACE_ZH.md)。
+
+AgentDemo、mock-manus 与 Hermes Agent 的源码级设计采纳、遗漏项和明确不复制项见
+[`REFERENCE_ADOPTION_ZH.md`](REFERENCE_ADOPTION_ZH.md)。
+
+### 0.4 用什么标准判断是否偏离
+
+出现以下任一情况时，应先停止增加能力并重新审视边界：
+
+- 创建一个普通 Agent 必须理解 RunStore、EventStore 或 RuntimeContext；
+- 创建一个简单 Flow 必须构造 Lifecycle、Repository、Invoker 或 Strategy；
+- Tool 作者必须理解 Worker、Checkpoint 或 Flow recovery；
+- 根包导出大量仅供 Harness 内部使用的状态机和基础设施类型；
+- 文档先讲持久化和故障恢复，后讲 Prompt、Tool、Skill、Agent 和 Flow；
+- 没有来自真实应用的需求，却先扩展复杂 Flow、并行调度或分布式恢复。
+
 ## 1. 文档目标
 
 本文定义 `base-agent` 的目标软件架构，用于指导后续功能开发、架构重构、生产化建设和
@@ -89,11 +150,12 @@ Run、Event、Checkpoint、Worker 和持久化是支撑这一目标的运行时�
 10. **业务逻辑外置**：业务 Prompt、Skill、Tool、Agent 和 Flow 由下游应用拥有。
 11. **渐进演进**：目标架构能够通过兼容性重构实现，不要求重写现有代码。
 
-一个简单 Agent 的目标使用方式应接近：
+一个简单 Agent 的推荐使用方式是：
 
 ```python
-profile = AgentProfile(
+definition = AgentDefinition(
     id="order-assistant",
+    version="1.0.0",
     instructions=load_prompt("prompts/order_assistant.md"),
     model="default",
     tools=("get_order", "search_policy"),
@@ -102,7 +164,7 @@ profile = AgentProfile(
 )
 
 agent = Agent(
-    profile=profile,
+    definition=definition,
     model=model,
     tools=(get_order, search_policy),
     skill_registry=skills,
@@ -114,28 +176,23 @@ result = await agent.run("帮我确认这个订单是否可以退款")
 开发者不需要了解 RuntimeContext、CheckpointStore、Event sequence 或状态持久化顺序，
 除非正在开发框架扩展或生产基础设施 Adapter。
 
-两个专业 Agent 的目标组合方式应接近：
+两个专业 Agent 的推荐组合方式是：
 
 ```python
-flow = Flow(
-    id="mtbi-analysis",
-    agents={
+flow = Flow.sequence(
+    {
         "query": mtbi_agent,
         "analysis": data_analysis_agent,
     },
-    strategy=SequentialFlow(
-        stages=(
-            FlowStage(agent="query", prompt=query_stage_prompt),
-            FlowStage(agent="analysis", prompt=analysis_stage_prompt),
-        )
-    ),
+    id="mtbi-analysis",
 )
 
-result = await flow.run("分析本周付费用户的留存变化")
+run = await flow.run("分析本周付费用户的留存变化")
+print(run.output)
 ```
 
-具体类名属于后续 API 设计，关键约束是业务开发者只描述 Agent、阶段和交接数据，不实现
-Run 生命周期。
+关键约束是业务开发者只组合 Agent 和明确的交接数据，不实现 Run 生命周期。需要自定义
+路由或 Planner/Executor 时，才进入扩展接口；简单顺序协作不需要理解 Strategy。
 
 ### 3.2 非目标
 
@@ -260,6 +317,8 @@ Agent 开发者
 
 - 用户输入、模型输出、远程 Tool 结果和外部网页均为不可信数据；
 - Tool 实现属于受信代码，但其后端响应仍需要验证；
+- 应用自己拥有并审查的 Skill root 可以通过 `discover_trusted()` 执行固定
+  `tools.py`；下载、用户上传或外部 Skill root 不属于该信任边界；
 - HTTP 身份与租户归属由宿主应用提供；
 - Worker 可以拥有内部执行权限，但不得自动继承终端用户全部权限；
 - Event、日志、Checkpoint 和 Artifact 都可能包含敏感信息，需要独立访问和保留策略。
@@ -268,12 +327,15 @@ Agent 开发者
 
 ### 6.1 构建一个简单 Agent
 
-开发者选择模型，编写 System Prompt，使用 `@tool` 声明少量业务 Tool，按需编写
-`SKILL.md`，然后通过 AgentProfile 和 `Agent` 完成组合。整个过程不需要：
+开发者选择模型，编写 System Prompt，使用 `@tool` 声明少量业务 Tool，按需在
+`skills/<name>/` 编写 `SKILL.md`、可选 `tools.py` 和 `scripts/`，然后通过
+AgentProfile 和 `Agent` 完成组合。受信任目录中的本地 `@tool` 由 Catalog 自动加载，
+整个过程不需要：
 
 - 继承 AgentRuntime；
 - 修改 Model/Tool 主循环；
 - 手工创建 RuntimeContext；
+- 维护一个中央 Skill definition 列表；
 - 处理 Event sequence；
 - 编写取消、等待或资源释放逻辑。
 

@@ -100,7 +100,7 @@ Harness、Run、Event、Checkpoint、Store、Worker 和治理能力是框架为�
 - 通用文件解析系统；
 - 业务 Agent 或业务工作流；
 - 默认开放宿主机权限的代码执行平台；
-- 内置多 Agent 协作框架。
+- 自治多 Agent 社会或复杂分布式工作流平台。
 
 FastAPI、PostgreSQL、Redis、MCP、Docker、Playwright 和 OpenAI SDK 都位于可选边界。
 业务应用依赖 `base-agent`，核心包不得反向导入业务代码。
@@ -115,7 +115,7 @@ starter / 业务应用 / CLI / HTTP 服务
                 │
                 ▼
 公共门面层
-Agent / AgentDefinition / AgentProfile / RunHandle
+Agent / AgentDefinition / RunHandle / Flow / FlowRun
                 │
                 ▼
 运行时与编排层
@@ -210,20 +210,24 @@ Adapter 补齐缺失能力。`Agent` 仍然是面向应用开发者的简单组�
 
 当前 Supervisor 不能代替 Verification 或完整 Governance。
 
-### 3.3 AgentDemo、mock-manus 与 base-agent 的关系
+### 3.3 AgentDemo、mock-manus、Hermes 与 base-agent 的关系
 
-`AgentDemo` 和 `mock-manus` 都已经包含项目内的隐式 Harness，但它们应作为参考实现和
-下游消费者，而不是核心依赖：
+`AgentDemo`、`mock-manus` 和 `Hermes Agent` 都已经包含项目内的 Harness 设计，但它们
+应作为参考实现和下游消费者，而不是核心依赖：
 
 ```text
 AgentDemo ────┐
 mock-manus ───┼──> base-agent Harness Kernel
+Hermes ───────┤
 业务 Agent ───┘
 ```
 
 从 `AgentDemo` 提炼的重点包括有界步骤循环、无进展检测、可替换的 ReAct/Planning、
 规范化 Tool 集合和可选 Memory。从 `mock-manus` 提炼的重点包括后台 Task、类型化事件、
-Planner/ReAct Flow、Sandbox/Browser 生命周期、Attachment/Artifact 和人工等待。
+Planner/ReAct Flow、Sandbox/Browser 生命周期、Attachment/Artifact 和人工等待。从
+`Hermes` 提炼的重点包括窄腰核心、运行期稳定的 Prompt/Tool 快照、Tool readiness、
+Skill/Tool 渐进披露、独立上下文预算，以及 Observer、Middleware、Governance 和
+Verification 的严格分层。
 
 抽取原则是：
 
@@ -231,7 +235,7 @@ Planner/ReAct Flow、Sandbox/Browser 生命周期、Attachment/Artifact 和人�
 2. 业务 Prompt、角色、UI、会话产品语义和领域 Tool 留在应用；
 3. 不直接复制同时构造 LLM、数据库、Sandbox、Browser 和 Flow 的应用级大类；
 4. 每项抽取能力必须能使用内存实现和 FakeModel 做确定性测试；
-5. `base-agent` 不导入或暴露以 AgentDemo、mock-manus 命名的类型。
+5. `base-agent` 不导入或暴露以 AgentDemo、mock-manus、Hermes 命名的类型。
 
 详细的已采纳模式和明确不复制的模式见
 [`REFERENCE_DESIGN.md`](REFERENCE_DESIGN.md)。
@@ -1091,7 +1095,8 @@ ToolCall ID 是一个新的 operation，不能复用旧幂等键。
 | ToolContext 注入 | 已实现 | `ContextualTool` |
 | Tool 副作用分类、确认与 Flow 账本埋点 | 已实现（显式启用） | `ToolSideEffectMode`、`ToolConfirmationMode`、`FlowToolSideEffectRecorder` |
 | Tool 大结果通用上限 | 已实现 | `BoundedToolResultPolicy`、`max_tool_result_bytes`、UTF-8 测量 |
-| Skill Manifest 和显式选择 | 已实现 | `SkillRegistry` |
+| Skill Package 扫描、渐进加载和显式选择 | next 原型已实现 | `SkillCatalog`、`skill_view` |
+| 受信任 Skill `tools.py` 自动加载 | next 原型已实现 | `SkillCatalog.discover_trusted` |
 | 语义 Skill 自动选择 | 尚未实现 | 应作为独立选择策略 |
 | Run/Event/后台执行 | 已实现 | `RunHandle` |
 | 人工输入 WAITING/resume | 已实现 | `WaitForInput`、Checkpoint |
@@ -1147,11 +1152,16 @@ ToolCall ID 是一个新的 operation，不能复用旧幂等键。
 
 ### 18.2 增加一个 Skill
 
-1. 创建 `skills/<name>/SKILL.md`；
-2. 声明版本、allowlist、required Tool 和 permissions；
-3. 在 Profile 中允许 Skill；
-4. 用 SkillHarness 检查 Manifest 和 Profile；
-5. 用 AgentTestHarness 验证 Skill 指令、Tool 边界、Run 事件和最终结果。
+1. 创建 `skills/<name>/SKILL.md`，用 frontmatter 声明 name、description 和 version；
+2. 如果 Skill 只是经验和指令，不再创建 Python 注册文件；
+3. 如果 Skill 需要函数能力，在同目录 `tools.py` 中编写一个或多个 `@tool`；
+4. 把辅助 Python 函数或其他实现放入 `scripts/`，默认由类型化 Tool 调用，不直接
+   向模型暴露文件路径；
+5. 应用自己拥有和审查的目录使用 `SkillCatalog.discover_trusted()`；下载、
+   用户上传或其他外部 Skill 只使用不导入 Python 的 `SkillCatalog.discover()`；
+6. 在 AgentDefinition 中显式选择 Skill，具体权限优先由每个 Tool 独立声明；
+7. 用 FakeModel/Starter 验证 `skill.selected`、`skill.loaded`、`skill.resource.used`、
+   `tool.completed` 和最终 ToolResult。
 
 业务流程优先放 Skill，原子动作放 Tool。
 
@@ -1323,7 +1333,7 @@ Tool、Skill、CLI 和 Server 如何在应用层组合，而不是塞进 Runtime
 - 后续任务：[`TODO.md`](TODO.md)
 - 总体边界：[`ARCHITECTURE.md`](ARCHITECTURE.md)
 - 目标架构设计：[`ARCHITECTURE_DESIGN_ZH.md`](ARCHITECTURE_DESIGN_ZH.md)
-- AgentDemo/mock-manus 参考决策：[`REFERENCE_DESIGN.md`](REFERENCE_DESIGN.md)
+- AgentDemo/mock-manus/Hermes 参考决策：[`REFERENCE_DESIGN.md`](REFERENCE_DESIGN.md)
 - Tool：[`TOOLS.md`](TOOLS.md)
 - Skill：[`SKILLS.md`](SKILLS.md)
 - Run 与 Event：[`RUNS.md`](RUNS.md)

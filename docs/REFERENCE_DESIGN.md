@@ -1,14 +1,18 @@
 # Reference Design Decisions
 
-base-agent uses mock-manus and AgentDemo as reference implementations. They are consumers and
-design inputs, not dependencies of the core package. No core module may import them or expose a
-type named after either application.
+base-agent uses mock-manus, AgentDemo, and Hermes Agent as reference implementations. They are
+consumers and design inputs, not dependencies of the core package. No core module may import them
+or expose a type named after any of these applications.
+
+The source-level adoption matrix, including gaps in the current SDK-facing API, is maintained in
+[`REFERENCE_ADOPTION_ZH.md`](REFERENCE_ADOPTION_ZH.md).
 
 ## Dependency direction
 
 ```text
 mock-manus ─┐
 AgentDemo ──┼──> base-agent
+Hermes ─────┤
 BI-WIKI ────┘
 ```
 
@@ -40,6 +44,23 @@ depends on base-agent public APIs in the same direction as any external applicat
 - Let application Agents add domain prompts and Tools through composition.
 - Expose browser state through bounded observations and clean up browser resources explicitly.
 
+## Lessons adopted from Hermes Agent
+
+- Keep a narrow core and prefer Skill/Toolkit or optional integrations over adding core Tools.
+- Freeze the model-visible Prompt, Skill, Tool schema, model, and policy selection for one Run.
+- Separate configured Tool membership, environment readiness, governance authorization, and
+  execution.
+- Disclose large Skill and Tool catalogs progressively and account for each context component
+  independently.
+- Keep read-only Observer hooks separate from behavior-changing Middleware, fail-closed Governance,
+  and evidence-producing Verification.
+- Distinguish context selection, compaction, per-result truncation, and aggregate observation
+  budgets.
+- Normalize provider responses behind a minimal transport contract while retaining
+  provider-specific data outside the common surface.
+- Record bounded, scoped verification evidence without treating a targeted check as proof that the
+  entire application is correct.
+
 ## Patterns deliberately not copied
 
 - Deep Agent inheritance trees;
@@ -51,6 +72,13 @@ depends on base-agent public APIs in the same direction as any external applicat
 - monolithic Sandbox APIs combining shell, sudo, files, browser, VNC, and container management;
 - raw shell-string interpolation, unrestricted host paths, and process-global Browser state;
 - disabling browser security or exposing arbitrary JavaScript execution by default.
+- a very large Agent constructor combining provider, gateway, prompt, plugin, session, and runtime
+  configuration;
+- import-time global Tool registration, automatic override, and mid-Run capability mutation;
+- product-level profile routing, messaging gateways, cron, TUI, or plugin marketplace behavior in
+  the SDK core;
+- Observer hooks that can silently mutate requests, block execution, or replace results;
+- executing inline shell while loading a Skill or Prompt.
 
 ## Extraction sequence
 
@@ -68,8 +96,8 @@ depends on base-agent public APIs in the same direction as any external applicat
    repository (implemented);
 10. a bounded SequentialFlowStrategy with explicit handoffs, WAITING/resume, failure and
     cancellation propagation (implemented);
-11. a definition-pinned AgentRuntimeInvoker with shared execution stores and correlated child
-    Runtime records (implemented);
+11. a definition-pinned AgentRuntimeInvoker with correlated child Runtime records and optional
+    application-composed shared stores (implemented);
 12. versioned Flow-wide invocation, Token, model-call, Tool-call, and wall-clock budgets with
     structured limit events (implemented);
 13. state-before-transport cancellation propagation with waiting-checkpoint cleanup, running
