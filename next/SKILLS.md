@@ -288,9 +288,9 @@ run.started
 - `skill.loaded` 可以证明 playbook 确实进入了上下文，但仍不能证明模型严格遵循了每一步；
   `skill.resource.used` 只记录可客观归因的 Tool 或 Script 使用。
 
-这些 Event 在产生时实时通知构造期 Observer 和单次 Run 的 `on_event`，同时进入
-`RunResult.events` 供测试和内存回看。Observer 是 fail-open 的实时消费通道，不承担可靠
-持久化；EventStore 不属于本阶段。
+这些 Event 先写入 Agent 配置的 EventStore，再实时通知构造期 Observer 和单次 Run 的
+`on_event`，最终由同一 Store 生成 `RunResult.events`。Observer 是 fail-open 的实时消费
+通道，不承担可靠持久化；完整边界见 [`EVENTS.md`](EVENTS.md)。
 
 ## 8. 当前边界
 

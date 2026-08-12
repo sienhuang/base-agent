@@ -13,6 +13,11 @@ dependencies = [
 openai = [
     "openai>=2,<3",
 ]
+server = [
+    "fastapi>=0.115,<1",
+    "sse-starlette>=3,<4",
+    "uvicorn>=0.30,<1",
+]
 
 [build-system]
 requires = ["hatchling>=1.27"]
@@ -23,10 +28,13 @@ packages = ["src/base_agent"]
 
 [dependency-groups]
 dev = [
+    "fastapi>=0.115,<1",
+    "httpx>=0.27,<1",
     "mypy>=1.15",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "ruff>=0.11",
+    "sse-starlette>=3,<4",
     "types-pyyaml>=6.0.12",
 ]
 

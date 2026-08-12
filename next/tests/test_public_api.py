@@ -12,6 +12,7 @@ def test_root_api_is_intentionally_small() -> None:
         "FlowStatus",
         "RunResult",
         "RunFailure",
+        "RunHandle",
         "RunStatus",
         "SideEffect",
         "Skill",

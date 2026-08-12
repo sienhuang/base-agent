@@ -59,7 +59,7 @@ async def test_offline_agent_streams_text_and_returns_full_result() -> None:
     assert result.status is RunStatus.SUCCEEDED
     assert result.text == "Starter Agent received: hello"
     assert (
-        "".join(event.payload["text"] for event in observed if event.kind == "model.output.delta")
+        "".join(event.payload["delta"] for event in observed if event.kind == "message.delta")
         == result.text
     )
     assert [
@@ -68,8 +68,9 @@ async def test_offline_agent_streams_text_and_returns_full_result() -> None:
         if event.kind
         in {
             "model.requested",
-            "model.output.delta",
+            "message.delta",
             "model.responded",
+            "message.completed",
         }
     ][0] == "model.requested"
 
@@ -625,6 +626,7 @@ def test_provider_factory_defaults_to_offline() -> None:
 
 def test_openai_compatible_provider_reads_environment(
     monkeypatch,
+    tmp_path,
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -639,6 +641,7 @@ def test_openai_compatible_provider_reads_environment(
     monkeypatch.setenv("OPENAI_API_KEY", "secret-for-test")
     monkeypatch.setenv("OPENAI_MODEL", "served-model")
     monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
+    monkeypatch.setattr("agent_app.config._DOTENV_PATH", tmp_path / ".env")
     monkeypatch.setattr(
         "agent_app.provider.OpenAIChatProvider",
         CapturingProvider,
@@ -655,10 +658,11 @@ def test_openai_compatible_provider_reads_environment(
     }
 
 
-def test_openai_compatible_provider_requires_model(monkeypatch) -> None:
+def test_openai_compatible_provider_requires_model(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "secret-for-test")
     monkeypatch.delenv("AGENT_MODEL", raising=False)
     monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    monkeypatch.setattr("agent_app.config._DOTENV_PATH", tmp_path / ".env")
 
     try:
         build_provider(Settings.from_env(provider="openai-compatible"))

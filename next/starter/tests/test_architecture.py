@@ -42,3 +42,11 @@ def test_step_03_uses_self_contained_trusted_skill_packages() -> None:
     assert not (STARTER_SRC / "tool_limit_demo.py").exists()
     for module_name in ("flows", "scenarios"):
         assert not tuple((STARTER_SRC / module_name).glob("*.py"))
+
+
+def test_starter_only_owns_the_asgi_composition_root() -> None:
+    assert not (STARTER_SRC / "runs.py").exists()
+    assert not (STARTER_SRC / "server.py").exists()
+    asgi_source = (STARTER_SRC / "asgi.py").read_text(encoding="utf-8")
+    assert "from base_agent.server import create_http_app" in asgi_source
+    assert "@app." not in asgi_source

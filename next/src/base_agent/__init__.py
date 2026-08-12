@@ -12,6 +12,7 @@ from base_agent.models import (
     ToolChoice,
 )
 from base_agent.prompts import load_prompt
+from base_agent.run_handle import RunHandle
 from base_agent.skills import Skill, SkillCatalog, SkillDescriptor, SkillPackage
 from base_agent.tools import Toolkit, ToolReadiness, tool
 from base_agent.verification import VerificationEvidence
@@ -26,6 +27,7 @@ __all__ = [
     "FlowStatus",
     "RunResult",
     "RunFailure",
+    "RunHandle",
     "RunStatus",
     "SideEffect",
     "Skill",

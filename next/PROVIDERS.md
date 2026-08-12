@@ -93,12 +93,13 @@ ProviderCapabilities(
 - `ModelStreamCompleted`：携带聚合后的完整 `ModelResponse`。
 
 Harness 只在收到 `ModelStreamCompleted` 后处理 ToolCall。参数片段尚未聚合、解析和校验
-完成时绝不执行 Tool。文本 delta 同时转换成有序的 `model.output.delta` Event；ToolCall
+完成时绝不执行 Tool。文本 delta 同时转换成有序的 `message.delta` Event；ToolCall
 delta 只发布不含原始参数的元数据 Event，避免未治理参数通过观察面泄漏。
 
 Delta 是实时但暂定的输出：连接可能在部分文本后失败。消费者必须以随后出现的
-`model.responded`/`run.succeeded` 或 `model.failed`/`run.failed` 判断最终状态，不能把收到
-第一个 delta 等同于 Run 成功。Harness 还会校验已发布文本与 completed response 一致。
+`message.completed` 取得完整 assistant 消息，并以 `run.succeeded` 或 `run.failed` 判断最终
+状态，不能把收到第一个 delta 等同于 Run 成功。Harness 还会校验已发布文本与 completed
+response 一致。
 
 ## 4. 错误分类
 

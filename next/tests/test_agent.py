@@ -683,11 +683,23 @@ async def test_agent_stream_publishes_live_text_deltas_and_result() -> None:
 
     assert result.status is RunStatus.SUCCEEDED
     assert result.text == "Hello"
-    deltas = [event.payload["text"] for event in observed if event.kind == "model.output.delta"]
-    assert deltas == ["Hel", "lo"]
+    created = next(event for event in observed if event.kind == "message.created")
+    deltas = [event for event in observed if event.kind == "message.delta"]
+    completed = next(event for event in observed if event.kind == "message.completed")
+
+    assert created.payload["role"] == "user"
+    assert created.payload["content"] == "hello"
+    assert [event.payload["delta"] for event in deltas] == ["Hel", "lo"]
+    assert {event.payload["message_id"] for event in deltas} == {
+        completed.payload["message_id"]
+    }
+    assert completed.payload["role"] == "assistant"
+    assert completed.payload["content"] == "Hello"
     event_kinds = [event.kind for event in observed]
-    assert event_kinds.index("model.requested") < event_kinds.index("model.output.delta")
-    assert event_kinds.index("model.output.delta") < event_kinds.index("model.responded")
+    assert event_kinds.index("model.requested") < event_kinds.index("message.delta")
+    assert event_kinds.index("message.delta") < event_kinds.index("model.responded")
+    assert event_kinds.index("model.responded") < event_kinds.index("message.completed")
+    assert event_kinds.index("message.completed") < event_kinds.index("run.succeeded")
     assert model.requests[0].messages[0].content == "hello"
 
 
@@ -748,12 +760,12 @@ async def test_agent_stream_fails_when_completed_text_mismatches_deltas() -> Non
         for event in observed
         if event.kind
         in {
-            "model.output.delta",
+            "message.delta",
             "model.failed",
             "run.failed",
         }
     ] == [
-        "model.output.delta",
+        "message.delta",
         "model.failed",
         "run.failed",
     ]

@@ -42,6 +42,9 @@ Flow.sequence(...)
 | `tools/` | Tool、Toolkit、schema 和 readiness | 常用类型是 |
 | `skills/` | Skill Descriptor/Catalog、按需加载、Package 与能力贡献 | 是 |
 | `agent.py` | 普通应用的 Agent 门面 | 是 |
+| `run_handle.py` | 进程内后台 Run 等待、状态、事件回放和实时订阅 | 是 |
+| `events/` | EventStore/EventStream 契约和默认内存事实源 | 扩展 API |
+| `server/` | 可选 FastAPI Run 提交、状态查询和进程内 Handle registry | 否 |
 | `flows/` | Stage 和简单 SequentialFlow | 是 |
 | `runtime/` | snapshot、model/tool loop、结果边界 | 否 |
 | `governance/` | 副作用分类和 fail-closed 确认 | 常用枚举是 |
@@ -105,7 +108,18 @@ Skill Package 的额外不变量：
    `skill.resource.used` 把 Skill 自有资源与 ToolCall 关联，
    Tool 的最终结果仍由 `tool.completed` 和 `ToolResult` 表达。
 
+Event 的额外不变量：
+
+1. EventStore 是唯一事实源，Harness 和 RunHandle 不各自保存 Event 副本；
+2. `emit()` 原子分配 Run 内 sequence，并在 Observer 扇出前完成提交；
+3. `list(after_sequence=N)` 和 `subscribe(after_sequence=N)` 只返回 sequence 大于 N 的事件；
+4. Observer 是 fail-open 旁路，EventStore 写入不是 fail-open；
+5. Redis 只能装饰 durable EventStore 提供通知，不能代替 PostgreSQL 等事实源。
+6. Message 使用同一条 Event sequence：user `message.created` 和 assistant
+   `message.completed` 始终存在，`message.delta` 只是可选实时增量。
+
 完整契约见 [`SKILLS.md`](SKILLS.md)。
+Event 存储和流契约见 [`EVENTS.md`](EVENTS.md)。
 
 ## 5. Model Turn 与 ToolCall 预算
 
@@ -137,7 +151,8 @@ AgentDefinition(
 
 ## 6. 后续迁移顺序
 
-1. 在已实现的 `Agent.stream()` 模型事件之上增加 RunHandle、`start()`、HTTP SSE 与回放；
+1. 已增加进程内 RunHandle、`start()`、Event 回放与实时订阅，以及 `base_agent.server`
+   HTTP Run 提交/状态查询，以及基于同一 EventStore 的 JSON 回放与 SSE 实时订阅；
 2. 增加取消语义和小型 ContextPolicy；
 3. 增加声明式 Stage output contract；
 4. 用 AgentDemo MTBI Flow 验证 Artifact/Verifier；
@@ -145,7 +160,21 @@ AgentDefinition(
 6. 用 mock-manus PlannerReActFlow 验证重新规划和实时事件；
 7. 在已有 Skill 受控目录发现、Descriptor/Catalog/`skill_view` 基础上，根据真实
    目录规模再增加检索、缓存和外部 Skill 源 Adapter；
-8. 真实生产应用需要后，再迁入 Store、Artifact、Resource 等小型 Protocol。
+8. 在已有 EventStore/EventStream 小型契约上按真实部署需求增加 PostgreSQL durable store
+   和 Redis notification adapter，再迁入 Artifact、Resource 等其他 Protocol。
 
 Worker、Lease、Operator API 和分布式恢复不在以上主路径内；只有明确部署需求出现时，才
 作为独立生产 Adapter 评估。
+
+### 多进程 Run 管理（已记录，暂缓实现）
+
+当前 `InMemoryRunRegistry` 和 `RunHandle` 都是执行进程内对象，只支持单 Worker。以后支持
+多进程或多实例时，HTTP 层不能再把 `RunHandle` 当权威 Run 记录：
+
+1. 共享 `RunStore` 保存 Run 状态、结果、取消标记和执行租约；
+2. API Worker 只创建/查询 RunRecord，不直接持有后台 `asyncio.Task`；
+3. Execution Worker 领取 Run 后，可以在本进程内部使用 `RunHandle`，但它只是执行细节；
+4. PostgreSQL EventStore 作为事件事实源，Redis/PgNotify 只负责实时唤醒 SSE；
+5. Worker 崩溃后的重新领取依赖 lease、幂等写入和后续 checkpoint，而不是恢复旧 RunHandle。
+
+这部分等单进程 Run/Event/Server 契约稳定后再实现，当前 Starter 明确保持单 Worker。

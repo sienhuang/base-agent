@@ -1,13 +1,14 @@
 # base-agent Starter — Step 03: Skill 组合
 
 当前 Starter 在已经验收的 Prompt、Provider、Tool 和 Model Streaming 之上增加一个
-应用拥有的 `value-recording` Skill：
+应用拥有的 Skill Package：
 
 > `SKILL.md` frontmatter 提供可自动发现的身份，正文总结可复用操作经验；
 > 受信任 Skill 目录中的 `tools.py` 自动提供类型化 Tool，`scripts/` 默认作为 Tool
 > 的私有实现。
 
-本阶段没有 Flow、持久化、恢复或 HTTP SSE；已支持 Provider 到 CLI 的模型文本 streaming。
+本阶段没有 Flow、持久化或恢复；已支持 Provider 到 CLI 的模型文本 streaming，并通过一个
+薄 ASGI composition root 使用 SDK 提供的 HTTP Run Server。
 
 ## 目录
 
@@ -17,6 +18,7 @@ src/agent_app/
 ├── config.py              # Provider 环境配置
 ├── provider.py            # Offline/API/CLI Provider 选择
 ├── cli.py                 # 命令行入口
+├── asgi.py                # 只构造 Agent；HTTP 实现来自 base_agent.server
 ├── assets.py              # Prompt asset loader
 ├── tools.py               # 应用拥有的类型化 Tools
 ├── skills/                # 应用拥有的 Skill catalog
@@ -53,22 +55,85 @@ src/agent_app/
 uv sync --project next/starter --group dev
 ```
 
+Starter 会固定读取 `next/starter/.env`，并让进程环境变量覆盖文件中的同名配置。默认模板
+使用 OpenAI-compatible Provider：
+
+```bash
+cp next/starter/.env.example next/starter/.env
+```
+
+复制后在 `.env` 中填写实际的 `AGENT_MODEL`、`OPENAI_API_KEY`，使用兼容服务时再设置
+`OPENAI_BASE_URL`。`.env` 被 Git 忽略，不应提交 API Key；`.env.example` 只包含可提交的
+占位配置。若既没有 `.env` 也没有相关进程环境变量，Starter 才会回退到
+OfflineProvider。
+
 ## 运行
 
 ```bash
 uv run --project next/starter agent-app "hello"
 ```
 
-预期输出：
+输出为所配置模型的回复，例如：
 
 ```text
-Starter Agent received: hello
+Hello! How can I help?
 ```
+
+## 启动 FastAPI
+
+Starter 的 `asgi.py` 只负责构造具体 Agent，路由、schemas 和 Run registry 全部由
+`base_agent.server` 提供。启动本地服务：
+
+```bash
+uv run --project next/starter agent-server --host 127.0.0.1 --port 8000
+```
+
+也可以直接使用 uvicorn：
+
+```bash
+uv run --project next/starter \
+  uvicorn agent_app.asgi:app --host 127.0.0.1 --port 8000
+```
+
+提交并查询 Run：
+
+```bash
+curl http://127.0.0.1:8000/v1/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"hello"}'
+
+curl http://127.0.0.1:8000/v1/runs/<run_id>
+```
+
+回放 sequence 大于 3 的历史 Event：
+
+```bash
+curl 'http://127.0.0.1:8000/v1/runs/<run_id>/events?after_sequence=3'
+```
+
+从头订阅 SSE；它会先补历史、再实时跟随，Run 结束后自动关闭：
+
+```bash
+curl -N -H 'Accept: text/event-stream' \
+  http://127.0.0.1:8000/v1/runs/<run_id>/events/stream
+```
+
+断线后可用最后收到的 SSE `id` 续传：
+
+```bash
+curl -N -H 'Last-Event-ID: 3' \
+  http://127.0.0.1:8000/v1/runs/<run_id>/events/stream
+```
+
+空闲 SSE 默认每 15 秒发送 comment 心跳。心跳不写入 EventStore，也不改变事件游标。
+
+HTTP 服务和 CLI 使用同一份 `.env` 配置。模板选择 `openai-compatible`，需要配置
+`AGENT_MODEL`、`OPENAI_API_KEY`，连接非 OpenAI 服务时再设置 `OPENAI_BASE_URL`。
 
 ## 测试 Model Streaming
 
 OfflineProvider 会把完整文本拆成确定性的 `ModelTextDelta`。Starter 使用 `--stream` 实时
-消费 Harness 的 `model.output.delta` Event：
+消费 Harness 的 `message.delta` Event：
 
 ```bash
 uv run --project next/starter agent-app --stream "hello"
@@ -101,7 +166,7 @@ executed=1, not_found=0, denied=0, confirmation_denied=0, invalid_arguments=0, e
 call-1: status=success, data=1
 ```
 
-Harness 对文本发布 `model.output.delta`；对 ToolCall 分片只发布 index、ToolCall ID、Tool 名称
+Harness 对文本发布 `message.delta`；对 ToolCall 分片只发布 index、ToolCall ID、Tool 名称
 和参数字节数，原始未校验参数不会进入 Event。收到完整 `ModelStreamCompleted` 后，才进入
 原有 Tool allowlist、权限、参数、确认、超时和执行链。
 
@@ -647,7 +712,7 @@ Observation 生成总结。
 
 ## 测试 OpenAI-compatible Provider
 
-先设置凭据。密钥只从环境变量读取，不通过 CLI 参数传递：
+先设置凭据。密钥从 `next/starter/.env` 或进程环境读取，不通过 CLI 参数传递；进程环境优先：
 
 ```bash
 export OPENAI_API_KEY="your-api-key"

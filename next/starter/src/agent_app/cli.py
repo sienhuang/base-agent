@@ -43,8 +43,8 @@ async def _run(
             line = _execution_trace_line(event)
             if line is not None:
                 print(line, file=sys.stderr, flush=True)
-        if stream and event.kind == "model.output.delta":
-            text = event.payload.get("text")
+        if stream and event.kind == "message.delta":
+            text = event.payload.get("delta")
             if isinstance(text, str) and text:
                 print(text, end="", flush=True)
                 streamed_text = True

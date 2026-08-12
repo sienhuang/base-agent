@@ -20,7 +20,8 @@
 - 旧根包的全量导出；
 - AgentProfile 兼容层；
 - AgentRuntimeInvoker、FlowLifecycle、FlowWorker 等内部类型；
-- Repository/Store 参数进入普通 Agent 或 Flow 构造器；
+- 要求普通 Agent 开发者理解 Repository 聚合、事务或恢复状态机；EventStore 作为可选
+  extension port 保留默认内存实现；
 - 深继承 Agent/Flow；
 - import-time 自动注册和全局可变 Tool registry；
 - Gateway、Profile routing、插件市场和产品 UI；

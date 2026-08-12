@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Coroutine, Iterable, Sequence
+from typing import Any
+from uuid import uuid4
 
 from base_agent.definitions import AgentDefinition
+from base_agent.events import EventStore, InMemoryEventStore
 from base_agent.models import RunResult
 from base_agent.observability import Observer
 from base_agent.providers import ModelProvider
+from base_agent.run_handle import RunHandle
 from base_agent.runtime.harness import Harness
 from base_agent.skills import Skill, SkillCatalog
 from base_agent.skills.execution import build_skill_script_tool
@@ -33,6 +37,7 @@ class Agent:
         skills: Iterable[Skill] | SkillCatalog = (),
         confirmation_policy: ConfirmationPolicy | None = None,
         observers: Sequence[Observer] = (),
+        event_store: EventStore | None = None,
     ) -> None:
         direct_tools = flatten_tools(tools)
         registered_catalog = skills if isinstance(skills, SkillCatalog) else SkillCatalog(skills)
@@ -107,6 +112,7 @@ class Agent:
         if definition.response_model is not None and not model.info.capabilities.structured_output:
             raise ValueError(f"Provider '{model.info.name}' does not support structured output")
         self.definition = definition
+        self.event_store = event_store if event_store is not None else InMemoryEventStore()
         self._harness = Harness(
             definition=definition,
             model=model,
@@ -115,6 +121,7 @@ class Agent:
             skill_catalog=selected_catalog,
             confirmation_policy=confirmation_policy,
             observers=observers,
+            event_store=self.event_store,
         )
 
     async def run(
@@ -137,6 +144,28 @@ class Agent:
             prompt,
             stream=True,
             on_event=on_event,
+        )
+
+    def start(
+        self,
+        prompt: str,
+        *,
+        stream: bool = False,
+    ) -> RunHandle:
+        """Start a process-local background Run and return immediately."""
+        run_id = str(uuid4())
+
+        def run_in_background() -> Coroutine[Any, Any, RunResult]:
+            return self._harness.run(
+                prompt,
+                stream=stream,
+                run_id=run_id,
+            )
+
+        return RunHandle._launch(
+            run_id=run_id,
+            operation=run_in_background,
+            event_store=self.event_store,
         )
 
 

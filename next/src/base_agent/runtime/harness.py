@@ -15,6 +15,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from base_agent.definitions import AgentDefinition
+from base_agent.events import EventStore
 from base_agent.governance import (
     Confirmation,
     ConfirmationPolicy,
@@ -63,27 +64,25 @@ class _SkillResourceSource:
 
 
 class _EventEmitter:
-    def __init__(self, run_id: str, observers: Sequence[Observer]) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        event_store: EventStore,
+        observers: Sequence[Observer],
+    ) -> None:
         self._run_id = run_id
+        self._event_store = event_store
         self._observers = tuple(observers)
-        self._events: list[Event] = []
 
-    @property
-    def events(self) -> tuple[Event, ...]:
-        return tuple(self._events)
+    async def events(self) -> tuple[Event, ...]:
+        return await self._event_store.list(self._run_id)
 
     @property
     def run_id(self) -> str:
         return self._run_id
 
     async def emit(self, kind: str, **payload: Any) -> None:
-        event = Event(
-            sequence=len(self._events) + 1,
-            kind=kind,
-            run_id=self._run_id,
-            payload=payload,
-        )
-        self._events.append(event)
+        event = await self._event_store.emit(self._run_id, kind, payload)
         for observer in self._observers:
             try:
                 value = observer(event)
@@ -108,6 +107,7 @@ class Harness:
         skill_catalog: SkillCatalog,
         confirmation_policy: ConfirmationPolicy | None,
         observers: Sequence[Observer],
+        event_store: EventStore,
     ) -> None:
         self._definition = definition
         self._model = model
@@ -117,6 +117,7 @@ class Harness:
         self._skill_resources_by_tool = _index_skill_resources(skills)
         self._confirmation_policy = confirmation_policy or DenyConfirmations()
         self._observers = tuple(observers)
+        self._event_store = event_store
 
     async def run(
         self,
@@ -124,6 +125,7 @@ class Harness:
         *,
         stream: bool = False,
         on_event: Observer | None = None,
+        run_id: str | None = None,
     ) -> RunResult:
         if not prompt.strip():
             raise ValueError("run prompt must not be blank")
@@ -135,15 +137,21 @@ class Harness:
                 "does not implement stream()"
             )
 
-        run_id = str(uuid4())
+        resolved_run_id = run_id or str(uuid4())
         run_observers = self._observers if on_event is None else (*self._observers, on_event)
-        emitter = _EventEmitter(run_id, run_observers)
+        emitter = _EventEmitter(resolved_run_id, self._event_store, run_observers)
         snapshot = self._create_snapshot()
         await emitter.emit(
             "run.started",
             agent_id=snapshot.agent_id,
             agent_version=snapshot.agent_version,
             snapshot_fingerprint=snapshot.fingerprint,
+        )
+        await emitter.emit(
+            "message.created",
+            message_id=str(uuid4()),
+            role="user",
+            content=prompt,
         )
         for skill in snapshot.skills:
             await emitter.emit(
@@ -168,6 +176,7 @@ class Harness:
         tools_by_name = {tool.spec.name: tool for tool in self._tools}
 
         for turn in range(1, self._definition.max_model_turns + 1):
+            assistant_message_id = str(uuid4())
             is_final_turn = turn == self._definition.max_model_turns or not snapshot.tool_specs
             request_tools = () if is_final_turn else snapshot.tool_specs
             request_tool_choice = _tool_choice_for_turn(
@@ -197,6 +206,7 @@ class Harness:
                     stream=stream,
                     emitter=emitter,
                     turn=turn,
+                    message_id=assistant_message_id,
                 )
             except Exception as exc:
                 failure = _model_failure(exc)
@@ -222,6 +232,14 @@ class Harness:
                 finish_reason=response.finish_reason.value,
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
+                tool_call_count=len(response.tool_calls),
+            )
+            await emitter.emit(
+                "message.completed",
+                message_id=assistant_message_id,
+                role="assistant",
+                turn=turn,
+                content=response.content or "",
                 tool_call_count=len(response.tool_calls),
             )
 
@@ -253,12 +271,12 @@ class Harness:
                     )
                 await emitter.emit("run.succeeded", turn=turn)
                 return RunResult(
-                    run_id=run_id,
+                    run_id=resolved_run_id,
                     status=RunStatus.SUCCEEDED,
                     output=output,
                     text=response_content,
                     snapshot=snapshot,
-                    events=emitter.events,
+                    events=await emitter.events(),
                     tool_results=tuple(tool_results),
                     evidence=evidence,
                 )
@@ -353,6 +371,7 @@ class Harness:
         stream: bool,
         emitter: _EventEmitter,
         turn: int,
+        message_id: str,
     ) -> ModelResponse:
         if not stream:
             return await self._model.complete(request)
@@ -371,9 +390,11 @@ class Harness:
             if isinstance(event, ModelTextDelta):
                 text_parts.append(event.text)
                 await emitter.emit(
-                    "model.output.delta",
+                    "message.delta",
+                    message_id=message_id,
+                    role="assistant",
                     turn=turn,
-                    text=event.text,
+                    delta=event.text,
                 )
                 continue
             if isinstance(event, ModelToolCallDelta):
@@ -708,7 +729,7 @@ class Harness:
             output=None,
             text="",
             snapshot=snapshot,
-            events=emitter.events,
+            events=await emitter.events(),
             tool_results=tuple(tool_results),
             evidence=evidence,
             error=error,

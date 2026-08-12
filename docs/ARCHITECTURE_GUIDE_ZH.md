@@ -1124,8 +1124,10 @@ ToolCall ID 是一个新的 operation，不能复用旧幂等键。
 | Attachment/Artifact | 已实现 | `ArtifactStore` |
 | Memory 检索端口 | 已实现 | `MemoryRetriever` |
 | OpenAI Chat Completions | 已实现、能力有限 | `OpenAIChatProvider` |
-| 流式模型输出 | 尚未实现 | 需要新 Provider/Runtime 契约 |
+| 流式模型输出 | next 已实现 | Provider `stream()`、有序 `message.delta` 与完整 `message.completed` |
 | FastAPI/SSE | 可选实现 | `base_agent.server` |
+| next Event 存储与回放 | 已实现（默认内存） | `EventStore` 是唯一事实源，`EventStream` 提供可选 replay-then-follow；PostgreSQL/Redis Adapter 待实现 |
+| next HTTP Run API | 可选实现（进程内） | `base_agent.server`、`Agent.start()`、`InMemoryRunRegistry`、Run API、Event JSON 回放与 SSE 实时订阅 |
 | PostgreSQL 持久化 | 可选实现 | `base_agent.stores.postgres` |
 | Redis 事件通知 | 可选实现 | `base_agent.stores.redis` |
 | MCP Tool | 可选实现 | `base_agent.mcp` |
