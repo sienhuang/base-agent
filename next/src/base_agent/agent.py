@@ -162,9 +162,16 @@ class Agent:
                 run_id=run_id,
             )
 
+        def cancel_in_background() -> Coroutine[Any, Any, RunResult]:
+            return self._harness.cancelled_result(
+                run_id,
+                reason="run cancellation requested",
+            )
+
         return RunHandle._launch(
             run_id=run_id,
             operation=run_in_background,
+            cancel_operation=cancel_in_background,
             event_store=self.event_store,
         )
 

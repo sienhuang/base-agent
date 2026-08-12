@@ -29,10 +29,12 @@ class RunStatus(StrEnum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class ToolResultStatus(StrEnum):
     SUCCESS = "success"
+    CANCELLED = "cancelled"
     NOT_FOUND = "not_found"
     DENIED = "denied"
     LIMIT_EXCEEDED = "limit_exceeded"

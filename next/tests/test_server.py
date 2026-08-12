@@ -107,6 +107,53 @@ async def test_http_starts_without_waiting_and_returns_completed_result() -> Non
     }
 
 
+async def test_http_cancels_running_run_and_replays_terminal_event() -> None:
+    model = GatedModel()
+
+    async with _client(_agent(model)) as (client, _):
+        started = await client.post("/v1/runs", json={"prompt": "hello"})
+        run_id = started.json()["run_id"]
+        await asyncio.wait_for(model.requested.wait(), timeout=1)
+
+        cancelled = await client.post(f"/v1/runs/{run_id}/cancel")
+        repeated = await client.post(f"/v1/runs/{run_id}/cancel")
+        events = await client.get(f"/v1/runs/{run_id}/events")
+        stream = await client.get(f"/v1/runs/{run_id}/events/stream")
+
+    expected = {
+        "run_id": run_id,
+        "status": "cancelled",
+        "event_count": 5,
+        "output": None,
+        "text": "",
+        "error": "run cancellation requested",
+    }
+    assert cancelled.status_code == repeated.status_code == 200
+    assert cancelled.json() == repeated.json() == expected
+    assert [event["kind"] for event in events.json()][-2:] == [
+        "model.requested",
+        "run.cancelled",
+    ]
+    terminal = events.json()[-1]
+    assert terminal["turn"] == 1
+    assert terminal["payload"] == {"reason": "run cancellation requested"}
+    stream_text = stream.text.replace("\r\n", "\n")
+    assert "id: 5\nevent: run.cancelled" in stream_text
+
+
+async def test_http_rejects_cancellation_for_unknown_or_completed_run() -> None:
+    async with _client(_agent(FakeModel.text("done"))) as (client, _):
+        missing = await client.post("/v1/runs/missing/cancel")
+        started = await client.post("/v1/runs", json={"prompt": "hello"})
+        run_id = started.json()["run_id"]
+        await _wait_for_status(client, run_id, "succeeded")
+        completed = await client.post(f"/v1/runs/{run_id}/cancel")
+
+    assert missing.status_code == 404
+    assert completed.status_code == 409
+    assert "already reached status 'succeeded'" in completed.json()["detail"]
+
+
 async def test_http_replays_persisted_events_after_sequence_cursor() -> None:
     async with _client(_agent(FakeModel.text("done"))) as (client, _):
         started = await client.post("/v1/runs", json={"prompt": "hello"})

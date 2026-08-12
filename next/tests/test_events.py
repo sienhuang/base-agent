@@ -83,6 +83,17 @@ async def test_completed_stream_stops_at_and_beyond_terminal_cursor() -> None:
     assert beyond_terminal == ()
 
 
+async def test_cancelled_stream_stops_after_terminal_event() -> None:
+    store = InMemoryEventStore()
+    await store.emit("run-a", "run.started")
+    terminal = await store.emit("run-a", "run.cancelled", turn=1)
+
+    replayed = await asyncio.wait_for(_collect_events(store.subscribe("run-a")), timeout=1)
+
+    assert replayed[-1] is terminal
+    assert terminal.kind == "run.cancelled"
+
+
 async def test_harness_store_is_the_single_event_record_and_observers_are_fanout() -> None:
     class RecordingEventStore(InMemoryEventStore):
         def __init__(self) -> None:

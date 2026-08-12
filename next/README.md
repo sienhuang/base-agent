@@ -72,6 +72,14 @@ newer_events = await handle.events(after_sequence=3)
 result = await handle.wait()
 ```
 
+运行中的后台 Run 可以显式取消。取消会等待清理完成，并返回带有
+`RunStatus.CANCELLED` 的终态结果：
+
+```python
+cancelled = await handle.cancel()
+assert cancelled.status is RunStatus.CANCELLED
+```
+
 `events()` 返回调用时已经记录的只读 Event 快照，`after_sequence=N` 只返回 sequence 大于
 N 的事件。需要先回放历史事件、再持续等待新事件时，使用进程内订阅：
 
@@ -83,7 +91,9 @@ async for event in handle.stream(after_sequence=last_sequence):
 ```
 
 订阅在 Run 结束且已发送全部事件后自动结束，多个订阅者互不影响；取消某个订阅不会取消
-Run。当前 `RunHandle` 不提供持久化或 Run 取消；HTTP SSE 已复用同一事件游标语义实现。
+Run，只有显式调用 `handle.cancel()` 才会取消后台执行。对已取消 Run 重复调用是幂等的；
+已经成功或失败的 Run 不能改写为取消。当前 `RunHandle` 不提供持久化；HTTP SSE 已复用同一
+事件游标语义实现。
 支持 streaming 的 Provider 可通过
 `agent.start("Hi", stream=True)` 在后台执行。
 
@@ -113,6 +123,7 @@ app = create_http_app(agent)
 | --- | --- | --- |
 | `POST` | `/v1/runs` | 后台启动 Run，立即返回 `202`。 |
 | `GET` | `/v1/runs/{run_id}` | 返回 Run 当前状态或最终结果。 |
+| `POST` | `/v1/runs/{run_id}/cancel` | 取消运行中的 Run；已完成 Run 返回 `409`。 |
 | `GET` | `/v1/runs/{run_id}/events` | 按 sequence 游标回放 Event JSON。 |
 | `GET` | `/v1/runs/{run_id}/events/stream` | 先回放、再通过 SSE 实时跟随。 |
 
@@ -127,7 +138,9 @@ data: {"sequence":7,"kind":"run.succeeded","run_id":"...","turn":1,"payload":{..
 客户端可用 `?after_sequence=5`、`?last_event_id=5` 或 `Last-Event-ID: 5` 只接收 sequence
 大于 5 的 Event；Header 优先于 `last_event_id`，再与 `after_sequence` 取较大值。连接空闲时
 默认每 15 秒发送一次 SSE comment 心跳，Run 终态事件发出后流自然关闭。Run registry 仍只
-存在于服务进程内，重启后原 `run_id` 不再可用，且目前不会自动清理已完成 Run。
+存在于服务进程内，重启后原 `run_id` 不再可用，且目前不会自动清理已完成 Run。当前 Server
+因此只适合单 Worker；部署到 Kubernetes 多副本或多 Worker 前，必须迁移为共享 RunStore
+驱动，不能依赖 sticky session 维持正确性。
 
 Tool、Skill 和 Flow 的完整离线示例见 `examples/quickstart.py`。
 Skill Package 的目录、Tool 贡献、Script 执行边界和 snapshot 契约见
@@ -157,9 +170,9 @@ Skill Package 的目录、Tool 贡献、Script 执行边界和 snapshot 契约�
 - 以 Model Turn 和单轮 ToolCall 上限约束的 model/tool loop；
 - Tool 参数、权限、超时和确认治理；
 - Provider-neutral text/ToolCall streaming 与完整响应聚合；
-- 进程内 `Agent.start()`、`RunHandle`、Event 快照回放和实时订阅；
+- 进程内 `Agent.start()`、`RunHandle`、显式取消、Event 快照回放和实时订阅；
 - 默认内存 `EventStore`、可替换持久历史和可选 `EventStream` 契约；
-- 可选 `base_agent.server` FastAPI Run 提交与状态查询；
+- 可选 `base_agent.server` FastAPI Run 提交、状态查询与取消；
 - 有序只读 Event；
 - 结构化最终输出验证；
 - 简单 SequentialFlow 与显式阶段交接。

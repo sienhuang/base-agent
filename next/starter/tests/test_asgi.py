@@ -20,6 +20,7 @@ def test_starter_composes_sdk_http_adapter(monkeypatch) -> None:
     assert {route.path for route in built.routes} >= {
         "/v1/runs",
         "/v1/runs/{run_id}",
+        "/v1/runs/{run_id}/cancel",
         "/v1/runs/{run_id}/events",
         "/v1/runs/{run_id}/events/stream",
     }

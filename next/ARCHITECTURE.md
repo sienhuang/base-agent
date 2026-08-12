@@ -117,6 +117,8 @@ Event 的额外不变量：
 5. Redis 只能装饰 durable EventStore 提供通知，不能代替 PostgreSQL 等事实源。
 6. Message 使用同一条 Event sequence：user `message.created` 和 assistant
    `message.completed` 始终存在，`message.delta` 只是可选实时增量。
+7. `run.succeeded`、`run.failed` 和 `run.cancelled` 是互斥的 Run 终态 Event；取消期间已经
+   `tool.started` 的调用必须以 `tool.completed(status=cancelled)` 闭合。
 
 完整契约见 [`SKILLS.md`](SKILLS.md)。
 Event 存储和流契约见 [`EVENTS.md`](EVENTS.md)。
@@ -153,14 +155,15 @@ AgentDefinition(
 
 1. 已增加进程内 RunHandle、`start()`、Event 回放与实时订阅，以及 `base_agent.server`
    HTTP Run 提交/状态查询，以及基于同一 EventStore 的 JSON 回放与 SSE 实时订阅；
-2. 增加取消语义和小型 ContextPolicy；
-3. 增加声明式 Stage output contract；
-4. 用 AgentDemo MTBI Flow 验证 Artifact/Verifier；
-5. 增加固定角色的 Planner/Executor Flow 预设；
-6. 用 mock-manus PlannerReActFlow 验证重新规划和实时事件；
-7. 在已有 Skill 受控目录发现、Descriptor/Catalog/`skill_view` 基础上，根据真实
+2. 已增加进程内 `RunHandle.cancel()`、HTTP cancel 和 `run.cancelled` 终态语义；
+3. 增加小型 ContextPolicy；
+4. 增加声明式 Stage output contract；
+5. 用 AgentDemo MTBI Flow 验证 Artifact/Verifier；
+6. 增加固定角色的 Planner/Executor Flow 预设；
+7. 用 mock-manus PlannerReActFlow 验证重新规划和实时事件；
+8. 在已有 Skill 受控目录发现、Descriptor/Catalog/`skill_view` 基础上，根据真实
    目录规模再增加检索、缓存和外部 Skill 源 Adapter；
-8. 在已有 EventStore/EventStream 小型契约上按真实部署需求增加 PostgreSQL durable store
+9. 在已有 EventStore/EventStream 小型契约上按真实部署需求增加 PostgreSQL durable store
    和 Redis notification adapter，再迁入 Artifact、Resource 等其他 Protocol。
 
 Worker、Lease、Operator API 和分布式恢复不在以上主路径内；只有明确部署需求出现时，才
@@ -177,4 +180,11 @@ Worker、Lease、Operator API 和分布式恢复不在以上主路径内；只�
 4. PostgreSQL EventStore 作为事件事实源，Redis/PgNotify 只负责实时唤醒 SSE；
 5. Worker 崩溃后的重新领取依赖 lease、幂等写入和后续 checkpoint，而不是恢复旧 RunHandle。
 
-这部分等单进程 Run/Event/Server 契约稳定后再实现，当前 Starter 明确保持单 Worker。
+已经明确的部署门槛：`RunHandle` 只保留为 Execution Worker 内部控制本地 Task 的原语；任何
+Kubernetes、多 Pod、多 Worker、滚动更新或弹性扩缩容部署，都必须先把 HTTP Run 创建、查询、
+取消和结果读取迁移为共享 `RunStore` 驱动。API Pod 通过 RunStore 写入取消请求，持有 lease
+的 Worker 再取消自己的本地 RunHandle；负载均衡、sticky session 或共享 EventStore 都不能
+替代 RunStore。
+
+这部分等单进程 Run/Event/Server 契约稳定后再实现，当前 Starter 明确保持单 Worker，不能
+作为多副本 K8s Run Server 部署。

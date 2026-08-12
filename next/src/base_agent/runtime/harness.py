@@ -662,15 +662,17 @@ class Harness:
                 tool_call_id=call.id,
             )
 
-        await emitter.emit(
-            "tool.started",
-            turn=turn,
-            tool_name=call.name,
-            tool_call_id=call.id,
-            side_effect=tool.side_effect.value,
-        )
         started_at = monotonic()
+        tool_started = False
         try:
+            await emitter.emit(
+                "tool.started",
+                turn=turn,
+                tool_name=call.name,
+                tool_call_id=call.id,
+                side_effect=tool.side_effect.value,
+            )
+            tool_started = True
             data = await asyncio.wait_for(
                 tool.invoke(
                     arguments,
@@ -682,6 +684,17 @@ class Harness:
                 ),
                 timeout=tool.timeout_seconds,
             )
+        except asyncio.CancelledError:
+            if tool_started or await _has_open_tool_event(emitter, call.id):
+                await emitter.emit(
+                    "tool.completed",
+                    turn=turn,
+                    tool_name=call.name,
+                    tool_call_id=call.id,
+                    status=ToolResultStatus.CANCELLED.value,
+                    duration_ms=int((monotonic() - started_at) * 1000),
+                )
+            raise
         except TimeoutError:
             result = ToolResult(
                 call=call,
@@ -767,6 +780,91 @@ class Harness:
             ),
         )
 
+    async def cancelled_result(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+    ) -> RunResult:
+        """Persist the terminal result for a cancelled background Run."""
+        emitter = _EventEmitter(run_id, self._event_store, self._observers)
+        existing_events = await emitter.events()
+        if existing_events and existing_events[-1].kind in {
+            "run.succeeded",
+            "run.failed",
+            "run.cancelled",
+        }:
+            return self._result_from_terminal_events(run_id, existing_events)
+        turn = next(
+            (event.turn for event in reversed(existing_events) if event.turn is not None),
+            None,
+        )
+        await emitter.emit("run.cancelled", turn=turn, reason=reason)
+        return RunResult(
+            run_id=run_id,
+            status=RunStatus.CANCELLED,
+            output=None,
+            text="",
+            snapshot=self._create_snapshot(),
+            events=await emitter.events(),
+            error=reason,
+        )
+
+    def _result_from_terminal_events(
+        self,
+        run_id: str,
+        events: tuple[Event, ...],
+    ) -> RunResult:
+        terminal = events[-1]
+        snapshot = self._create_snapshot()
+        if terminal.kind == "run.succeeded":
+            completed = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if event.kind == "message.completed"
+                ),
+                None,
+            )
+            text = completed.payload.get("content", "") if completed is not None else ""
+            resolved_text = text if isinstance(text, str) else str(text)
+            output, evidence, validation_error = self._validate_output(resolved_text)
+            if validation_error is not None:
+                raise RuntimeError(
+                    f"Run '{run_id}' committed success with invalid output: "
+                    f"{validation_error}"
+                )
+            return RunResult(
+                run_id=run_id,
+                status=RunStatus.SUCCEEDED,
+                output=output,
+                text=resolved_text,
+                snapshot=snapshot,
+                events=events,
+                evidence=evidence,
+            )
+        error = terminal.payload.get("error") or terminal.payload.get("reason")
+        resolved_error = str(error or terminal.kind)
+        status = (
+            RunStatus.FAILED
+            if terminal.kind == "run.failed"
+            else RunStatus.CANCELLED
+        )
+        return RunResult(
+            run_id=run_id,
+            status=status,
+            output=None,
+            text="",
+            snapshot=snapshot,
+            events=events,
+            error=resolved_error,
+            failure=(
+                RunFailure(code="run_failed", message=resolved_error)
+                if status is RunStatus.FAILED
+                else None
+            ),
+        )
+
 
 def _build_system_prompt(
     definition: AgentDefinition,
@@ -845,6 +943,17 @@ def _response_schema(definition: AgentDefinition) -> Mapping[str, Any] | None:
     if definition.response_model is None:
         return None
     return definition.response_model.model_json_schema()
+
+
+async def _has_open_tool_event(emitter: _EventEmitter, tool_call_id: str) -> bool:
+    for event in reversed(await emitter.events()):
+        if event.payload.get("tool_call_id") != tool_call_id:
+            continue
+        if event.kind == "tool.completed":
+            return False
+        if event.kind == "tool.started":
+            return True
+    return False
 
 
 def _index_skill_resources(

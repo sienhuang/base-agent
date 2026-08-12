@@ -109,6 +109,12 @@ curl http://127.0.0.1:8000/v1/runs \
 curl http://127.0.0.1:8000/v1/runs/<run_id>
 ```
 
+取消仍在运行的 Run；重复取消已取消的 Run 是幂等的，已经成功或失败的 Run 返回 `409`：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/runs/<run_id>/cancel
+```
+
 回放 sequence 大于 3 的历史 Event：
 
 ```bash

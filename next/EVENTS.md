@@ -22,8 +22,9 @@ Observer 是 fail-open 的旁路消费者，不是可靠存储。EventStore 写�
 事件专属 `payload`。`turn` 是执行关联信息，不属于业务 payload：Run 初始化阶段的
 `run.started`、user `message.created`、`skill.selected`、`run.ready` 等事件为 `None`；
 模型回合内的 `model.*`、assistant `message.*`、`tool.*`、Skill 资源使用，以及在该回合
-结束的 `run.succeeded` / `run.failed` 都记录从 1 开始的 turn。这样 sequence 提供 Run 内
-总顺序，turn 则提供回合边界，回放消费者不需要从 payload 猜测事件归属。
+结束的 `run.succeeded` / `run.failed` / `run.cancelled` 都记录从 1 开始的 turn。这样
+sequence 提供 Run 内总顺序，turn 则提供回合边界，回放消费者不需要从 payload 猜测事件
+归属。
 
 ## 默认内存实现
 
@@ -70,8 +71,9 @@ Message 不使用第二条 Stream，而是作为同一条有序 Run Event Stream
 - `message.completed`：一个模型回合的完整 assistant 内容，流式和非流式 Provider 都产生。
 
 同一个 assistant 回合的 delta 和 completed 共享 `message_id`。`message.completed` 只表示该
-模型消息已经完整；Run 是否接受该输出仍由后续 `run.succeeded` / `run.failed` 决定。消费者
-可以实时拼接 delta，但断线回放和最终展示必须以 completed 的完整 `content` 为准。
+模型消息已经完整；Run 是否接受该输出仍由后续 `run.succeeded` / `run.failed` /
+`run.cancelled` 决定。消费者可以实时拼接 delta，但断线回放和最终展示必须以 completed
+的完整 `content` 为准。
 
 Prompt 和模型正文可能包含敏感数据。生产 EventStore/SSE Adapter 必须在授权边界内使用，
 并在后续 payload policy 中支持保留期、加密、脱敏或禁止正文持久化；不能把 Event 自动写入
@@ -83,10 +85,18 @@ Prompt 和模型正文可能包含敏感数据。生产 EventStore/SSE Adapter �
 
 - `GET /v1/runs/{run_id}/events?after_sequence=N` 返回 sequence 大于 N 的历史 JSON；
 - `GET /v1/runs/{run_id}/events/stream` 先回放历史，再实时等待新 Event；
+- `POST /v1/runs/{run_id}/cancel` 取消运行中的进程内 Run；
 - 每个 SSE 帧以 sequence 作为 `id`，以 Event kind 作为 `event`；
 - 断线重连支持 `Last-Event-ID` Header，以及 `last_event_id` / `after_sequence` 查询参数；
 - 空闲连接默认每 15 秒发送 comment 心跳，心跳不进入 EventStore，也不推进游标；
-- `run.succeeded` 或 `run.failed` 发出后订阅自然结束，客户端断开不会取消 Run。
+- `run.succeeded`、`run.failed` 或 `run.cancelled` 发出后订阅自然结束，客户端断开不会取消
+  Run。
+
+`RunHandle.cancel()` 取消后台 Task，并在清理完成后写入唯一的 `run.cancelled` 终态 Event。
+如果取消发生在 Tool 执行期间，Harness 会先写入 `tool.completed(status=cancelled)`，避免留下
+只有 `tool.started` 的悬空调用。对已取消 Run 重复取消不会新增 Event；成功或失败的 Run
+不能被事后改写为取消。直接等待 `agent.run()` 的调用方取消自己的 Task 时仍收到
+`CancelledError`，不会被转换成一个看似正常返回的 RunResult。
 
 这种分层沿用 mock-manus 的“先写事实记录、再实时分发”和 `Last-Event-ID` 续读思路；不同点
 是 `InMemoryEventStore.subscribe()` 已通过同一把 Condition lock 原子完成回放到实时的切换，

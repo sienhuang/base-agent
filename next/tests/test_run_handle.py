@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from base_agent import Agent, AgentDefinition, RunHandle, RunStatus
+from base_agent import Agent, AgentDefinition, RunHandle, RunStatus, tool
 from base_agent.events import InMemoryEventStore
 from base_agent.models import (
     Event,
@@ -13,8 +13,11 @@ from base_agent.models import (
     ModelStreamCompleted,
     ModelStreamEvent,
     ModelTextDelta,
+    ToolCall,
 )
 from base_agent.providers import ProviderCapabilities, ProviderInfo
+from base_agent.run_handle import RunNotCancellableError
+from base_agent.testing import FakeModel
 
 
 class GatedModel:
@@ -105,6 +108,201 @@ async def test_cancelling_waiter_does_not_cancel_background_run() -> None:
     assert result.status is RunStatus.SUCCEEDED
 
 
+async def test_handle_cancel_stops_background_run_and_persists_terminal_event() -> None:
+    model = GatedModel()
+    handle = _agent(model).start("hello")
+    await asyncio.wait_for(model.requested.wait(), timeout=1)
+
+    result = await handle.cancel()
+
+    assert result.status is RunStatus.CANCELLED
+    assert result.error == "run cancellation requested"
+    assert result.output is None
+    assert result.text == ""
+    assert handle.status is RunStatus.CANCELLED
+    assert await handle.wait() is result
+    assert [event.kind for event in result.events] == [
+        "run.started",
+        "message.created",
+        "run.ready",
+        "model.requested",
+        "run.cancelled",
+    ]
+    terminal = result.events[-1]
+    assert terminal.turn == 1
+    assert terminal.payload == {"reason": "run cancellation requested"}
+
+
+async def test_handle_can_be_cancelled_immediately_after_start() -> None:
+    handle = _agent(GatedModel()).start("hello")
+
+    result = await handle.cancel()
+
+    assert result.status is RunStatus.CANCELLED
+    assert result.events[0].kind == "run.started"
+    assert result.events[-1].kind == "run.cancelled"
+
+
+async def test_handle_cancel_closes_an_in_progress_tool_event() -> None:
+    tool_started = asyncio.Event()
+    tool_release = asyncio.Event()
+
+    @tool
+    async def blocking_tool() -> str:
+        tool_started.set()
+        await tool_release.wait()
+        return "done"
+
+    model = FakeModel(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id="blocking-1",
+                        name="blocking_tool",
+                        arguments={},
+                    ),
+                )
+            ),
+            ModelResponse(content="unused"),
+        ]
+    )
+    agent = Agent(
+        AgentDefinition(
+            id="tool-cancellation",
+            version="1.0.0",
+            instructions="Call the Tool.",
+            tools=("blocking_tool",),
+            max_model_turns=2,
+        ),
+        model=model,
+        tools=(blocking_tool,),
+    )
+    handle = agent.start("work")
+    await asyncio.wait_for(tool_started.wait(), timeout=1)
+
+    result = await handle.cancel()
+
+    tool_events = [event for event in result.events if event.kind.startswith("tool.")]
+    assert [event.kind for event in tool_events] == ["tool.started", "tool.completed"]
+    assert tool_events[-1].turn == 1
+    assert tool_events[-1].payload["status"] == "cancelled"
+    assert result.events[-1].kind == "run.cancelled"
+
+
+async def test_handle_cancel_closes_tool_started_before_observer_returns() -> None:
+    tool_started_committed = asyncio.Event()
+    observer_release = asyncio.Event()
+
+    async def blocking_observer(event: Event) -> None:
+        if event.kind == "tool.started":
+            tool_started_committed.set()
+            await observer_release.wait()
+
+    @tool
+    async def never_invoked() -> str:
+        raise AssertionError("cancellation should happen before Tool invocation")
+
+    model = FakeModel(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id="observer-blocked-1",
+                        name="never_invoked",
+                        arguments={},
+                    ),
+                )
+            ),
+            ModelResponse(content="unused"),
+        ]
+    )
+    agent = Agent(
+        AgentDefinition(
+            id="tool-start-observer-cancellation",
+            version="1.0.0",
+            instructions="Call the Tool.",
+            tools=("never_invoked",),
+            max_model_turns=2,
+        ),
+        model=model,
+        tools=(never_invoked,),
+        observers=(blocking_observer,),
+    )
+    handle = agent.start("work")
+    await asyncio.wait_for(tool_started_committed.wait(), timeout=1)
+
+    result = await handle.cancel()
+
+    tool_events = [event for event in result.events if event.kind.startswith("tool.")]
+    assert [event.kind for event in tool_events] == ["tool.started", "tool.completed"]
+    assert tool_events[-1].payload["status"] == "cancelled"
+    assert result.events[-1].kind == "run.cancelled"
+
+
+async def test_handle_cancel_is_idempotent_only_for_cancelled_run() -> None:
+    model = GatedModel()
+    handle = _agent(model).start("hello")
+    await asyncio.wait_for(model.requested.wait(), timeout=1)
+
+    first, second = await asyncio.gather(handle.cancel(), handle.cancel())
+    repeated = await handle.cancel()
+
+    assert first is second is repeated
+    assert [event.kind for event in first.events].count("run.cancelled") == 1
+
+    completed_model = GatedModel()
+    completed_handle = _agent(completed_model).start("hello")
+    await asyncio.wait_for(completed_model.requested.wait(), timeout=1)
+    completed_model.release.set()
+    await completed_handle.wait()
+
+    with pytest.raises(RunNotCancellableError, match="already reached status 'succeeded'"):
+        await completed_handle.cancel()
+
+
+async def test_cancel_does_not_rewrite_a_committed_terminal_event() -> None:
+    terminal_committed = asyncio.Event()
+    release_observer = asyncio.Event()
+
+    async def blocking_observer(event: Event) -> None:
+        if event.kind == "run.succeeded":
+            terminal_committed.set()
+            await release_observer.wait()
+
+    agent = Agent(
+        AgentDefinition(
+            id="terminal-cancel-race",
+            version="1.0.0",
+            instructions="Answer.",
+        ),
+        model=FakeModel.text("done"),
+        observers=(blocking_observer,),
+    )
+    handle = agent.start("hello")
+    await asyncio.wait_for(terminal_committed.wait(), timeout=1)
+
+    with pytest.raises(RunNotCancellableError, match="already committed status 'succeeded'"):
+        await asyncio.wait_for(handle.cancel(), timeout=1)
+
+    release_observer.set()
+    result = await handle.wait()
+    assert result.status is RunStatus.SUCCEEDED
+    assert [event.kind for event in result.events].count("run.succeeded") == 1
+    assert "run.cancelled" not in [event.kind for event in result.events]
+
+
+async def test_direct_agent_run_cancellation_still_propagates_to_caller() -> None:
+    model = GatedModel()
+    task = asyncio.create_task(_agent(model).run("hello"))
+    await asyncio.wait_for(model.requested.wait(), timeout=1)
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
 async def test_event_stream_replays_then_follows_until_run_completion() -> None:
     model = GatedModel()
     handle = _agent(model).start("hello")
@@ -144,6 +342,22 @@ async def test_event_stream_replays_completed_run_and_supports_multiple_subscrib
     assert await first_subscriber == result.events
     assert await second_subscriber == result.events
     assert await _collect_events(handle.stream(after_sequence=3)) == result.events[3:]
+
+
+async def test_multiple_event_subscribers_receive_run_cancelled() -> None:
+    model = GatedModel()
+    handle = _agent(model).start("hello")
+    await asyncio.wait_for(model.requested.wait(), timeout=1)
+    first_subscriber = asyncio.create_task(_collect_events(handle.stream()))
+    second_subscriber = asyncio.create_task(_collect_events(handle.stream()))
+    await asyncio.sleep(0)
+
+    result = await handle.cancel()
+
+    assert result.status is RunStatus.CANCELLED
+    assert await first_subscriber == result.events
+    assert await second_subscriber == result.events
+    assert result.events[-1].kind == "run.cancelled"
 
 
 async def test_cancelling_event_subscription_does_not_cancel_background_run() -> None:

@@ -10,16 +10,28 @@ from base_agent.events import EventStore, EventStream
 from base_agent.models import Event, RunResult, RunStatus
 
 _RunOperation = Callable[[], Coroutine[Any, Any, RunResult]]
+_CancelOperation = Callable[[], Coroutine[Any, Any, RunResult]]
 
 
 class EventStreamingNotSupportedError(RuntimeError):
     """The configured EventStore does not expose live subscriptions."""
 
 
+class RunNotCancellableError(RuntimeError):
+    """The process-local Run has already reached a non-cancelled terminal state."""
+
+
 class RunHandle:
     """Observe and await one process-local background Run."""
 
-    __slots__ = ("_event_store", "_task", "run_id")
+    __slots__ = (
+        "_cancel_lock",
+        "_cancel_requested",
+        "_event_store",
+        "_started",
+        "_task",
+        "run_id",
+    )
 
     def __init__(
         self,
@@ -27,10 +39,14 @@ class RunHandle:
         run_id: str,
         task: asyncio.Task[RunResult],
         event_store: EventStore,
+        started: asyncio.Event,
     ) -> None:
         self.run_id = run_id
         self._task = task
         self._event_store = event_store
+        self._started = started
+        self._cancel_lock = asyncio.Lock()
+        self._cancel_requested = False
 
     @classmethod
     def _launch(
@@ -38,10 +54,25 @@ class RunHandle:
         *,
         run_id: str,
         operation: _RunOperation,
+        cancel_operation: _CancelOperation,
         event_store: EventStore,
     ) -> RunHandle:
-        task = asyncio.create_task(operation(), name=f"base-agent-run-{run_id}")
-        return cls(run_id=run_id, task=task, event_store=event_store)
+        started = asyncio.Event()
+
+        async def run_operation() -> RunResult:
+            started.set()
+            try:
+                return await operation()
+            except asyncio.CancelledError:
+                return await cancel_operation()
+
+        task = asyncio.create_task(run_operation(), name=f"base-agent-run-{run_id}")
+        return cls(
+            run_id=run_id,
+            task=task,
+            event_store=event_store,
+            started=started,
+        )
 
     @property
     def status(self) -> RunStatus:
@@ -49,7 +80,7 @@ class RunHandle:
         if not self._task.done():
             return RunStatus.RUNNING
         if self._task.cancelled():
-            return RunStatus.FAILED
+            return RunStatus.CANCELLED
         try:
             return self._task.result().status
         except Exception:
@@ -58,6 +89,37 @@ class RunHandle:
     async def wait(self) -> RunResult:
         """Wait for completion without letting waiter cancellation stop the Run."""
         return await asyncio.shield(self._task)
+
+    async def cancel(self) -> RunResult:
+        """Cancel this background Run and return its persisted terminal result.
+
+        Repeating cancellation after the Run reached ``CANCELLED`` is idempotent.
+        A Run that already succeeded or failed cannot be rewritten as cancelled.
+        """
+        async with self._cancel_lock:
+            if self._cancel_requested:
+                return await asyncio.shield(self._task)
+
+            await self._started.wait()
+            if self._task.done():
+                return self._cancelled_or_raise()
+
+            terminal_status = _terminal_status(await self._event_store.list(self.run_id))
+            if terminal_status is not None:
+                raise RunNotCancellableError(
+                    f"Run '{self.run_id}' already committed status "
+                    f"'{terminal_status.value}' and cannot be cancelled"
+                )
+
+            self._cancel_requested = True
+            self._task.cancel("run cancellation requested")
+            result = await asyncio.shield(self._task)
+            if result.status is not RunStatus.CANCELLED:
+                raise RunNotCancellableError(
+                    f"Run '{self.run_id}' reached status '{result.status.value}' "
+                    "before cancellation"
+                )
+            return result
 
     async def events(self, *, after_sequence: int = 0) -> tuple[Event, ...]:
         """Read persisted Events strictly after the cursor."""
@@ -135,7 +197,36 @@ class RunHandle:
                     pass
             await subscription.aclose()
 
+    def _cancelled_or_raise(self) -> RunResult:
+        if self._task.cancelled():
+            raise RunNotCancellableError(
+                f"Run '{self.run_id}' exited without a cancellable result"
+            )
+        try:
+            result = self._task.result()
+        except Exception as exc:
+            raise RunNotCancellableError(
+                f"Run '{self.run_id}' failed and cannot be cancelled"
+            ) from exc
+        if result.status is RunStatus.CANCELLED:
+            self._cancel_requested = True
+            return result
+        raise RunNotCancellableError(
+            f"Run '{self.run_id}' already reached status '{result.status.value}' "
+            "and cannot be cancelled"
+        )
+
 
 def _validate_cursor(after_sequence: int) -> None:
     if after_sequence < 0:
         raise ValueError("after_sequence must be non-negative")
+
+
+def _terminal_status(events: tuple[Event, ...]) -> RunStatus | None:
+    if not events:
+        return None
+    return {
+        "run.succeeded": RunStatus.SUCCEEDED,
+        "run.failed": RunStatus.FAILED,
+        "run.cancelled": RunStatus.CANCELLED,
+    }.get(events[-1].kind)

@@ -10,7 +10,11 @@ from sse_starlette import EventSourceResponse, ServerSentEvent
 
 from base_agent.agent import Agent
 from base_agent.models import Event, RunStatus
-from base_agent.run_handle import EventStreamingNotSupportedError, RunHandle
+from base_agent.run_handle import (
+    EventStreamingNotSupportedError,
+    RunHandle,
+    RunNotCancellableError,
+)
 from base_agent.server.registry import InMemoryRunRegistry, RunNotFoundError
 from base_agent.server.schemas import (
     EventResponse,
@@ -53,6 +57,18 @@ def create_http_app(
     )
     async def get_run(run_id: str) -> RunResponse:
         handle = _get_handle(registry, run_id)
+        return await _run_response(handle)
+
+    @app.post(
+        f"{route_prefix}/runs/{{run_id}}/cancel",
+        response_model=RunResponse,
+    )
+    async def cancel_run(run_id: str) -> RunResponse:
+        handle = _get_handle(registry, run_id)
+        try:
+            await handle.cancel()
+        except RunNotCancellableError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return await _run_response(handle)
 
     @app.get(
