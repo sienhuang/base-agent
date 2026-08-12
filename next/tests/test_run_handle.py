@@ -174,8 +174,10 @@ async def test_closing_handle_stream_closes_underlying_subscription() -> None:
             run_id: str,
             kind: str,
             payload: Mapping[str, Any] | None = None,
+            *,
+            turn: int | None = None,
         ) -> Event:
-            return await self.delegate.emit(run_id, kind, payload)
+            return await self.delegate.emit(run_id, kind, payload, turn=turn)
 
         async def list(
             self,

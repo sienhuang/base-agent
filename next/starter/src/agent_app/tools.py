@@ -7,9 +7,11 @@ import shutil
 from base_agent import (
     Confirmation,
     SideEffect,
+    Toolkit,
     ToolReadiness,
     tool,
 )
+from base_agent.tools import flatten_tools
 
 
 def check_browser_readiness() -> ToolReadiness:
@@ -55,3 +57,17 @@ async def save_value(value: int) -> int:
 async def browse(url: str) -> str:
     """Represent a browser-backed Tool with an external dependency."""
     return f"Browser is ready for {url}"
+
+
+DIAGNOSTIC_TOOLKIT = Toolkit.of(
+    "diagnostics",
+    fail_operation,
+    slow_operation,
+)
+
+# Registration, enablement, and authorization are intentionally separate. The
+# browser implementation is registered for opt-in definitions but is not part
+# of the Starter Agent's default capability policy.
+REGISTERED_TOOLS = (DIAGNOSTIC_TOOLKIT, save_value, browse)
+ENABLED_TOOLS = (DIAGNOSTIC_TOOLKIT, save_value)
+ENABLED_TOOL_NAMES = tuple(tool.spec.name for tool in flatten_tools(ENABLED_TOOLS))

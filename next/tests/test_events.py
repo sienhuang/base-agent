@@ -19,12 +19,15 @@ async def test_in_memory_store_assigns_per_run_sequence_and_replays_by_cursor() 
     store = InMemoryEventStore()
 
     first = await store.emit("run-a", "run.started")
-    second = await store.emit("run-a", "model.requested", {"turn": 1})
+    second = await store.emit("run-a", "model.requested", turn=1)
     other = await store.emit("run-b", "run.started")
 
     assert isinstance(store, EventStore)
     assert isinstance(store, EventStream)
     assert (first.sequence, second.sequence, other.sequence) == (1, 2, 1)
+    assert first.turn is None
+    assert second.turn == 1
+    assert "turn" not in second.payload
     assert await store.list("run-a") == (first, second)
     assert await store.list("run-a", after_sequence=1) == (second,)
     assert await store.list("missing") == ()
@@ -91,8 +94,10 @@ async def test_harness_store_is_the_single_event_record_and_observers_are_fanout
             run_id: str,
             kind: str,
             payload: Mapping[str, Any] | None = None,
+            *,
+            turn: int | None = None,
         ) -> Event:
-            event = await super().emit(run_id, kind, payload)
+            event = await super().emit(run_id, kind, payload, turn=turn)
             self.emitted.append(event)
             return event
 
@@ -151,6 +156,8 @@ async def test_event_store_failure_does_not_notify_observers_or_call_model() -> 
             run_id: str,
             kind: str,
             payload: Mapping[str, Any] | None = None,
+            *,
+            turn: int | None = None,
         ) -> Event:
             raise RuntimeError("event store unavailable")
 
@@ -192,8 +199,10 @@ async def test_run_handle_reports_history_only_store_cannot_stream() -> None:
             run_id: str,
             kind: str,
             payload: Mapping[str, Any] | None = None,
+            *,
+            turn: int | None = None,
         ) -> Event:
-            return await self.delegate.emit(run_id, kind, payload)
+            return await self.delegate.emit(run_id, kind, payload, turn=turn)
 
         async def list(
             self,

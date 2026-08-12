@@ -62,7 +62,7 @@ uv run --project next/starter agent-app \
     "test browser readiness"
 
 --测试streaming的逻辑
-     export OPENAI_API_KEY="sk-toGokALYLPvjR0GINzu3Bw" （这个报错了使用qianwen模型报错了， 可是是用ds没有报错的。call_27ec2e2294b64ff3bdfe4309: status=success, data=1
+     export OPENAI_API_KEY="" （这个报错了使用qianwen模型报错了， 可是是用ds没有报错的。call_27ec2e2294b64ff3bdfe4309: status=success, data=1
 error: final model turn requested Tools while Tool use was disabled）
   uv run --project next/starter agent-app \
     --provider openai-compatible \

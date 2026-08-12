@@ -18,6 +18,13 @@ Harness / _EventEmitter
 Observer 是 fail-open 的旁路消费者，不是可靠存储。EventStore 写入失败会中断执行，不能在
 事件尚未成为事实时继续通知外部消费者。
 
+每个 Event 都有公共 envelope：`sequence`、`kind`、`run_id`、可选的 `turn` 和
+事件专属 `payload`。`turn` 是执行关联信息，不属于业务 payload：Run 初始化阶段的
+`run.started`、user `message.created`、`skill.selected`、`run.ready` 等事件为 `None`；
+模型回合内的 `model.*`、assistant `message.*`、`tool.*`、Skill 资源使用，以及在该回合
+结束的 `run.succeeded` / `run.failed` 都记录从 1 开始的 turn。这样 sequence 提供 Run 内
+总顺序，turn 则提供回合边界，回放消费者不需要从 payload 猜测事件归属。
+
 ## 默认内存实现
 
 `Agent` 默认创建 `InMemoryEventStore`。它按 `run_id` 隔离 Event、原子分配递增 sequence，

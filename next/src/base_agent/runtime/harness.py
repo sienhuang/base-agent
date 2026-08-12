@@ -81,8 +81,19 @@ class _EventEmitter:
     def run_id(self) -> str:
         return self._run_id
 
-    async def emit(self, kind: str, **payload: Any) -> None:
-        event = await self._event_store.emit(self._run_id, kind, payload)
+    async def emit(
+        self,
+        kind: str,
+        *,
+        turn: int | None = None,
+        **payload: Any,
+    ) -> None:
+        event = await self._event_store.emit(
+            self._run_id,
+            kind,
+            payload,
+            turn=turn,
+        )
         for observer in self._observers:
             try:
                 value = observer(event)
@@ -223,6 +234,7 @@ class Harness:
                     error=failure.message,
                     failure=failure,
                     tool_results=tool_results,
+                    turn=turn,
                 )
             await emitter.emit(
                 "model.responded",
@@ -249,6 +261,7 @@ class Harness:
                     snapshot,
                     error="final model turn requested Tools while Tool use was disabled",
                     tool_results=tool_results,
+                    turn=turn,
                 )
 
             if not response.tool_calls:
@@ -258,6 +271,7 @@ class Harness:
                         snapshot,
                         error="model completed without the required Tool call",
                         tool_results=tool_results,
+                        turn=turn,
                     )
                 response_content = response.content or ""
                 output, evidence, validation_error = self._validate_output(response_content)
@@ -268,6 +282,7 @@ class Harness:
                         error=validation_error,
                         tool_results=tool_results,
                         evidence=evidence,
+                        turn=turn,
                     )
                 await emitter.emit("run.succeeded", turn=turn)
                 return RunResult(
@@ -287,6 +302,7 @@ class Harness:
                     snapshot,
                     error="model requested a Tool while tool_choice is 'none'",
                     tool_results=tool_results,
+                    turn=turn,
                 )
 
             called_any_tool = True
@@ -329,6 +345,7 @@ class Harness:
                 )
                 await emitter.emit(
                     "tool.completed",
+                    turn=turn,
                     tool_name=call.name,
                     tool_call_id=call.id,
                     status=result.status.value,
@@ -345,6 +362,7 @@ class Harness:
                         snapshot,
                         error="Tool observations exceeded the per-Run context budget",
                         tool_results=tool_results,
+                        turn=turn,
                     )
                 messages.append(Message.tool_result(result.call, observation))
                 if (
@@ -362,6 +380,7 @@ class Harness:
             snapshot,
             error="Agent exhausted max_model_turns without a final answer",
             tool_results=tool_results,
+            turn=self._definition.max_model_turns,
         )
 
     async def _complete_model_turn(
@@ -543,6 +562,7 @@ class Harness:
             )
             await emitter.emit(
                 "tool.completed",
+                turn=turn,
                 tool_name=call.name,
                 tool_call_id=call.id,
                 status=result.status.value,
@@ -558,6 +578,7 @@ class Harness:
             )
             await emitter.emit(
                 "tool.completed",
+                turn=turn,
                 tool_name=call.name,
                 tool_call_id=call.id,
                 status=result.status.value,
@@ -574,6 +595,7 @@ class Harness:
             )
             await emitter.emit(
                 "tool.completed",
+                turn=turn,
                 tool_name=call.name,
                 tool_call_id=call.id,
                 status=result.status.value,
@@ -597,6 +619,7 @@ class Harness:
                 approved = False
             await emitter.emit(
                 "tool.confirmation",
+                turn=turn,
                 tool_name=call.name,
                 tool_call_id=call.id,
                 approved=approved,
@@ -609,6 +632,7 @@ class Harness:
                 )
                 await emitter.emit(
                     "tool.completed",
+                    turn=turn,
                     tool_name=call.name,
                     tool_call_id=call.id,
                     status=result.status.value,
@@ -640,6 +664,7 @@ class Harness:
 
         await emitter.emit(
             "tool.started",
+            turn=turn,
             tool_name=call.name,
             tool_call_id=call.id,
             side_effect=tool.side_effect.value,
@@ -677,6 +702,7 @@ class Harness:
             )
         await emitter.emit(
             "tool.completed",
+            turn=turn,
             tool_name=call.name,
             tool_call_id=call.id,
             status=result.status.value,
@@ -721,8 +747,9 @@ class Harness:
         tool_results: Sequence[ToolResult] = (),
         evidence: tuple[VerificationEvidence, ...] = (),
         failure: RunFailure | None = None,
+        turn: int | None = None,
     ) -> RunResult:
-        await emitter.emit("run.failed", error=error)
+        await emitter.emit("run.failed", turn=turn, error=error)
         return RunResult(
             run_id=emitter.run_id,
             status=RunStatus.FAILED,
@@ -801,7 +828,6 @@ async def _emit_skill_view_event(
     if not isinstance(name, str) or not isinstance(file_path, str):
         return
     payload = {
-        "turn": turn,
         "skill_name": name,
         "skill_version": version,
         "package_fingerprint": data.get("package_fingerprint"),
@@ -810,6 +836,7 @@ async def _emit_skill_view_event(
     }
     await emitter.emit(
         "skill.loaded" if file_path == "SKILL.md" else "skill.file.loaded",
+        turn=turn,
         **payload,
     )
 

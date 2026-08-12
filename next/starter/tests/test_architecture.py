@@ -50,3 +50,17 @@ def test_starter_only_owns_the_asgi_composition_root() -> None:
     asgi_source = (STARTER_SRC / "asgi.py").read_text(encoding="utf-8")
     assert "from base_agent.server import create_http_app" in asgi_source
     assert "@app." not in asgi_source
+
+
+def test_cli_and_http_do_not_rebuild_the_agent_capability_policy() -> None:
+    app_source = (STARTER_SRC / "app.py").read_text(encoding="utf-8")
+    cli_source = (STARTER_SRC / "cli.py").read_text(encoding="utf-8")
+    asgi_source = (STARTER_SRC / "asgi.py").read_text(encoding="utf-8")
+
+    assert "STARTER_AGENT_DEFINITION = AgentDefinition(" in app_source
+    assert "definition: AgentDefinition = STARTER_AGENT_DEFINITION" in app_source
+    for source in (cli_source, asgi_source):
+        assert "AGENT_SKILLS" not in source
+        assert "AGENT_PERMISSIONS" not in source
+        assert "--grant-permission" not in source
+        assert "--enable-" not in source

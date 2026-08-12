@@ -47,4 +47,5 @@ class EventResponse(BaseModel):
     sequence: int
     kind: str
     run_id: str
+    turn: int | None
     payload: dict[str, Any]

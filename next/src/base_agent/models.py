@@ -183,6 +183,7 @@ class Event:
     kind: str
     run_id: str
     payload: Mapping[str, Any] = field(default_factory=dict)
+    turn: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))

@@ -127,6 +127,8 @@ async def test_http_replays_persisted_events_after_sequence_cursor() -> None:
     ]
     assert response.json()[1]["payload"]["content"] == "done"
     assert all(event["run_id"] == run_id for event in response.json())
+    assert [event["turn"] for event in response.json()] == [1, 1, 1]
+    assert all("turn" not in event["payload"] for event in response.json())
     assert all(isinstance(event["payload"], dict) for event in response.json())
 
 
@@ -170,6 +172,7 @@ async def test_sse_replays_and_resumes_with_query_and_last_event_id_cursors() ->
     assert '"content":"done"' in replay_text
     assert "id: 7\nevent: run.succeeded" in replay_text
     assert '"sequence":5' in replay_text
+    assert '"turn":1' in replay_text
     assert "id: 5" not in header_text
     assert "id: 6\nevent: message.completed" in header_text
     assert "id: 7\nevent: run.succeeded" in header_text
@@ -197,6 +200,7 @@ async def test_sse_follows_live_events_and_sends_periodic_ping() -> None:
     assert app.state.sse_ping_seconds == 1
     assert response.status_code == 200
     assert ": ping - " in response_text
+    assert '"turn":null' in response_text
     assert "id: 1\nevent: run.started" in response_text
     assert "id: 2\nevent: message.created" in response_text
     assert "id: 6\nevent: message.completed" in response_text
@@ -295,8 +299,10 @@ async def test_http_reports_when_event_store_cannot_stream() -> None:
             run_id: str,
             kind: str,
             payload: Mapping[str, Any] | None = None,
+            *,
+            turn: int | None = None,
         ) -> Event:
-            return await self.delegate.emit(run_id, kind, payload)
+            return await self.delegate.emit(run_id, kind, payload, turn=turn)
 
         async def list(
             self,

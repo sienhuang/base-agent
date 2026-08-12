@@ -1,16 +1,28 @@
 import json
+from dataclasses import replace
 
+import pytest
 from base_agent import RunStatus
 from base_agent.governance import AllowAllConfirmations
 from base_agent.models import ModelResponse, ToolCall, ToolResultStatus
 from base_agent.providers import ProviderInfo
 from base_agent.testing import FakeModel
 
-from agent_app.app import DIAGNOSTIC_TOOLKIT, build_agent, run
+from agent_app.app import (
+    ENABLED_PERMISSIONS,
+    ENABLED_SKILL_NAMES,
+    STARTER_AGENT_DEFINITION,
+    build_agent,
+    run,
+)
 from agent_app.config import Settings
 from agent_app.provider import OfflineProvider, build_provider
-from agent_app.skills import SKILL_CATALOG, VALUE_RECORDING_SKILL_NAME
-from agent_app.tools import check_browser_readiness
+from agent_app.skills import (
+    PYTHON_CALCULATOR_SKILL_NAME,
+    SKILL_CATALOG,
+    VALUE_RECORDING_SKILL_NAME,
+)
+from agent_app.tools import DIAGNOSTIC_TOOLKIT, ENABLED_TOOL_NAMES, check_browser_readiness
 
 
 def test_application_groups_diagnostic_tools_in_a_toolkit() -> None:
@@ -29,6 +41,22 @@ def test_application_registers_lightweight_skill_descriptors() -> None:
     assert all(not hasattr(item, "playbook") for item in SKILL_CATALOG.descriptors)
 
 
+def test_starter_definition_is_the_single_capability_policy() -> None:
+    assert STARTER_AGENT_DEFINITION.tools == ENABLED_TOOL_NAMES
+    assert STARTER_AGENT_DEFINITION.skills == ENABLED_SKILL_NAMES
+    assert STARTER_AGENT_DEFINITION.permissions == ENABLED_PERMISSIONS
+
+
+def test_application_rejects_unknown_enabled_skill() -> None:
+    with pytest.raises(ValueError, match="references unregistered Skills: missing-skill"):
+        build_agent(
+            definition=replace(
+                STARTER_AGENT_DEFINITION,
+                skills=("missing-skill",),
+            )
+        )
+
+
 async def test_default_offline_agent_runs_end_to_end() -> None:
     result = await run("hello")
 
@@ -36,13 +64,16 @@ async def test_default_offline_agent_runs_end_to_end() -> None:
     assert result.text == "Starter Agent received: hello"
     assert result.snapshot.agent_id == "starter-assistant"
     assert result.snapshot.model_name == "starter-offline"
-    assert result.snapshot.skill_names == ()
-    assert "## Skill:" not in result.snapshot.system_prompt
+    assert result.snapshot.skill_names == ENABLED_SKILL_NAMES
+    assert "# Available skills" in result.snapshot.system_prompt
     assert [spec.name for spec in result.snapshot.tool_specs] == [
-        "record_value",
+        "skill_view",
         "fail_operation",
         "slow_operation",
         "save_value",
+        "calculate_product",
+        "calculate_sum",
+        "record_value",
     ]
     assert "diagnostics" not in [spec.name for spec in result.snapshot.tool_specs]
 
@@ -81,9 +112,12 @@ async def test_recording_skill_composes_instructions_and_enables_tool() -> None:
 
     result = await run(
         "tool=record_value calls=1",
-        permissions=frozenset({"values:record"}),
-        max_model_turns=2,
-        enable_recording_skill=True,
+        definition=replace(
+            STARTER_AGENT_DEFINITION,
+            skills=(VALUE_RECORDING_SKILL_NAME,),
+            permissions=frozenset({"values:record"}),
+            max_model_turns=2,
+        ),
         stream=True,
         on_event=observed.append,
     )
@@ -116,9 +150,12 @@ async def test_recording_skill_composes_instructions_and_enables_tool() -> None:
 async def test_python_script_skill_auto_loads_tool_backed_by_script() -> None:
     result = await run(
         'tool=calculate_sum calls=1 tool_args={"left":2,"right":3}',
-        permissions=frozenset({"skills:scripts:execute"}),
-        max_model_turns=2,
-        enable_python_script_skill=True,
+        definition=replace(
+            STARTER_AGENT_DEFINITION,
+            skills=(PYTHON_CALCULATOR_SKILL_NAME,),
+            permissions=frozenset({"skills:scripts:execute"}),
+            max_model_turns=2,
+        ),
     )
 
     assert result.status is RunStatus.SUCCEEDED
@@ -161,9 +198,12 @@ async def test_python_calculator_skill_full_chain_loads_executes_and_answers() -
 
     result = await build_agent(
         model,
-        permissions=frozenset({"skills:scripts:execute"}),
-        max_model_turns=3,
-        enable_python_script_skill=True,
+        definition=replace(
+            STARTER_AGENT_DEFINITION,
+            skills=(PYTHON_CALCULATOR_SKILL_NAME,),
+            permissions=frozenset({"skills:scripts:execute"}),
+            max_model_turns=3,
+        ),
     ).run(
         "Use the python-calculator Skill to calculate 1 + 2.",
         on_event=observed_events.append,
@@ -191,8 +231,12 @@ async def test_python_calculator_skill_full_chain_loads_executes_and_answers() -
 async def test_python_script_skill_tool_enforces_execution_permission() -> None:
     result = await run(
         'tool=calculate_sum calls=1 tool_args={"left":2,"right":3}',
-        max_model_turns=2,
-        enable_python_script_skill=True,
+        definition=replace(
+            STARTER_AGENT_DEFINITION,
+            skills=(PYTHON_CALCULATOR_SKILL_NAME,),
+            permissions=frozenset(),
+            max_model_turns=2,
+        ),
     )
 
     assert result.tool_results[0].status is ToolResultStatus.DENIED
@@ -202,8 +246,12 @@ async def test_python_script_skill_tool_enforces_execution_permission() -> None:
 async def test_recording_skill_tool_enforces_permission() -> None:
     result = await run(
         'tool=record_value calls=1 tool_args={"value":1}',
-        max_model_turns=2,
-        enable_recording_skill=True,
+        definition=replace(
+            STARTER_AGENT_DEFINITION,
+            skills=(VALUE_RECORDING_SKILL_NAME,),
+            permissions=frozenset(),
+            max_model_turns=2,
+        ),
     )
 
     assert result.tool_results[0].status is ToolResultStatus.DENIED
@@ -215,8 +263,7 @@ async def test_streamed_tool_call_is_assembled_before_execution() -> None:
 
     result = await run(
         "tool=record_value calls=1",
-        permissions=frozenset({"values:record"}),
-        max_model_turns=2,
+        definition=replace(STARTER_AGENT_DEFINITION, max_model_turns=2),
         stream=True,
         on_event=observed.append,
     )
@@ -228,14 +275,18 @@ async def test_streamed_tool_call_is_assembled_before_execution() -> None:
     assert len(tool_call_deltas) == 2
     assert tool_call_deltas[0].payload["tool_call_id"] == "call-1"
     assert tool_call_deltas[0].payload["tool_name"] == "record_value"
+    assert {event.turn for event in tool_call_deltas} == {1}
     assert set(tool_call_deltas[0].payload) == {
-        "turn",
         "index",
         "tool_call_id",
         "tool_name",
         "argument_bytes",
     }
     assert sum(event.payload["argument_bytes"] for event in tool_call_deltas) == len(b'{"value":1}')
+    tool_events = [event for event in observed if event.kind.startswith("tool.")]
+    assert tool_events
+    assert {event.turn for event in tool_events} == {1}
+    assert all("turn" not in event.payload for event in tool_events)
     assert [event.kind for event in observed].index("tool.started") > [
         event.kind for event in observed
     ].index("model.tool_call.delta")
@@ -251,7 +302,10 @@ async def test_application_can_inject_a_deterministic_provider() -> None:
 
 
 async def test_prompt_asset_is_frozen_into_the_run_snapshot() -> None:
-    result = await run("inspect prompt")
+    result = await run(
+        "inspect prompt",
+        definition=replace(STARTER_AGENT_DEFINITION, skills=()),
+    )
 
     assert result.snapshot.system_prompt == (
         "Answer the user's request clearly and briefly.\n"
@@ -268,9 +322,10 @@ async def test_prompt_asset_is_frozen_into_the_run_snapshot() -> None:
 async def test_agent_app_prompt_triggers_the_per_turn_tool_limit() -> None:
     result = await run(
         "Call record_value once per value. calls=3",
-        permissions=frozenset({"values:record"}),
-        max_model_turns=2,
-        max_tool_calls_per_turn=2,
+        definition=replace(
+            STARTER_AGENT_DEFINITION,
+            max_tool_calls_per_turn=2,
+        ),
     )
 
     assert result.status is RunStatus.SUCCEEDED
@@ -309,8 +364,6 @@ async def test_observations_are_json_and_match_tool_calls() -> None:
     result = await run(
         "record two values",
         model=model,
-        permissions=frozenset({"values:record"}),
-        max_model_turns=2,
     )
 
     assert result.status is RunStatus.SUCCEEDED
@@ -339,8 +392,6 @@ async def test_observations_are_json_and_match_tool_calls() -> None:
 async def test_offline_provider_can_show_observation_contract() -> None:
     result = await run(
         "tool=record_value calls=2 show_observations=true",
-        permissions=frozenset({"values:record"}),
-        max_model_turns=2,
     )
 
     assert result.status is RunStatus.SUCCEEDED
@@ -371,7 +422,10 @@ async def test_offline_provider_can_show_observation_contract() -> None:
 async def test_agent_app_denies_tool_without_permission() -> None:
     result = await run(
         "Call record_value once. calls=1",
-        max_model_turns=2,
+        definition=replace(
+            STARTER_AGENT_DEFINITION,
+            permissions=frozenset(),
+        ),
     )
 
     assert result.status is RunStatus.SUCCEEDED
@@ -383,13 +437,14 @@ async def test_agent_app_denies_tool_without_permission() -> None:
     assert result.tool_results[0].data is None
     assert "missing permissions: values:record" in (result.tool_results[0].error or "")
     assert "tool.started" not in [event.kind for event in result.events]
+    completed = next(event for event in result.events if event.kind == "tool.completed")
+    assert completed.turn == 1
+    assert "turn" not in completed.payload
 
 
 async def test_agent_app_executes_tool_with_granted_permission() -> None:
     result = await run(
         "Call record_value once. calls=1",
-        permissions=frozenset({"values:record"}),
-        max_model_turns=2,
     )
 
     assert result.status is RunStatus.SUCCEEDED
@@ -399,7 +454,7 @@ async def test_agent_app_executes_tool_with_granted_permission() -> None:
     )
     assert result.tool_results[0].status is ToolResultStatus.SUCCESS
     assert result.tool_results[0].data == 1
-    assert result.snapshot.permissions == frozenset({"values:record"})
+    assert result.snapshot.permissions == ENABLED_PERMISSIONS
     assert "tool.started" in [event.kind for event in result.events]
 
 
@@ -413,8 +468,6 @@ async def test_agent_app_rejects_invalid_tool_arguments_before_execution() -> No
     for prompt_text in prompts:
         result = await run(
             prompt_text,
-            permissions=frozenset({"values:record"}),
-            max_model_turns=2,
         )
 
         assert result.status is RunStatus.SUCCEEDED
@@ -432,7 +485,11 @@ async def test_agent_app_rejects_invalid_tool_arguments_before_execution() -> No
 
 async def test_record_value_schema_is_exposed_to_the_provider() -> None:
     result = await run("inspect schema")
-    schema = result.snapshot.tool_specs[0].input_schema
+    schema = next(
+        spec.input_schema
+        for spec in result.snapshot.tool_specs
+        if spec.name == "record_value"
+    )
 
     assert schema["properties"]["value"]["type"] == "integer"
     assert schema["required"] == ["value"]
@@ -442,7 +499,6 @@ async def test_record_value_schema_is_exposed_to_the_provider() -> None:
 async def test_agent_app_converts_tool_exception_into_error_observation() -> None:
     result = await run(
         'tool=fail_operation calls=1 tool_args={"message":"expected failure"}',
-        max_model_turns=2,
     )
 
     assert result.status is RunStatus.SUCCEEDED
@@ -466,7 +522,6 @@ async def test_agent_app_converts_tool_exception_into_error_observation() -> Non
 async def test_agent_app_converts_tool_timeout_into_observation() -> None:
     result = await run(
         'tool=slow_operation calls=1 tool_args={"delay_seconds":0.2}',
-        max_model_turns=2,
     )
 
     assert result.status is RunStatus.SUCCEEDED
@@ -490,8 +545,6 @@ async def test_agent_app_converts_tool_timeout_into_observation() -> None:
 async def test_agent_app_denies_unconfirmed_side_effect() -> None:
     result = await run(
         'tool=save_value calls=1 tool_args={"value":7}',
-        permissions=frozenset({"values:write"}),
-        max_model_turns=2,
     )
 
     assert result.status is RunStatus.SUCCEEDED
@@ -504,6 +557,8 @@ async def test_agent_app_denies_unconfirmed_side_effect() -> None:
     assert result.tool_results[0].error == ("Tool execution was not confirmed")
     events = result.events
     confirmation = next(event for event in events if event.kind == "tool.confirmation")
+    assert confirmation.turn == 1
+    assert "turn" not in confirmation.payload
     assert confirmation.payload["approved"] is False
     assert "tool.started" not in [event.kind for event in events]
 
@@ -511,8 +566,6 @@ async def test_agent_app_denies_unconfirmed_side_effect() -> None:
 async def test_agent_app_executes_explicitly_confirmed_side_effect() -> None:
     result = await run(
         'tool=save_value calls=1 tool_args={"value":7}',
-        permissions=frozenset({"values:write"}),
-        max_model_turns=2,
         confirmation_policy=AllowAllConfirmations(),
     )
 
@@ -525,9 +578,11 @@ async def test_agent_app_executes_explicitly_confirmed_side_effect() -> None:
     assert result.tool_results[0].data == 7
     events = result.events
     confirmation = next(event for event in events if event.kind == "tool.confirmation")
+    assert confirmation.turn == 1
     assert confirmation.payload["approved"] is True
     assert "tool.started" in [event.kind for event in events]
     completed = [event for event in events if event.kind == "tool.completed"]
+    assert {event.turn for event in completed} == {1}
     assert completed[-1].payload["status"] == "success"
 
 
@@ -538,7 +593,6 @@ async def test_registered_but_disabled_tool_is_not_found(
 
     result = await run(
         'tool=browse calls=1 tool_args={"url":"https://example.com"}',
-        max_model_turns=2,
     )
 
     assert result.status is RunStatus.SUCCEEDED
@@ -580,7 +634,10 @@ async def test_opt_in_browser_tool_fails_before_model_when_not_ready(
 
     result = await build_agent(
         model,
-        enable_browser_tool=True,
+        definition=replace(
+            STARTER_AGENT_DEFINITION,
+            tools=(*STARTER_AGENT_DEFINITION.tools, "browse"),
+        ),
     ).run("test browser readiness")
 
     assert result.status is RunStatus.FAILED
@@ -610,7 +667,10 @@ async def test_opt_in_browser_tool_allows_run_when_ready(
 
     result = await build_agent(
         model,
-        enable_browser_tool=True,
+        definition=replace(
+            STARTER_AGENT_DEFINITION,
+            tools=(*STARTER_AGENT_DEFINITION.tools, "browse"),
+        ),
     ).run("test browser readiness")
 
     assert result.status is RunStatus.SUCCEEDED

@@ -175,8 +175,9 @@ async def test_skill_package_contributes_owned_tool_and_resource_inventory(
         "skill.resource.used",
     ]
     assert skill_events[0].payload["skill_name"] == "calculation"
+    assert skill_events[0].turn is None
+    assert skill_events[1].turn == 1
     assert skill_events[1].payload == {
-        "turn": 1,
         "skill_name": "calculation",
         "skill_version": "1.0.0",
         "package_fingerprint": skill_snapshot.package_fingerprint,
@@ -273,8 +274,8 @@ async def test_skill_catalog_exposes_descriptors_and_skill_view_loads_playbook(
         "skill.selected",
         "skill.loaded",
     ]
+    assert skill_events[1].turn == 1
     assert skill_events[1].payload == {
-        "turn": 1,
         "skill_name": "evidence-review",
         "skill_version": "1.0.0",
         "package_fingerprint": descriptor.package_fingerprint,
@@ -635,6 +636,8 @@ async def test_minimal_agent_freezes_snapshot_and_emits_ordered_events() -> None
     assert result.snapshot.system_prompt == "Answer briefly."
     assert len(result.snapshot.fingerprint) == 64
     assert [event.sequence for event in result.events] == list(range(1, len(result.events) + 1))
+    assert [event.turn for event in result.events] == [None, None, None, 1, 1, 1, 1]
+    assert all("turn" not in event.payload for event in result.events)
     assert observed == [event.kind for event in result.events]
     assert per_run_observed == list(result.events)
     assert model.requests[0].system_prompt == result.snapshot.system_prompt
@@ -769,6 +772,10 @@ async def test_agent_stream_fails_when_completed_text_mismatches_deltas() -> Non
         "model.failed",
         "run.failed",
     ]
+    assert {event.turn for event in observed if event.kind in {"model.failed", "run.failed"}} == {
+        1
+    }
+    assert all("turn" not in event.payload for event in observed)
 
 
 async def test_skill_enables_tool_and_harness_executes_model_tool_loop() -> None:
@@ -894,8 +901,8 @@ async def test_harness_executes_only_the_first_tool_calls_per_model_turn() -> No
     assert result.snapshot.max_model_turns == 2
     assert result.snapshot.max_tool_calls_per_turn == 3
     limited = [event for event in result.events if event.kind == "tool.batch_limited"]
+    assert limited[0].turn == 1
     assert limited[0].payload == {
-        "turn": 1,
         "requested": 5,
         "accepted": 3,
         "skipped": 2,

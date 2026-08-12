@@ -25,6 +25,8 @@ class InMemoryEventStore:
         run_id: str,
         kind: str,
         payload: Mapping[str, Any] | None = None,
+        *,
+        turn: int | None = None,
     ) -> Event:
         async with self._changed:
             events = self._events[run_id]
@@ -33,6 +35,7 @@ class InMemoryEventStore:
                 kind=kind,
                 run_id=run_id,
                 payload=payload or {},
+                turn=turn,
             )
             events.append(event)
             self._changed.notify_all()

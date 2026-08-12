@@ -121,7 +121,7 @@ SSE 帧把 `Event.sequence` 同时作为 `id` 和断线续传游标：
 ```text
 id: 7
 event: run.succeeded
-data: {"sequence":7,"kind":"run.succeeded","run_id":"...","payload":{...}}
+data: {"sequence":7,"kind":"run.succeeded","run_id":"...","turn":1,"payload":{...}}
 ```
 
 客户端可用 `?after_sequence=5`、`?last_event_id=5` 或 `Last-Event-ID: 5` 只接收 sequence

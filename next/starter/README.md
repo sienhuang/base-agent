@@ -67,6 +67,10 @@ cp next/starter/.env.example next/starter/.env
 占位配置。若既没有 `.env` 也没有相关进程环境变量，Starter 才会回退到
 OfflineProvider。
 
+`.env` 只配置 Provider 和基础设施，不定义 Agent 能力。普通 Tool、Skill、权限和执行预算统一
+收敛在 `app.py` 的 `STARTER_AGENT_DEFINITION`；CLI 与 HTTP 都调用同一个 `build_agent()`，
+不能分别改变能力白名单。
+
 ## 运行
 
 ```bash
@@ -127,8 +131,9 @@ curl -N -H 'Last-Event-ID: 3' \
 
 空闲 SSE 默认每 15 秒发送 comment 心跳。心跳不写入 EventStore，也不改变事件游标。
 
-HTTP 服务和 CLI 使用同一份 `.env` 配置。模板选择 `openai-compatible`，需要配置
-`AGENT_MODEL`、`OPENAI_API_KEY`，连接非 OpenAI 服务时再设置 `OPENAI_BASE_URL`。
+HTTP 服务和 CLI 使用同一份 `.env` Provider 配置。模板选择 `openai-compatible`，需要配置
+`AGENT_MODEL`、`OPENAI_API_KEY`，连接非 OpenAI 服务时再设置 `OPENAI_BASE_URL`；Agent 能力
+始终来自同一份 `STARTER_AGENT_DEFINITION`。
 
 ## 测试 Model Streaming
 
@@ -153,8 +158,6 @@ ToolResult、验证证据和最终文本不会因为 streaming 丢失。
 ```bash
 uv run --project next/starter agent-app \
   --stream \
-  --grant-permission values:record \
-  --max-model-turns 2 \
   --show-tool-results \
   'tool=record_value calls=1'
 ```
@@ -174,35 +177,15 @@ Harness 对文本发布 `message.delta`；对 ToolCall 分片只发布 index、T
 
 ### Skill 自带 Tool
 
-Starter 默认仍直接注册 `record_value`，以保留 Step 02 的测试。增加
-`--enable-recording-skill` 后，应用不再注册这个 Tool，改由 `value-recording` Skill
-自动贡献；Tool 调用 Skill 包内的 `scripts/record.py`，同时 Skill 组合自己的
-playbook。受信任 Loader 自动收集 `tools.py` 中的 `record_value`，Package Loader
-同时把 `scripts/record.py` 记入包清单。`values:record` 由 Tool 自己声明。
+`STARTER_AGENT_DEFINITION` 选择 `value-recording`；Agent 因此自动加入 Skill 贡献的
+`record_value`，应用不再直接注册它。Tool 调用 Skill 包内的 `scripts/record.py`。受信任
+Loader 自动收集 `tools.py` 中的 Tool，Package Loader 同时把 script 记入包清单；Definition
+显式授予 `values:record`，而不是从 Tool 声明反向推导权限。
 
-先验证未授权时具体 ToolCall 被 Harness 拒绝：
-
-```bash
-uv run --project next/starter agent-app \
-  --enable-recording-skill \
-  --max-model-turns 2 \
-  --show-tool-results \
-  'tool=record_value calls=1 tool_args={"value":1}'
-```
-
-预期输出：
-
-```text
-call-1: status=denied, data=None, error='missing permissions: values:record'
-```
-
-再授予权限，验证 Skill 提供的 Tool、流式 ToolCall 和最终结果：
+验证 Skill 提供的 Tool、流式 ToolCall 和最终结果：
 
 ```bash
 uv run --project next/starter agent-app \
-  --enable-recording-skill \
-  --grant-permission values:record \
-  --max-model-turns 2 \
   --stream \
   --show-tool-results \
   'tool=record_value calls=1'
@@ -224,9 +207,6 @@ call-1: status=success, data=1
 
 ```bash
 uv run --project next/starter agent-app \
-  --enable-recording-skill \
-  --grant-permission values:record \
-  --max-model-turns 2 \
   --show-execution-trace \
   --show-tool-results \
   'tool=skill_view calls=1 tool_args={"name":"value-recording"}'
@@ -241,23 +221,11 @@ Trace 中应先出现 `skill.selected`，成功执行 `skill_view` 后才出现
 `python-calculator` 的 `tools.py` 声明 `calculate_sum` 和 `calculate_product`，它们内部导入
 `scripts/calculate.py`。模型只看到类型化 Tool，不选择文件路径，也不直接操作子进程。
 
-先验证缺少执行权限时 ToolCall 返回 `denied`：
+`STARTER_AGENT_DEFINITION` 同时选择 `python-calculator` 并显式授予
+`skills:scripts:execute`。验证执行：
 
 ```bash
 uv run --project next/starter agent-app \
-  --enable-python-script-skill \
-  --max-model-turns 2 \
-  --show-tool-results \
-  'tool=calculate_sum calls=1 tool_args={"left":2,"right":3}'
-```
-
-再授权执行：
-
-```bash
-uv run --project next/starter agent-app \
-  --enable-python-script-skill \
-  --grant-permission skills:scripts:execute \
-  --max-model-turns 2 \
   --show-execution-trace \
   --show-tool-results \
   'tool=calculate_sum calls=1 tool_args={"left":2,"right":3}'
@@ -281,6 +249,10 @@ call-1: status=success, data={'sum': 5}
 不等待 Run 结束后遍历 `RunResult.events`；模型正文和 ToolResult 写入 stdout。真实 Provider
 生成的 ToolCall ID 不保证是 `call-1`。
 
+Skill 贡献的 Tool 不需要再写入 `AgentDefinition.tools`；Definition 只选择 Skill，Agent
+根据 Catalog 自动加入对应 Tool。缺少权限、未选择 Skill 等反例通过复制 Definition 的
+单元测试验证，不给 CLI 或 HTTP 增加修改生产能力策略的入口。
+
 该 Tool 通过普通 Python import 复用 Package Script 的函数。如果未来确实需要模型直接
 选择 Script 路径，再单独使用 SDK 的高级 `SkillScriptExecution` 适配器。
 
@@ -298,24 +270,20 @@ DIAGNOSTIC_TOOLKIT = Toolkit.of(
     slow_operation,
 )
 
-Agent(
-    ...,
-    tools=(
-        record_value,
-        DIAGNOSTIC_TOOLKIT,
-        save_value,
-        browse,
-    ),
+REGISTERED_TOOLS = (DIAGNOSTIC_TOOLKIT, save_value, browse)
+ENABLED_TOOLS = (DIAGNOSTIC_TOOLKIT, save_value)
+ENABLED_TOOL_NAMES = tuple(
+    tool.spec.name for tool in flatten_tools(ENABLED_TOOLS)
 )
 ```
 
 Harness 会把 Toolkit 展开成 `fail_operation` 和 `slow_operation`。模型看到和调用的仍然是
-具体 Tool 名称，不会看到名为 `diagnostics` 的 Tool。可以复用异常命令验证 Toolkit 中的
+具体 Tool 名称，不会看到名为 `diagnostics` 的 Tool。`record_value` 和 calculator Tool 由
+所选 Skill 自动贡献，不放入普通 `REGISTERED_TOOLS`。可以复用异常命令验证 Toolkit 中的
 Tool 能正常执行：
 
 ```bash
 uv run --project next/starter agent-app \
-  --max-model-turns 2 \
   --show-tool-results \
   'tool=fail_operation calls=1 tool_args={"message":"expected failure"}'
 ```
@@ -340,8 +308,6 @@ OfflineProvider 的确定性测试标记可以显示 Provider 实际收到的 Ob
 
 ```bash
 uv run --project next/starter agent-app \
-  --grant-permission values:record \
-  --max-model-turns 2 \
   'tool=record_value calls=2 show_observations=true'
 ```
 
@@ -379,17 +345,9 @@ async def browse(url: str) -> str:
     return f"Browser is ready for {url}"
 ```
 
-`browse` 默认不在 Agent Profile 中启用，因此不会影响普通 Starter 运行。使用
-`--enable-browser-tool` 才会把它加入本次 Agent 的已启用 Tool：
-
-```bash
-STARTER_BROWSER_EXECUTABLE=definitely-missing-starter-browser \
-uv run --project next/starter agent-app \
-  --enable-browser-tool \
-  "test browser readiness"
-```
-
-预期在调用模型之前失败：
+`browse` 位于 `REGISTERED_TOOLS`，但不在 `ENABLED_TOOLS`，因此不会影响 CLI 或 HTTP。
+readiness 的失败与成功分支通过复制 `STARTER_AGENT_DEFINITION`、仅在单元测试中加入
+`browse` 来验证。依赖缺失时会在调用模型之前失败：
 
 ```text
 error: Tool 'browse' is not ready: browser executable 'definitely-missing-starter-browser' was not found
@@ -406,7 +364,6 @@ ToolResult。测试就绪分支时，将 `STARTER_BROWSER_EXECUTABLE` 指向真�
 
 ```bash
 uv run --project next/starter agent-app \
-  --max-model-turns 2 \
   --show-tool-results \
   'tool=browse calls=1 tool_args={"url":"https://example.com"}'
 ```
@@ -432,28 +389,10 @@ async def record_value(value: int) -> int:
     return value
 ```
 
-不授予权限时：
+`STARTER_AGENT_DEFINITION` 显式授予 `values:record`，因此 CLI 与 HTTP 都可以执行：
 
 ```bash
 uv run --project next/starter agent-app \
-  --max-model-turns 2 \
-  --show-tool-results \
-  "Call record_value once. calls=1"
-```
-
-预期 Tool 不会开始执行：
-
-```text
-executed=0, not_found=0, denied=1, confirmation_denied=0, invalid_arguments=0, error=0, timeout=0, limit_exceeded=0
-call-1: status=denied, data=None, error='missing permissions: values:record'
-```
-
-显式授予权限：
-
-```bash
-uv run --project next/starter agent-app \
-  --grant-permission values:record \
-  --max-model-turns 2 \
   --show-tool-results \
   "Call record_value once. calls=1"
 ```
@@ -465,8 +404,8 @@ executed=1, not_found=0, denied=0, confirmation_denied=0, invalid_arguments=0, e
 call-1: status=success, data=1
 ```
 
-`--grant-permission` 可以重复使用。权限会进入 `AgentDefinition.permissions` 和本次
-`HarnessSnapshot`；它不会进入 Prompt，也不会传给 Provider。
+权限会进入 `HarnessSnapshot`，但不会进入 Prompt 或发送给 Provider。未授权拒绝路径通过
+单元测试复制 Definition 并清空权限来验证；CLI 和 HTTP 不提供临时扩权或降权入口。
 
 ## 测试 Tool 参数校验
 
@@ -477,8 +416,6 @@ integer，并拒绝额外字段。
 
 ```bash
 uv run --project next/starter agent-app \
-  --grant-permission values:record \
-  --max-model-turns 2 \
   --show-tool-results \
   'Call record_value once. calls=1 tool_args={"value":"abc"}'
 ```
@@ -495,15 +432,11 @@ call-1: status=invalid_arguments, data=None, error='...valid integer...'
 ```bash
 # 缺少 value
 uv run --project next/starter agent-app \
-  --grant-permission values:record \
-  --max-model-turns 2 \
   --show-tool-results \
   'Call record_value once. calls=1 tool_args={}'
 
 # 存在额外字段
 uv run --project next/starter agent-app \
-  --grant-permission values:record \
-  --max-model-turns 2 \
   --show-tool-results \
   'Call record_value once. calls=1 tool_args={"value":1,"extra":true}'
 ```
@@ -541,7 +474,6 @@ async def fail_operation(message: str) -> str:
 
 ```bash
 uv run --project next/starter agent-app \
-  --max-model-turns 2 \
   --show-tool-results \
   'tool=fail_operation calls=1 tool_args={"message":"expected failure"}'
 ```
@@ -574,7 +506,6 @@ async def slow_operation(delay_seconds: float) -> str:
 
 ```bash
 uv run --project next/starter agent-app \
-  --max-model-turns 2 \
   --show-tool-results \
   'tool=slow_operation calls=1 tool_args={"delay_seconds":0.2}'
 ```
@@ -604,12 +535,10 @@ async def save_value(value: int) -> int:
     return value
 ```
 
-先授予权限，但不确认本次副作用：
+Definition 已授予 `values:write`，但默认 ConfirmationPolicy 仍拒绝本次副作用：
 
 ```bash
 uv run --project next/starter agent-app \
-  --grant-permission values:write \
-  --max-model-turns 2 \
   --show-tool-results \
   'tool=save_value calls=1 tool_args={"value":7}'
 ```
@@ -621,44 +550,22 @@ executed=0, not_found=0, denied=0, confirmation_denied=1, invalid_arguments=0, e
 call-1: status=confirmation_denied, data=None, error='Tool execution was not confirmed'
 ```
 
-再对本次演示运行显式批准副作用：
-
-```bash
-uv run --project next/starter agent-app \
-  --grant-permission values:write \
-  --approve-side-effects \
-  --max-model-turns 2 \
-  --show-tool-results \
-  'tool=save_value calls=1 tool_args={"value":7}'
-```
-
-预期：
-
-```text
-executed=1, not_found=0, denied=0, confirmation_denied=0, invalid_arguments=0, error=0, timeout=0, limit_exceeded=0
-call-1: status=success, data=7
-```
-
-`--grant-permission` 表示 Agent 有资格调用；`--approve-side-effects` 表示本次演示运行明确
-同意执行副作用。默认 ConfirmationPolicy 是拒绝，确认服务异常时同样 fail-closed。
-`--approve-side-effects` 使用允许全部确认的演示策略；生产应用应换成经过身份认证、针对
-单次 ToolCall 作出决定并保留审计记录的 ConfirmationPolicy。
+允许确认的分支通过向 `build_agent()` 注入测试 ConfirmationPolicy 验证。CLI 和当前 HTTP
+Adapter 不提供“全部批准”开关；生产应用应接入经过身份认证、针对单次 ToolCall 作出决定并
+保留审计记录的 ConfirmationPolicy。
 
 ## 测试每轮 ToolCall 上限
 
 仍然使用 Starter 的主入口 `agent-app`。下面的 Prompt 要求 Provider 在同一个 Model Turn
-返回 3 个 `record_value` ToolCall，而 Harness 只允许执行前 2 个：
+返回 4 个 `record_value` ToolCall，而统一 Definition 每轮只允许执行前 3 个：
 
 ```bash
 uv run --project next/starter agent-app \
-  --grant-permission values:record \
-  --max-model-turns 2 \
-  --max-tool-calls-per-turn 2 \
   --show-tool-results \
-  "Call record_value once per value in the same model turn. calls=3"
+  "Call record_value once per value in the same model turn. calls=4"
 ```
 
-离线 Provider 会读取 Prompt 中明确的 `calls=3`，因此该命令能够稳定验收 Harness；
+离线 Provider 会读取 Prompt 中明确的 `calls=4`，因此该命令能够稳定验收 Harness；
 但整个调用仍经过正常主路径：
 
 ```text
@@ -667,29 +574,27 @@ agent-app
   → AgentDefinition + record_value
   → Harness
   → OfflineProvider
-  → 3 个 ToolCall
-  → 每轮上限 2
+  → 4 个 ToolCall
+  → 每轮上限 3
 ```
 
 预期输出：
 
 ```text
-executed=2, not_found=0, denied=0, confirmation_denied=0, invalid_arguments=0, error=0, timeout=0, limit_exceeded=1
+executed=3, not_found=0, denied=0, confirmation_denied=0, invalid_arguments=0, error=0, timeout=0, limit_exceeded=1
 call-1: status=success, data=1
 call-2: status=success, data=2
-call-3: status=limit_exceeded, data=None, error='...max_tool_calls_per_turn=2'
+call-3: status=success, data=3
+call-4: status=limit_exceeded, data=None, error='...max_tool_calls_per_turn=3'
 ```
 
-使用真实 Codex CLI Provider 时，Prompt 直接要求模型一次返回 3 个 ToolCall：
+使用真实 Codex CLI Provider 时，Prompt 直接要求模型一次返回 4 个 ToolCall：
 
 ```bash
 uv run --project next/starter agent-app \
   --provider codex-cli \
-  --grant-permission values:record \
-  --max-model-turns 2 \
-  --max-tool-calls-per-turn 2 \
   --show-tool-results \
-  "In the same model turn, call record_value exactly 3 times with values 1, 2, and 3. Do not answer directly before calling all 3 Tools."
+  "In one model turn, call record_value exactly 4 times with values 1, 2, 3, and 4. Do not answer directly before calling all 4 Tools."
 ```
 
 `prompts/assistant.md` 也包含“同一轮返回全部 `record_value` 调用”的系统指令，可以直接
@@ -701,14 +606,12 @@ Harness，再用 API/CLI Provider 验收模型是否遵循 Prompt。
 ```python
 AgentDefinition(
     ...,
-    tools=("record_value",),
-    max_model_turns=2,
-    max_tool_calls_per_turn=2,
+    max_model_turns=10,
+    max_tool_calls_per_turn=3,
 )
 ```
 
-第一个 Model Turn 申请和执行 Tool；第二个也是最后一个 Model Turn 禁用 Tool，只根据全部
-Observation 生成总结。
+模型停止调用 Tool 后生成总结；如果耗尽十个回合，最后一个 Model Turn 固定禁用 Tool。
 
 ## 测试 OpenAI-compatible Provider
 
@@ -840,8 +743,9 @@ uv run --project next/starter mypy \
 11. `agent-app` 主路径只执行前 N 个 ToolCall；
 12. 超限 ToolCall 具有对应的 `limit_exceeded` ToolResult 和 Observation；
 13. 最终 Model Turn 禁用 Tool 并消费前一轮结果。
-14. 未授予 `values:record` 时 Tool 返回 `denied` 且不产生 `tool.started`；
-15. `--grant-permission values:record` 后同一个 ToolCall 才返回 `success`。
+14. 唯一 `STARTER_AGENT_DEFINITION` 显式选择 Tool、Skill 和权限；CLI/HTTP 不再二次拼装；
+15. 单元测试复制 Definition 并移除 `values:record` 后，Tool 返回 `denied` 且不产生
+    `tool.started`。
 16. `fail_operation` 抛出的异常被转换为 `error` ToolResult，产生
     `tool.started`/`tool.completed` 事件，且异常不会逃出 Harness。
 17. `slow_operation` 超时后返回 `timeout` ToolResult，产生

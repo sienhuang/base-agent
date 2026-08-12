@@ -17,6 +17,8 @@ class EventSink(Protocol):
         run_id: str,
         kind: str,
         payload: Mapping[str, Any] | None = None,
+        *,
+        turn: int | None = None,
     ) -> Event: ...
 
 

@@ -126,6 +126,7 @@ def _event_response(event: Event) -> EventResponse:
         sequence=event.sequence,
         kind=event.kind,
         run_id=event.run_id,
+        turn=event.turn,
         payload=dict(event.payload),
     )
 
