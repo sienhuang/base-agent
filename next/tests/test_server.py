@@ -88,7 +88,7 @@ async def test_http_starts_without_waiting_and_returns_completed_result() -> Non
         assert running.json() == {
             "run_id": run_id,
             "status": "running",
-            "event_count": 4,
+            "event_count": 5,
             "output": None,
             "text": None,
             "error": None,
@@ -100,7 +100,7 @@ async def test_http_starts_without_waiting_and_returns_completed_result() -> Non
     assert completed == {
         "run_id": run_id,
         "status": "succeeded",
-        "event_count": 7,
+        "event_count": 8,
         "output": "HTTP done",
         "text": "HTTP done",
         "error": None,
@@ -123,7 +123,7 @@ async def test_http_cancels_running_run_and_replays_terminal_event() -> None:
     expected = {
         "run_id": run_id,
         "status": "cancelled",
-        "event_count": 5,
+        "event_count": 6,
         "output": None,
         "text": "",
         "error": "run cancellation requested",
@@ -138,7 +138,7 @@ async def test_http_cancels_running_run_and_replays_terminal_event() -> None:
     assert terminal["turn"] == 1
     assert terminal["payload"] == {"reason": "run cancellation requested"}
     stream_text = stream.text.replace("\r\n", "\n")
-    assert "id: 5\nevent: run.cancelled" in stream_text
+    assert "id: 6\nevent: run.cancelled" in stream_text
 
 
 async def test_http_rejects_cancellation_for_unknown_or_completed_run() -> None:
@@ -162,11 +162,11 @@ async def test_http_replays_persisted_events_after_sequence_cursor() -> None:
 
         response = await client.get(
             f"/v1/runs/{run_id}/events",
-            params={"after_sequence": 4},
+            params={"after_sequence": 5},
         )
 
     assert response.status_code == 200
-    assert [event["sequence"] for event in response.json()] == [5, 6, 7]
+    assert [event["sequence"] for event in response.json()] == [6, 7, 8]
     assert [event["kind"] for event in response.json()] == [
         "model.responded",
         "message.completed",
@@ -187,24 +187,24 @@ async def test_sse_replays_and_resumes_with_query_and_last_event_id_cursors() ->
 
         replay = await client.get(
             f"/v1/runs/{run_id}/events/stream",
-            params={"after_sequence": 4},
+            params={"after_sequence": 5},
         )
         header_resume = await client.get(
             f"/v1/runs/{run_id}/events/stream",
-            headers={"Last-Event-ID": "5"},
+            headers={"Last-Event-ID": "6"},
         )
         query_resume = await client.get(
             f"/v1/runs/{run_id}/events/stream",
-            params={"last_event_id": "5"},
+            params={"last_event_id": "6"},
         )
         larger_cursor = await client.get(
             f"/v1/runs/{run_id}/events/stream",
-            params={"after_sequence": 5},
-            headers={"Last-Event-ID": "4"},
+            params={"after_sequence": 6},
+            headers={"Last-Event-ID": "5"},
         )
         exhausted = await client.get(
             f"/v1/runs/{run_id}/events/stream",
-            headers={"Last-Event-ID": "7"},
+            headers={"Last-Event-ID": "8"},
         )
 
     replay_text = replay.text.replace("\r\n", "\n")
@@ -214,15 +214,15 @@ async def test_sse_replays_and_resumes_with_query_and_last_event_id_cursors() ->
     assert replay.status_code == 200
     assert replay.headers["content-type"].startswith("text/event-stream")
     assert replay.headers["x-accel-buffering"] == "no"
-    assert "id: 5\nevent: model.responded" in replay_text
-    assert "id: 6\nevent: message.completed" in replay_text
+    assert "id: 6\nevent: model.responded" in replay_text
+    assert "id: 7\nevent: message.completed" in replay_text
     assert '"content":"done"' in replay_text
-    assert "id: 7\nevent: run.succeeded" in replay_text
-    assert '"sequence":5' in replay_text
+    assert "id: 8\nevent: run.succeeded" in replay_text
+    assert '"sequence":6' in replay_text
     assert '"turn":1' in replay_text
-    assert "id: 5" not in header_text
-    assert "id: 6\nevent: message.completed" in header_text
-    assert "id: 7\nevent: run.succeeded" in header_text
+    assert "id: 6" not in header_text
+    assert "id: 7\nevent: message.completed" in header_text
+    assert "id: 8\nevent: run.succeeded" in header_text
     assert query_text == header_text == larger_text
     assert exhausted.text == ""
 
@@ -250,8 +250,8 @@ async def test_sse_follows_live_events_and_sends_periodic_ping() -> None:
     assert '"turn":null' in response_text
     assert "id: 1\nevent: run.started" in response_text
     assert "id: 2\nevent: message.created" in response_text
-    assert "id: 6\nevent: message.completed" in response_text
-    assert "id: 7\nevent: run.succeeded" in response_text
+    assert "id: 7\nevent: message.completed" in response_text
+    assert "id: 8\nevent: run.succeeded" in response_text
 
 
 async def test_event_routes_validate_run_and_cursors() -> None:
@@ -377,7 +377,7 @@ async def test_http_reports_when_event_store_cannot_stream() -> None:
         stream = await client.get(f"/v1/runs/{run_id}/events/stream")
 
     assert history.status_code == 200
-    assert len(history.json()) == 7
+    assert len(history.json()) == 8
     assert stream.status_code == 501
     assert stream.json() == {
         "detail": "the configured EventStore does not support live subscriptions"
@@ -416,11 +416,11 @@ async def test_http_keeps_concurrent_run_events_isolated() -> None:
 
     first_events = await agent.event_store.list(first_run_id)
     second_events = await agent.event_store.list(second_run_id)
-    assert first_result["event_count"] == second_result["event_count"] == 7
+    assert first_result["event_count"] == second_result["event_count"] == 8
     assert {event.run_id for event in first_events} == {first_run_id}
     assert {event.run_id for event in second_events} == {second_run_id}
-    assert [event.sequence for event in first_events] == list(range(1, 8))
-    assert [event.sequence for event in second_events] == list(range(1, 8))
+    assert [event.sequence for event in first_events] == list(range(1, 9))
+    assert [event.sequence for event in second_events] == list(range(1, 9))
 
 
 async def test_http_exposes_harness_failure_as_terminal_run() -> None:
@@ -434,4 +434,4 @@ async def test_http_exposes_harness_failure_as_terminal_run() -> None:
 
     assert failed["error"] == "model request failed: provider unavailable"
     assert failed["output"] is None
-    assert failed["event_count"] == 6
+    assert failed["event_count"] == 7

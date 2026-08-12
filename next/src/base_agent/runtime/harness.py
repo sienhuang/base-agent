@@ -14,6 +14,14 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from base_agent.context import (
+    ContextBudget,
+    ContextInput,
+    ContextPolicy,
+    ContextPolicyError,
+    ContextView,
+    SystemContext,
+)
 from base_agent.definitions import AgentDefinition
 from base_agent.events import EventStore
 from base_agent.governance import (
@@ -21,6 +29,15 @@ from base_agent.governance import (
     ConfirmationPolicy,
     ConfirmationRequest,
     DenyConfirmations,
+)
+from base_agent.memory import (
+    MemoryObservation,
+    MemoryProvider,
+    MemoryRecallRequest,
+    MemoryRecord,
+    MemoryScope,
+    MemorySnapshot,
+    MemoryWriter,
 )
 from base_agent.models import (
     Event,
@@ -46,7 +63,7 @@ from base_agent.providers.errors import (
     InvalidProviderResponseError,
     ProviderError,
 )
-from base_agent.skills import Skill, SkillCatalog, SkillDescriptor
+from base_agent.skills import Skill
 from base_agent.skills.execution import skill_script_tool_name
 from base_agent.skills.loading import SKILL_VIEW_TOOL_NAME
 from base_agent.tools import Tool, flatten_tools
@@ -115,8 +132,14 @@ class Harness:
         model: ModelProvider,
         tools: tuple[Tool, ...],
         skills: tuple[Skill, ...],
-        skill_catalog: SkillCatalog,
         confirmation_policy: ConfirmationPolicy | None,
+        context_policy: ContextPolicy,
+        context_budget: ContextBudget,
+        system_context: SystemContext,
+        memory_provider: MemoryProvider,
+        memory_writer: MemoryWriter,
+        memory_recall_limit: int,
+        memory_recall_timeout_seconds: float,
         observers: Sequence[Observer],
         event_store: EventStore,
     ) -> None:
@@ -124,9 +147,20 @@ class Harness:
         self._model = model
         self._tools = tools
         self._skills = skills
-        self._skill_catalog = skill_catalog
         self._skill_resources_by_tool = _index_skill_resources(skills)
         self._confirmation_policy = confirmation_policy or DenyConfirmations()
+        self._context_policy = context_policy
+        self._context_policy_name = context_policy.name
+        self._context_budget = context_budget
+        self._system_context = system_context
+        self._memory_provider = memory_provider
+        self._memory_provider_name = memory_provider.name
+        self._memory_enabled = memory_provider.enabled
+        self._memory_writer = memory_writer
+        self._memory_writer_name = memory_writer.name
+        self._memory_write_enabled = memory_writer.enabled
+        self._memory_recall_limit = memory_recall_limit
+        self._memory_recall_timeout_seconds = memory_recall_timeout_seconds
         self._observers = tuple(observers)
         self._event_store = event_store
 
@@ -137,6 +171,7 @@ class Harness:
         stream: bool = False,
         on_event: Observer | None = None,
         run_id: str | None = None,
+        memory_scope: MemoryScope | None = None,
     ) -> RunResult:
         if not prompt.strip():
             raise ValueError("run prompt must not be blank")
@@ -146,6 +181,10 @@ class Harness:
             raise ValueError(
                 f"Provider '{self._model.info.name}' declares streaming but "
                 "does not implement stream()"
+            )
+        if (self._memory_enabled or self._memory_write_enabled) and memory_scope is None:
+            raise ValueError(
+                "enabled Memory requires an explicit MemoryScope"
             )
 
         resolved_run_id = run_id or str(uuid4())
@@ -158,9 +197,10 @@ class Harness:
             agent_version=snapshot.agent_version,
             snapshot_fingerprint=snapshot.fingerprint,
         )
+        user_message = Message.user(prompt, message_id=str(uuid4()))
         await emitter.emit(
             "message.created",
-            message_id=str(uuid4()),
+            message_id=user_message.message_id,
             role="user",
             content=prompt,
         )
@@ -180,7 +220,13 @@ class Harness:
                 error=readiness_error,
             )
 
-        messages: list[Message] = [Message.user(prompt)]
+        memory = await self._recall_memory(
+            prompt,
+            scope=memory_scope,
+            run_id=resolved_run_id,
+            emitter=emitter,
+        )
+        messages: list[Message] = [user_message]
         tool_results: list[ToolResult] = []
         observation_bytes = 0
         called_any_tool = False
@@ -195,19 +241,87 @@ class Harness:
                 called_any_tool=called_any_tool,
                 is_final_turn=is_final_turn,
             )
+            response_schema = _response_schema(self._definition)
+            context_input = ContextInput(
+                agent_id=snapshot.agent_id,
+                run_id=resolved_run_id,
+                model=snapshot.model_name,
+                system_context=self._system_context,
+                transcript=tuple(messages),
+                tools=request_tools,
+                response_schema=response_schema,
+                turn=turn,
+                budget=self._context_budget,
+                memory=memory,
+            )
+            try:
+                context_view = _select_context(
+                    self._context_policy,
+                    context_input,
+                    policy_name=self._context_policy_name,
+                )
+            except ContextPolicyError as exc:
+                error = f"context preparation failed: {exc}"
+                await emitter.emit(
+                    "context.failed",
+                    turn=turn,
+                    policy=self._context_policy_name,
+                    error_type=type(exc.__cause__ or exc).__name__,
+                )
+                return await self._failed(
+                    emitter,
+                    snapshot,
+                    error=error,
+                    failure=RunFailure(
+                        code="context_preparation_failed",
+                        message=error,
+                        details={"policy": self._context_policy_name},
+                    ),
+                    tool_results=tool_results,
+                    turn=turn,
+                )
+            trace = context_view.trace
+            await emitter.emit(
+                "context.prepared",
+                turn=turn,
+                policy=trace.policy,
+                source_system_prompt_fingerprint=(
+                    trace.source_system_prompt_fingerprint
+                ),
+                selected_system_prompt_fingerprint=(
+                    trace.selected_system_prompt_fingerprint
+                ),
+                system_prompt_changed=(
+                    trace.source_system_prompt_fingerprint
+                    != trace.selected_system_prompt_fingerprint
+                ),
+                selected_system_block_ids=trace.selected_system_block_ids,
+                source_message_count=trace.source_message_count,
+                selected_message_count=trace.selected_message_count,
+                omitted_message_count=trace.omitted_message_count,
+                omitted_tool_result_count=trace.omitted_tool_result_count,
+                selected_message_ids=trace.selected_message_ids,
+                omitted_message_ids=trace.omitted_message_ids,
+                memory_enabled=memory.enabled,
+                memory_provider=memory.provider,
+                memory_candidate_count=trace.memory_candidate_count,
+                selected_memory_ids=trace.selected_memory_ids,
+                estimated_input_tokens=trace.estimated_input_tokens,
+                max_input_tokens=self._context_budget.max_input_tokens,
+            )
             request = ModelRequest(
                 model=snapshot.model_name,
-                system_prompt=snapshot.system_prompt,
-                messages=tuple(messages),
+                system_prompt=context_view.system_prompt,
+                messages=context_view.messages,
                 tools=request_tools,
                 tool_choice=request_tool_choice,
-                response_schema=_response_schema(self._definition),
+                response_schema=response_schema,
             )
             await emitter.emit(
                 "model.requested",
                 turn=turn,
                 finalization=is_final_turn,
-                message_count=len(messages),
+                message_count=len(context_view.messages),
                 tool_count=len(request_tools),
             )
             started_at = monotonic()
@@ -284,6 +398,20 @@ class Harness:
                         evidence=evidence,
                         turn=turn,
                     )
+                await self._queue_memory_write(
+                    scope=memory_scope,
+                    run_id=resolved_run_id,
+                    messages=(
+                        *messages,
+                        Message.assistant(
+                            response_content,
+                            message_id=assistant_message_id,
+                        ),
+                    ),
+                    output=response_content,
+                    turn=turn,
+                    emitter=emitter,
+                )
                 await emitter.emit("run.succeeded", turn=turn)
                 return RunResult(
                     run_id=resolved_run_id,
@@ -309,6 +437,7 @@ class Harness:
             messages.append(
                 Message.assistant(
                     response.content or "",
+                    message_id=assistant_message_id,
                     tool_calls=response.tool_calls,
                 )
             )
@@ -364,7 +493,13 @@ class Harness:
                         tool_results=tool_results,
                         turn=turn,
                     )
-                messages.append(Message.tool_result(result.call, observation))
+                messages.append(
+                    Message.tool_result(
+                        result.call,
+                        observation,
+                        message_id=str(uuid4()),
+                    )
+                )
                 if (
                     result.status is ToolResultStatus.SUCCESS
                     and result.call.name == SKILL_VIEW_TOOL_NAME
@@ -448,10 +583,7 @@ class Harness:
         return completed.response
 
     def _create_snapshot(self) -> HarnessSnapshot:
-        system_prompt = _build_system_prompt(
-            self._definition,
-            self._skill_catalog.descriptors,
-        )
+        system_prompt = self._system_context.render()
         skill_snapshots = tuple(_skill_snapshot(skill) for skill in self._skills)
         tool_specs = (
             ()
@@ -490,8 +622,28 @@ class Harness:
                 for skill in skill_snapshots
             ],
             "system_prompt": system_prompt,
+            "system_context_blocks": [
+                {
+                    "id": block.id,
+                    "content": block.content,
+                    "required": block.required,
+                }
+                for block in self._system_context.blocks
+            ],
             "max_model_turns": self._definition.max_model_turns,
             "max_tool_calls_per_turn": (self._definition.max_tool_calls_per_turn),
+            "context_policy": self._context_policy_name,
+            "context_budget": {
+                "context_window_tokens": self._context_budget.context_window_tokens,
+                "reserved_output_tokens": self._context_budget.reserved_output_tokens,
+                "safety_margin_tokens": self._context_budget.safety_margin_tokens,
+            },
+            "memory_provider": self._memory_provider_name,
+            "memory_enabled": self._memory_enabled,
+            "memory_writer": self._memory_writer_name,
+            "memory_write_enabled": self._memory_write_enabled,
+            "memory_recall_limit": self._memory_recall_limit,
+            "memory_recall_timeout_seconds": self._memory_recall_timeout_seconds,
             "tool_specs": [
                 {
                     "description": spec.description,
@@ -520,6 +672,16 @@ class Harness:
             permissions=self._definition.permissions,
             max_model_turns=self._definition.max_model_turns,
             max_tool_calls_per_turn=(self._definition.max_tool_calls_per_turn),
+            context_policy=self._context_policy_name,
+            context_window_tokens=self._context_budget.context_window_tokens,
+            context_reserved_output_tokens=self._context_budget.reserved_output_tokens,
+            context_safety_margin_tokens=self._context_budget.safety_margin_tokens,
+            system_context_block_ids=self._system_context.block_ids,
+            required_system_context_block_ids=self._system_context.required_block_ids,
+            memory_provider=self._memory_provider_name,
+            memory_writer=self._memory_writer_name,
+            memory_recall_limit=self._memory_recall_limit,
+            memory_recall_timeout_seconds=self._memory_recall_timeout_seconds,
             fingerprint=fingerprint,
         )
 
@@ -544,6 +706,104 @@ class Harness:
                 return f"Tool '{tool.spec.name}' is not ready{detail}"
         await emitter.emit("run.ready", tool_count=len(self._tools))
         return None
+
+    async def _recall_memory(
+        self,
+        query: str,
+        *,
+        scope: MemoryScope | None,
+        run_id: str,
+        emitter: _EventEmitter,
+    ) -> MemorySnapshot:
+        if not self._memory_enabled:
+            return MemorySnapshot.disabled()
+        if scope is None:  # run() validates this before emitting Run facts.
+            raise RuntimeError("enabled Memory has no scope")
+
+        try:
+            async with asyncio.timeout(self._memory_recall_timeout_seconds):
+                records = await self._memory_provider.recall(
+                    MemoryRecallRequest(
+                        agent_id=self._definition.id,
+                        run_id=run_id,
+                        query=query,
+                        scope=scope,
+                        limit=self._memory_recall_limit,
+                    )
+                )
+            if not isinstance(records, tuple) or not all(
+                isinstance(record, MemoryRecord) for record in records
+            ):
+                raise TypeError("MemoryProvider.recall() must return tuple[MemoryRecord, ...]")
+            if len(records) > self._memory_recall_limit:
+                raise ValueError(
+                    "MemoryProvider returned more records than the requested recall limit"
+                )
+            memory = MemorySnapshot(
+                enabled=True,
+                provider=self._memory_provider_name,
+                scope=scope,
+                records=records,
+            )
+        except Exception as exc:
+            await emitter.emit(
+                "memory.recall.failed",
+                turn=1,
+                provider=self._memory_provider_name,
+                error_type=type(exc).__name__,
+            )
+            return MemorySnapshot(
+                enabled=True,
+                provider=self._memory_provider_name,
+                scope=scope,
+            )
+
+        await emitter.emit(
+            "memory.recalled",
+            turn=1,
+            provider=self._memory_provider_name,
+            candidate_count=len(memory.records),
+        )
+        return memory
+
+    async def _queue_memory_write(
+        self,
+        *,
+        scope: MemoryScope | None,
+        run_id: str,
+        messages: tuple[Message, ...],
+        output: str,
+        turn: int,
+        emitter: _EventEmitter,
+    ) -> None:
+        if not self._memory_write_enabled:
+            return
+        if scope is None:  # run() validates this before emitting Run facts.
+            raise RuntimeError("enabled Memory writer has no scope")
+        try:
+            self._memory_writer.enqueue(
+                MemoryObservation(
+                    agent_id=self._definition.id,
+                    run_id=run_id,
+                    scope=scope,
+                    messages=messages,
+                    output=output,
+                )
+            )
+        except Exception as exc:
+            await emitter.emit(
+                "memory.write.failed",
+                turn=turn,
+                writer=self._memory_writer_name,
+                error_type=type(exc).__name__,
+            )
+            return
+        await emitter.emit(
+            "memory.write.queued",
+            turn=turn,
+            writer=self._memory_writer_name,
+            message_count=len(messages),
+        )
 
     async def _execute_tool(
         self,
@@ -866,26 +1126,6 @@ class Harness:
         )
 
 
-def _build_system_prompt(
-    definition: AgentDefinition,
-    skills: Sequence[SkillDescriptor],
-) -> str:
-    sections = [definition.instructions.strip()]
-    if skills:
-        skill_lines = []
-        for skill in skills:
-            detail = f": {skill.description}" if skill.description else ""
-            skill_lines.append(f"- `{skill.name}` (version {skill.version}){detail}")
-        sections.append(
-            "# Available skills\n\n"
-            "The Skills below are available for this Run. Before following a "
-            "Skill, call `skill_view` with its name to load the complete "
-            "instructions. Load supporting files only when the playbook "
-            "requires them.\n\n" + "\n".join(skill_lines)
-        )
-    return "\n\n".join(sections)
-
-
 def _skill_snapshot(skill: Skill) -> SkillSnapshot:
     package = skill.package
     script_policy = skill.script_execution
@@ -943,6 +1183,129 @@ def _response_schema(definition: AgentDefinition) -> Mapping[str, Any] | None:
     if definition.response_model is None:
         return None
     return definition.response_model.model_json_schema()
+
+
+def _select_context(
+    policy: ContextPolicy,
+    context: ContextInput,
+    *,
+    policy_name: str,
+) -> ContextView:
+    try:
+        view = policy.select(context)
+    except Exception as exc:
+        raise ContextPolicyError(
+            f"policy '{policy_name}' raised {type(exc).__name__}: {exc}"
+        ) from exc
+
+    if not isinstance(view, ContextView):
+        raise ContextPolicyError(
+            f"policy '{policy_name}' must return ContextView, got {type(view).__name__}"
+        )
+    if view.trace.policy != policy_name:
+        raise ContextPolicyError(
+            f"policy trace name '{view.trace.policy}' does not match '{policy_name}'"
+        )
+    if view.trace.source_system_prompt_fingerprint != context.system_prompt_fingerprint:
+        raise ContextPolicyError(
+            "policy trace source_system_prompt_fingerprint does not match SystemContext"
+        )
+    try:
+        expected_system_prompt = context.system_context.render(
+            view.trace.selected_system_block_ids
+        )
+        expected_system_prompt_fingerprint = context.system_context.fingerprint(
+            view.trace.selected_system_block_ids
+        )
+    except ValueError as exc:
+        raise ContextPolicyError(f"invalid system context selection: {exc}") from exc
+    if view.system_prompt != expected_system_prompt:
+        raise ContextPolicyError(
+            "ContextView.system_prompt must be rendered from the selected SystemContext blocks"
+        )
+    if (
+        view.trace.selected_system_prompt_fingerprint
+        != expected_system_prompt_fingerprint
+    ):
+        raise ContextPolicyError(
+            "policy trace selected_system_prompt_fingerprint does not match ContextView"
+        )
+    if view.trace.source_message_count != len(context.transcript):
+        raise ContextPolicyError("policy trace source_message_count does not match transcript")
+    if view.trace.selected_message_count != len(view.messages):
+        raise ContextPolicyError("policy trace selected_message_count does not match ContextView")
+    if view.trace.omitted_message_count > len(context.transcript):
+        raise ContextPolicyError("policy trace omitted_message_count exceeds transcript")
+    selected_message_ids = tuple(
+        message.message_id for message in view.messages if message.message_id is not None
+    )
+    if view.trace.selected_message_ids != selected_message_ids:
+        raise ContextPolicyError("policy trace selected_message_ids does not match ContextView")
+    source_message_ids = tuple(
+        message.message_id for message in context.transcript if message.message_id is not None
+    )
+    if len(source_message_ids) == len(context.transcript):
+        source_id_set = set(source_message_ids)
+        selected_source_ids = source_id_set.intersection(view.trace.selected_message_ids)
+        omitted_id_set = set(view.trace.omitted_message_ids)
+        if not omitted_id_set.issubset(source_id_set):
+            raise ContextPolicyError("policy trace omitted_message_ids are not in transcript")
+        if selected_source_ids.intersection(omitted_id_set):
+            raise ContextPolicyError("policy trace selected and omitted Message ids overlap")
+        if selected_source_ids.union(omitted_id_set) != source_id_set:
+            raise ContextPolicyError("policy trace does not account for every source Message id")
+        if len(view.trace.omitted_message_ids) != view.trace.omitted_message_count:
+            raise ContextPolicyError(
+                "policy trace omitted_message_ids does not match omitted_message_count"
+            )
+    if view.trace.memory_candidate_count != len(context.memory.records):
+        raise ContextPolicyError("policy trace memory_candidate_count does not match Memory")
+    candidate_memory_ids = {record.id for record in context.memory.records}
+    if not set(view.trace.selected_memory_ids).issubset(candidate_memory_ids):
+        raise ContextPolicyError("policy selected a Memory id that was not recalled")
+    max_input_tokens = context.budget.max_input_tokens
+    if (
+        max_input_tokens is not None
+        and view.trace.estimated_input_tokens is not None
+        and view.trace.estimated_input_tokens > max_input_tokens
+    ):
+        raise ContextPolicyError(
+            "selected context exceeds max_input_tokens: "
+            f"{view.trace.estimated_input_tokens} > {max_input_tokens}"
+        )
+    _validate_context_messages(view.messages)
+    return view
+
+
+def _validate_context_messages(messages: tuple[Message, ...]) -> None:
+    if not messages:
+        raise ContextPolicyError("ContextView messages must not be empty")
+    if not any(message.role == "user" for message in messages):
+        raise ContextPolicyError("ContextView must retain a user message")
+
+    pending_tool_call_ids: set[str] = set()
+    for message in messages:
+        if message.role not in {"user", "assistant", "tool"}:
+            raise ContextPolicyError(
+                f"ContextView contains unsupported Message role '{message.role}'"
+            )
+        if pending_tool_call_ids:
+            if message.role != "tool" or message.tool_call_id not in pending_tool_call_ids:
+                raise ContextPolicyError(
+                    "ContextView split an assistant ToolCall from its Tool result group"
+                )
+            pending_tool_call_ids.remove(message.tool_call_id)
+            continue
+        if message.role == "tool":
+            raise ContextPolicyError("ContextView contains an orphan Tool result")
+        if message.role == "assistant" and message.tool_calls:
+            tool_call_ids = {call.id for call in message.tool_calls}
+            if len(tool_call_ids) != len(message.tool_calls):
+                raise ContextPolicyError("ContextView contains duplicate ToolCall ids")
+            pending_tool_call_ids = tool_call_ids
+
+    if pending_tool_call_ids:
+        raise ContextPolicyError("ContextView is missing one or more Tool results")
 
 
 async def _has_open_tool_event(emitter: _EventEmitter, tool_call_id: str) -> bool:

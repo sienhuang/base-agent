@@ -21,7 +21,7 @@ Observer 是 fail-open 的旁路消费者，不是可靠存储。EventStore 写�
 每个 Event 都有公共 envelope：`sequence`、`kind`、`run_id`、可选的 `turn` 和
 事件专属 `payload`。`turn` 是执行关联信息，不属于业务 payload：Run 初始化阶段的
 `run.started`、user `message.created`、`skill.selected`、`run.ready` 等事件为 `None`；
-模型回合内的 `model.*`、assistant `message.*`、`tool.*`、Skill 资源使用，以及在该回合
+模型回合内的 `context.*`、`model.*`、assistant `message.*`、`tool.*`、Skill 资源使用，以及在该回合
 结束的 `run.succeeded` / `run.failed` / `run.cancelled` 都记录从 1 开始的 turn。这样
 sequence 提供 Run 内总顺序，turn 则提供回合边界，回放消费者不需要从 payload 猜测事件
 归属。
@@ -72,12 +72,46 @@ Message 不使用第二条 Stream，而是作为同一条有序 Run Event Stream
 
 同一个 assistant 回合的 delta 和 completed 共享 `message_id`。`message.completed` 只表示该
 模型消息已经完整；Run 是否接受该输出仍由后续 `run.succeeded` / `run.failed` /
-`run.cancelled` 决定。消费者可以实时拼接 delta，但断线回放和最终展示必须以 completed
-的完整 `content` 为准。
+`run.cancelled` 决定。user/assistant Event 的 `message_id` 也与 Harness transcript 和后续
+ModelRequest 中对应的 `Message.message_id` 一致。消费者可以实时拼接 delta，但断线回放和
+最终展示必须以 completed 的完整 `content` 为准。
 
 Prompt 和模型正文可能包含敏感数据。生产 EventStore/SSE Adapter 必须在授权边界内使用，
 并在后续 payload policy 中支持保留期、加密、脱敏或禁止正文持久化；不能把 Event 自动写入
 普通应用日志。
+
+## Context Event
+
+每次构造 `ModelRequest` 前，Harness 都会从冻结的 SystemContext、原始 transcript 和可选
+MemorySnapshot 生成一次 request-only `ContextView`：
+
+- `context.prepared`：ContextPolicy 成功选择上下文，记录 Policy、source/selected Message
+  数量、被省略的 Message/Tool result 数量、source/selected system prompt 指纹、selected
+  system block ids、可选 token 估算和输入预算；
+- `context.failed`：Policy 抛出异常或返回无效 ContextView，随后以
+  `run.failed` 结束，对应的 `RunFailure.code` 为 `context_preparation_failed`。
+
+Context Event 不包含实际 Message 或召回的 Memory 正文。`context.prepared` 是选择过程的审计
+记录，不会进入模型 Message；真正发送给 Provider 的内容仍只存在于
+`ModelRequest.system_prompt/messages`。Policy 不能切断 assistant ToolCall 与对应 Tool
+result，也不能改写核心 system instructions、漏掉 required block 或加入未声明 system text；
+违反约束时 fail-closed，避免隐式回退为未裁剪历史。
+
+## Memory Event
+
+Memory 默认由 Disabled Provider/Writer 占位，不产生额外 Event。应用显式启用并提供
+`MemoryScope` 后：
+
+- `memory.recalled`：每个 Run 最多一次，记录 Provider 和候选数量；
+- `memory.recall.failed`：Provider 异常或返回无效/越界候选，Memory 使用同 scope 的空快照，
+  Run 继续执行；
+- `memory.write.queued`：成功 Run 的完整 Message transcript 已交给非阻塞 Writer 队列；
+- `memory.write.failed`：Writer 拒绝入队，Run 仍保持成功。
+
+Memory Event 不记录 scope namespace、query、Memory content 或最终 transcript。被 ContextPolicy
+选中的 Memory 只以 opaque id 出现在 `context.prepared.selected_memory_ids` 中。持久 Writer
+后续必须自己实现后台队列、顺序、重试、关闭和租户隔离；Harness 不在响应热路径直接等待
+Redis、PostgreSQL、embedding 或摘要模型。
 
 ## HTTP JSON 与 SSE
 

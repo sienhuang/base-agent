@@ -44,6 +44,8 @@ Flow.sequence(...)
 | `agent.py` | 普通应用的 Agent 门面 | 是 |
 | `run_handle.py` | 进程内后台 Run 等待、状态、事件回放和实时订阅 | 是 |
 | `events/` | EventStore/EventStream 契约和默认内存事实源 | 扩展 API |
+| `context/` | 每次 Model Request 的只读上下文投影、预算和选择契约 | 扩展 API |
+| `memory/` | 显式作用域的长期 Memory recall 与非阻塞写入队列契约 | 扩展 API |
 | `server/` | 可选 FastAPI Run 提交、状态查询和进程内 Handle registry | 否 |
 | `flows/` | Stage 和简单 SequentialFlow | 是 |
 | `runtime/` | snapshot、model/tool loop、结果边界 | 否 |
@@ -91,7 +93,42 @@ base_agent facade ──> runtime Harness
 8. 结构化输出验证产生 Evidence；
 9. Stage 失败或验证失败时，SequentialFlow 不继续下一个 Stage。
 
-Skill Package 的额外不变量：
+### 4.1 Flow Stage 拆分边界标准
+
+默认使用单 Agent。Stage 表示由应用控制的独立 Run 边界，不表示单个 ToolCall，也不要求由
+不同 Agent 执行；同一个 Agent 可以执行多个 Stage。拆分 Stage 必须同时满足两个条件：
+
+1. 任务中存在两个或更多可以独立完成、独立返回结果的推理或执行单元，每个单元都值得启动
+   一次独立 Agent Run；
+2. Host 必须在这些 Run 之间建立至少一个以下实质边界：
+
+   - **职责和控制边界**：应用必须固定执行顺序，不能把下一步完全交给模型动态决定；
+   - **能力和治理边界**：Tool、Skill、权限、副作用确认策略或数据访问范围需要不同；
+   - **上下文边界**：下一阶段不应继承上一阶段的完整消息和 Tool observation，只接收有限交接；
+   - **验证检查点边界**：Host 验证结果必须成为后续独立 Run 的强制前置条件，或者形成可复用、
+     可恢复的 Artifact 检查点；
+   - **模型和预算边界**：阶段需要不同 Provider、模型、Token/ToolCall 预算或超时；
+   - **失败和恢复边界**：需要独立取消、重试、人工确认、幂等检查点或从已完成阶段恢复；
+   - **审计边界**：必须单独记录某项产物由哪个执行单元生成、验证和交接。
+
+验证本身不自动产生 Stage。验证只是同一 Run 推理过程的一部分时，可以由 Agent 调用验证 Tool；
+验证只约束单个 Run 的最终输出时，可以由 Harness 的结构化输出校验或终态 verifier 执行。只有
+验证需要在两个独立 Run 之间形成 Host 强制门禁时，才属于 Stage 拆分依据。
+
+以下情况不得仅为了形式上的“多步骤”拆 Stage：
+
+- 相同 Agent、上下文、能力、权限、模型和失败语义下的一组动态 ToolCall，应留在一个
+  model/tool loop 内；
+- 一个确定性的机械步骤只调用一个 Tool 时，应优先由普通应用代码直接编排；
+- 仅仅需要检查中间产物，且验证可以在同一 Run 内由确定性代码、Tool 或终态 verifier 完成，
+  不构成 Stage 拆分理由；
+- 仅仅更换 Stage Prompt 或使用不同 Agent 名称，不构成拆分理由；
+- 如果无法说明阶段输出契约，以及为什么必须在该位置验证、隔离或恢复，则不应拆 Stage。
+
+Stage 间只传递原始 Flow 输入和显式、有限、可验证的 Stage output/handoff。不得隐式继承上一个
+Agent 的消息历史、Tool/Skill、权限、Provider 客户端或其他运行期对象。
+
+### 4.2 Skill Package 不变量
 
 1. 一个 Skill 一个目录，`SKILL.md` 是经验 playbook，不是 Tool 清单；
 2. `dependencies` 表示外部 required/optional Tool，`contributions` 表示 Skill 自带能力；
@@ -108,7 +145,7 @@ Skill Package 的额外不变量：
    `skill.resource.used` 把 Skill 自有资源与 ToolCall 关联，
    Tool 的最终结果仍由 `tool.completed` 和 `ToolResult` 表达。
 
-Event 的额外不变量：
+### 4.3 Event 不变量
 
 1. EventStore 是唯一事实源，Harness 和 RunHandle 不各自保存 Event 副本；
 2. `emit()` 原子分配 Run 内 sequence，并在 Observer 扇出前完成提交；
@@ -119,6 +156,57 @@ Event 的额外不变量：
    `message.completed` 始终存在，`message.delta` 只是可选实时增量。
 7. `run.succeeded`、`run.failed` 和 `run.cancelled` 是互斥的 Run 终态 Event；取消期间已经
    `tool.started` 的调用必须以 `tool.completed(status=cancelled)` 闭合。
+8. user/assistant `message.*` Event 的 `message_id` 与 Harness transcript、后续 ModelRequest
+   中对应的 `Message.message_id` 相同；Tool Message 使用独立 id，并以 `tool_call_id` 关联调用。
+
+### 4.4 Context 不变量
+
+`HarnessSnapshot.system_prompt` 和 `messages` 分别是 Run 启动时冻结的完整 system prompt 与
+Run 内形成的原始 transcript；`ContextView.system_prompt/messages` 是一次模型请求实际使用的
+临时投影。source 与 request view 不能混为同一份可变状态：
+
+```text
+SystemContext + transcript + MemorySnapshot + request overhead + ContextBudget
+                    │
+                    ▼
+             ContextPolicy.select()
+                    │
+                    ▼
+ ContextView(system_prompt, messages, ContextTrace)
+                    │
+                    ▼
+              ModelRequest.messages
+```
+
+1. 默认 `KeepAllContextPolicy` 保持原有行为，不宣称执行 token 裁剪；
+2. ContextPolicy 是同步、确定性的纯选择边界，不能自行执行网络召回、模型摘要或持久化写入；
+3. SystemContext 由不可修改的核心 instructions 和声明式、应用可信的 SystemContextBlock 组成；
+   required block 必须保留，optional block 可由 Policy 按预算选择；
+4. ContextView.system_prompt 必须严格由核心 instructions 和 trace 中选中的已声明 blocks 渲染，
+   Policy 不能自由改写核心指令，也不能把 Memory 或任意文本临时提升为 system 权限；
+5. `ContextInput.transcript` 使用不可变 tuple，策略只能返回新的 request-only ContextView；
+6. ContextView 必须保留 user Message，并保持 assistant ToolCall 与其所有 Tool result 为完整组；
+7. 策略异常、无效 system selection、无效角色、孤立 Tool result、缺失 Tool result 或违反已报告预算时 fail-closed，
+   不能回退为完整历史；
+8. `ContextBudget` 描述 context window、输出预留和安全余量，具体 token 估算与执行由选中的
+   Policy 负责，因为 tokenizer 属于 Model/Provider 能力；
+9. `context.prepared` 记录 source/selected system prompt 指纹、selected block ids、Policy、
+   消息计数、裁剪计数和 token 估算，不记录上下文正文；
+10. ContextPolicy、SystemContext block 清单和预算固定进 HarnessSnapshot 与 fingerprint；
+11. MemoryProvider 每个 Run 最多 recall 一次，同一份不可变 MemorySnapshot 被该 Run 的所有
+   Model Turn 复用；ContextPolicy 必须显式报告 Memory candidate 和 selected ids；
+12. Memory recall 是 fail-open 的旁路，Provider 失败产生 `memory.recall.failed` 并使用空的
+   enabled MemorySnapshot；recall 有固定超时，且不能回退到其他 tenant/user scope；
+13. 启用 Memory read 或 write 必须由应用给 Run 传入显式 `MemoryScope`，HTTP body 不接受
+   客户端自报 scope；
+14. MemoryWriter 只提供同步、非阻塞 `enqueue()` 边界，Harness 在成功终态提交完整 Message
+   transcript；实际抽取、合并、去重、后台 I/O 和 Redis/PG 实现后续补充；
+15. Memory、摘要器和 ContextPolicy 不合并为一个接口。Memory 只提供 typed candidates，
+   ContextPolicy 决定哪些内容进入本次 request-only Message 投影。
+
+`ModelRequest` 不增加 `memory`、`context_policy` 或 `context_trace` 字段。Provider 只接收已经
+准备好的 `ContextView.system_prompt/messages`、Tools 和 response schema；选择过程由 Context
+Event 单独观测。
 
 完整契约见 [`SKILLS.md`](SKILLS.md)。
 Event 存储和流契约见 [`EVENTS.md`](EVENTS.md)。
@@ -156,7 +244,8 @@ AgentDefinition(
 1. 已增加进程内 RunHandle、`start()`、Event 回放与实时订阅，以及 `base_agent.server`
    HTTP Run 提交/状态查询，以及基于同一 EventStore 的 JSON 回放与 SSE 实时订阅；
 2. 已增加进程内 `RunHandle.cancel()`、HTTP cancel 和 `run.cancelled` 终态语义；
-3. 增加小型 ContextPolicy；
+3. 已增加小型 ContextPolicy、默认 KeepAll 策略、ContextBudget 和 request-only
+   ContextView，以及默认禁用的 scoped Memory recall/non-blocking write 契约；
 4. 增加声明式 Stage output contract；
 5. 用 AgentDemo MTBI Flow 验证 Artifact/Verifier；
 6. 增加固定角色的 Planner/Executor Flow 预设；

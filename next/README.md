@@ -101,6 +101,73 @@ Harness、RunResult 和 RunHandle 共享同一个 `EventStore`，默认使用
 `InMemoryEventStore`，不会重复保存 Event。持久化与实时扩展契约以及 PostgreSQL/Redis
 方向见 [`EVENTS.md`](EVENTS.md)。
 
+## ContextPolicy
+
+Harness 在每次构造 `ModelRequest` 前，把冻结的 SystemContext、Run 内原始 transcript 和可选
+MemorySnapshot 交给 ContextPolicy，并只把返回的 request-only
+`ContextView.system_prompt/messages` 发送给 Provider。默认
+`KeepAllContextPolicy` 保持全部历史；应用可以从 `base_agent.context` 引入扩展契约：
+
+```python
+from base_agent.context import (
+    ContextBudget,
+    KeepAllContextPolicy,
+    SystemContextBlock,
+)
+
+agent = Agent(
+    definition,
+    model=model,
+    context_policy=KeepAllContextPolicy(),
+    system_context_blocks=(
+        SystemContextBlock(
+            id="company-policy",
+            content="Follow the approved company terminology.",
+            required=True,
+        ),
+    ),
+    context_budget=ContextBudget(
+        context_window_tokens=128_000,
+        reserved_output_tokens=8_000,
+        safety_margin_tokens=2_000,
+    ),
+)
+```
+
+`ContextBudget` 向策略提供输入上限，但默认 KeepAll 策略不会假装进行 token 估算或裁剪。需要
+窗口、Tool result 清理或摘要的应用应实现自己的 `ContextPolicy.select()`，返回
+`ContextView` 和不含正文的 `ContextTrace`。核心 instructions 不可修改，required system
+block 不可省略，optional block 可以由 Policy 选择；最终 `ContextView.system_prompt` 必须由
+这些已声明 blocks 渲染，不能注入 Memory 或任意 system 文本。策略只能选择本次请求，不得
+修改 transcript；Memory 候选通过 `ContextInput.memory` 单独提供，模型摘要仍属于后续独立接口。
+
+### Memory 占位与作用域
+
+Memory read/write 默认分别使用 `DisabledMemoryProvider` 和 `DisabledMemoryWriter`，不会执行
+召回、写入或产生额外 Memory Event。启用 Memory 必须由应用在每次 Run 传入明确 scope：
+
+```python
+from base_agent.memory import MemoryScope
+
+result = await agent.run(
+    "Hi",
+    memory_scope=MemoryScope(("tenant-42", "user-7")),
+)
+```
+
+自定义 `MemoryProvider.recall()` 每个 Run 最多调用一次，返回 versioned `MemoryRecord`；同一
+MemorySnapshot 会被所有 Model Turn 复用。ContextPolicy 负责把选中的 record 渲染为有边界的
+request-only Message，并在 ContextTrace 中报告 `selected_memory_ids`。默认 KeepAll Policy
+不会自动注入 Memory。默认 recall limit 为 5、超时为 2 秒，均在 Agent 构造时配置并进入
+HarnessSnapshot/fingerprint。
+
+`MemoryWriter.enqueue()` 只接收成功 Run 的完整 Message transcript，并要求实现方立即入队、
+不能在调用线程执行数据库、embedding 或模型 I/O。当前只固定该窄接口；Memory 抽取、冲突
+合并、遗忘、后台重试、Redis/PG Adapter 和跨 Session 策略后续实现。
+
+内置 HTTP Run Server 暂不从请求 body 接受 MemoryScope，避免客户端自行声明 tenant/user
+身份。启用 Memory 的 HTTP 应用以后应从认证上下文注入 scope。
+
 ## 可选 HTTP Run Server
 
 HTTP 服务属于 `base-agent` 的可选 `server` 能力，不由 Starter 实现。安装依赖：
@@ -130,9 +197,9 @@ app = create_http_app(agent)
 SSE 帧把 `Event.sequence` 同时作为 `id` 和断线续传游标：
 
 ```text
-id: 7
+id: 8
 event: run.succeeded
-data: {"sequence":7,"kind":"run.succeeded","run_id":"...","turn":1,"payload":{...}}
+data: {"sequence":8,"kind":"run.succeeded","run_id":"...","turn":1,"payload":{...}}
 ```
 
 客户端可用 `?after_sequence=5`、`?last_event_id=5` 或 `Last-Event-ID: 5` 只接收 sequence

@@ -66,7 +66,12 @@ def _request(
     return ModelRequest(
         model=model,
         system_prompt="Be concise.",
-        messages=(Message.user("Weather in Shanghai?"),),
+        messages=(
+            Message.user(
+                "Weather in Shanghai?",
+                message_id="runtime-message-1",
+            ),
+        ),
         tools=(
             ToolSpec(
                 name="weather",
@@ -165,6 +170,16 @@ async def test_codex_cli_maps_jsonl_tool_calls_usage_and_safe_command() -> None:
     assert '"system_prompt": "Be concise."' in call["input_text"]
     assert '"tool_choice": "required"' in call["input_text"]
     assert '"name": "weather"' in call["input_text"]
+    envelope = json.loads(call["input_text"].split("REQUEST_JSON:\n", 1)[1])
+    assert set(envelope) == {
+        "system_prompt",
+        "messages",
+        "tools",
+        "tool_choice",
+        "response_schema",
+    }
+    assert envelope["messages"] == [{"role": "user", "content": "Weather in Shanghai?"}]
+    assert "message_id" not in call["input_text"]
     assert call["timeout_seconds"] == 12
     assert call["max_output_bytes"] == 123_456
 

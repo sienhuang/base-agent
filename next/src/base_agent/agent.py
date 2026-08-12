@@ -6,14 +6,28 @@ from collections.abc import Coroutine, Iterable, Sequence
 from typing import Any
 from uuid import uuid4
 
+from base_agent.context import (
+    ContextBudget,
+    ContextPolicy,
+    KeepAllContextPolicy,
+    SystemContext,
+    SystemContextBlock,
+)
 from base_agent.definitions import AgentDefinition
 from base_agent.events import EventStore, InMemoryEventStore
+from base_agent.memory import (
+    DisabledMemoryProvider,
+    DisabledMemoryWriter,
+    MemoryProvider,
+    MemoryScope,
+    MemoryWriter,
+)
 from base_agent.models import RunResult
 from base_agent.observability import Observer
 from base_agent.providers import ModelProvider
 from base_agent.run_handle import RunHandle
 from base_agent.runtime.harness import Harness
-from base_agent.skills import Skill, SkillCatalog
+from base_agent.skills import Skill, SkillCatalog, SkillDescriptor
 from base_agent.skills.execution import build_skill_script_tool
 from base_agent.skills.loading import (
     SKILL_VIEW_TOOL_NAME,
@@ -36,13 +50,55 @@ class Agent:
         tools: Iterable[Tool | Toolkit] = (),
         skills: Iterable[Skill] | SkillCatalog = (),
         confirmation_policy: ConfirmationPolicy | None = None,
+        context_policy: ContextPolicy | None = None,
+        context_budget: ContextBudget | None = None,
+        system_context_blocks: Iterable[SystemContextBlock] = (),
+        memory_provider: MemoryProvider | None = None,
+        memory_writer: MemoryWriter | None = None,
+        memory_recall_limit: int = 5,
+        memory_recall_timeout_seconds: float = 2.0,
         observers: Sequence[Observer] = (),
         event_store: EventStore | None = None,
     ) -> None:
+        resolved_context_policy = (
+            context_policy if context_policy is not None else KeepAllContextPolicy()
+        )
+        context_policy_name = resolved_context_policy.name
+        if not context_policy_name.strip():
+            raise ValueError("context policy name must not be blank")
+        if context_policy_name != context_policy_name.strip():
+            raise ValueError("context policy name must not have surrounding whitespace")
+        resolved_memory_provider = (
+            memory_provider if memory_provider is not None else DisabledMemoryProvider()
+        )
+        memory_provider_name = resolved_memory_provider.name
+        if not memory_provider_name.strip():
+            raise ValueError("memory provider name must not be blank")
+        if memory_provider_name != memory_provider_name.strip():
+            raise ValueError("memory provider name must not have surrounding whitespace")
+        resolved_memory_writer = (
+            memory_writer if memory_writer is not None else DisabledMemoryWriter()
+        )
+        memory_writer_name = resolved_memory_writer.name
+        if not memory_writer_name.strip():
+            raise ValueError("memory writer name must not be blank")
+        if memory_writer_name != memory_writer_name.strip():
+            raise ValueError("memory writer name must not have surrounding whitespace")
+        if memory_recall_limit < 1:
+            raise ValueError("memory_recall_limit must be at least 1")
+        if memory_recall_timeout_seconds <= 0:
+            raise ValueError("memory_recall_timeout_seconds must be positive")
         direct_tools = flatten_tools(tools)
         registered_catalog = skills if isinstance(skills, SkillCatalog) else SkillCatalog(skills)
         selected_catalog = _select_skills(definition, registered_catalog)
         selected_skills = selected_catalog.skills
+        system_context = SystemContext(
+            instructions=definition.instructions,
+            blocks=(
+                *tuple(system_context_blocks),
+                *_skill_system_context_blocks(selected_catalog.descriptors),
+            ),
+        )
         if selected_skills and definition.tool_choice.value == "none":
             raise ValueError("selected Skills require Tool use so the model can call skill_view")
         skill_tools = flatten_tools(
@@ -118,8 +174,14 @@ class Agent:
             model=model,
             tools=selected_tools,
             skills=selected_skills,
-            skill_catalog=selected_catalog,
             confirmation_policy=confirmation_policy,
+            context_policy=resolved_context_policy,
+            context_budget=(context_budget if context_budget is not None else ContextBudget()),
+            system_context=system_context,
+            memory_provider=resolved_memory_provider,
+            memory_writer=resolved_memory_writer,
+            memory_recall_limit=memory_recall_limit,
+            memory_recall_timeout_seconds=memory_recall_timeout_seconds,
             observers=observers,
             event_store=self.event_store,
         )
@@ -129,21 +191,28 @@ class Agent:
         prompt: str,
         *,
         on_event: Observer | None = None,
+        memory_scope: MemoryScope | None = None,
     ) -> RunResult:
         """Run to completion with an optional per-Run live Event observer."""
-        return await self._harness.run(prompt, on_event=on_event)
+        return await self._harness.run(
+            prompt,
+            on_event=on_event,
+            memory_scope=memory_scope,
+        )
 
     async def stream(
         self,
         prompt: str,
         *,
         on_event: Observer,
+        memory_scope: MemoryScope | None = None,
     ) -> RunResult:
         """Run with Provider streaming and publish live Harness events."""
         return await self._harness.run(
             prompt,
             stream=True,
             on_event=on_event,
+            memory_scope=memory_scope,
         )
 
     def start(
@@ -151,6 +220,7 @@ class Agent:
         prompt: str,
         *,
         stream: bool = False,
+        memory_scope: MemoryScope | None = None,
     ) -> RunHandle:
         """Start a process-local background Run and return immediately."""
         run_id = str(uuid4())
@@ -160,6 +230,7 @@ class Agent:
                 prompt,
                 stream=stream,
                 run_id=run_id,
+                memory_scope=memory_scope,
             )
 
         def cancel_in_background() -> Coroutine[Any, Any, RunResult]:
@@ -188,3 +259,27 @@ def _select_skills(
             f"{', '.join(sorted(missing_skills))}"
         )
     return registered_catalog.select(definition.skills)
+
+
+def _skill_system_context_blocks(
+    skills: Sequence[SkillDescriptor],
+) -> tuple[SystemContextBlock, ...]:
+    if not skills:
+        return ()
+    skill_lines = []
+    for skill in skills:
+        detail = f": {skill.description}" if skill.description else ""
+        skill_lines.append(f"- `{skill.name}` (version {skill.version}){detail}")
+    return (
+        SystemContextBlock(
+            id="base_agent.skills.catalog",
+            required=True,
+            content=(
+                "# Available skills\n\n"
+                "The Skills below are available for this Run. Before following a "
+                "Skill, call `skill_view` with its name to load the complete "
+                "instructions. Load supporting files only when the playbook "
+                "requires them.\n\n" + "\n".join(skill_lines)
+            ),
+        ),
+    )

@@ -636,7 +636,7 @@ async def test_minimal_agent_freezes_snapshot_and_emits_ordered_events() -> None
     assert result.snapshot.system_prompt == "Answer briefly."
     assert len(result.snapshot.fingerprint) == 64
     assert [event.sequence for event in result.events] == list(range(1, len(result.events) + 1))
-    assert [event.turn for event in result.events] == [None, None, None, 1, 1, 1, 1]
+    assert [event.turn for event in result.events] == [None, None, None, 1, 1, 1, 1, 1]
     assert all("turn" not in event.payload for event in result.events)
     assert observed == [event.kind for event in result.events]
     assert per_run_observed == list(result.events)

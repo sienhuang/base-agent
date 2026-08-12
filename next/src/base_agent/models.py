@@ -58,25 +58,48 @@ class Message:
     tool_calls: tuple[ToolCall, ...] = ()
     tool_call_id: str | None = None
     name: str | None = None
+    message_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.message_id is not None and not self.message_id.strip():
+            raise ValueError("message_id must not be blank when provided")
 
     @classmethod
-    def user(cls, content: str) -> Message:
-        return cls(role="user", content=content)
+    def user(
+        cls,
+        content: str,
+        *,
+        message_id: str | None = None,
+    ) -> Message:
+        return cls(role="user", content=content, message_id=message_id)
 
     @classmethod
     def assistant(
         cls,
         content: str,
         *,
+        message_id: str | None = None,
         tool_calls: tuple[ToolCall, ...] = (),
     ) -> Message:
-        return cls(role="assistant", content=content, tool_calls=tool_calls)
+        return cls(
+            role="assistant",
+            content=content,
+            message_id=message_id,
+            tool_calls=tool_calls,
+        )
 
     @classmethod
-    def tool_result(cls, call: ToolCall, content: str) -> Message:
+    def tool_result(
+        cls,
+        call: ToolCall,
+        content: str,
+        *,
+        message_id: str | None = None,
+    ) -> Message:
         return cls(
             role="tool",
             content=content,
+            message_id=message_id,
             tool_call_id=call.id,
             name=call.name,
         )
@@ -224,6 +247,16 @@ class HarnessSnapshot:
     permissions: frozenset[str]
     max_model_turns: int
     max_tool_calls_per_turn: int
+    context_policy: str
+    context_window_tokens: int | None
+    context_reserved_output_tokens: int
+    context_safety_margin_tokens: int
+    system_context_block_ids: tuple[str, ...]
+    required_system_context_block_ids: tuple[str, ...]
+    memory_provider: str
+    memory_writer: str
+    memory_recall_limit: int
+    memory_recall_timeout_seconds: float
     fingerprint: str
 
     @property

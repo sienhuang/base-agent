@@ -6,6 +6,7 @@ import pytest
 
 from base_agent import Agent, AgentDefinition, RunHandle, RunStatus, tool
 from base_agent.events import InMemoryEventStore
+from base_agent.memory import MemoryObservation, MemoryScope
 from base_agent.models import (
     Event,
     ModelRequest,
@@ -71,6 +72,7 @@ async def test_start_returns_running_handle_before_model_completes() -> None:
         "run.started",
         "message.created",
         "run.ready",
+        "context.prepared",
         "model.requested",
     ]
     assert {event.run_id for event in running_events} == {handle.run_id}
@@ -125,12 +127,50 @@ async def test_handle_cancel_stops_background_run_and_persists_terminal_event() 
         "run.started",
         "message.created",
         "run.ready",
+        "context.prepared",
         "model.requested",
         "run.cancelled",
     ]
     terminal = result.events[-1]
     assert terminal.turn == 1
     assert terminal.payload == {"reason": "run cancellation requested"}
+
+
+async def test_handle_cancel_does_not_queue_memory_write() -> None:
+    class RecordingMemoryWriter:
+        def __init__(self) -> None:
+            self.observations: list[MemoryObservation] = []
+
+        @property
+        def name(self) -> str:
+            return "recording-writer"
+
+        @property
+        def enabled(self) -> bool:
+            return True
+
+        def enqueue(self, observation: MemoryObservation, /) -> None:
+            self.observations.append(observation)
+
+    writer = RecordingMemoryWriter()
+    model = GatedModel()
+    agent = Agent(
+        AgentDefinition(
+            id="cancelled-memory-write",
+            version="1.0.0",
+            instructions="Answer.",
+        ),
+        model=model,
+        memory_writer=writer,
+    )
+    handle = agent.start("hello", memory_scope=MemoryScope(("user-1",)))
+    await asyncio.wait_for(model.requested.wait(), timeout=1)
+
+    result = await handle.cancel()
+
+    assert result.status is RunStatus.CANCELLED
+    assert writer.observations == []
+    assert not any(event.kind.startswith("memory.write.") for event in result.events)
 
 
 async def test_handle_can_be_cancelled_immediately_after_start() -> None:
@@ -313,6 +353,7 @@ async def test_event_stream_replays_then_follows_until_run_completion() -> None:
     assert created.kind == "message.created"
     assert created.payload["content"] == "hello"
     assert (await anext(event_stream)).kind == "run.ready"
+    assert (await anext(event_stream)).kind == "context.prepared"
     assert (await anext(event_stream)).kind == "model.requested"
     next_event = asyncio.create_task(anext(event_stream))
     await asyncio.sleep(0)
@@ -482,9 +523,7 @@ async def test_start_can_preserve_provider_streaming_events() -> None:
 
     assert result.text == "done"
     assert [
-        event.payload["delta"]
-        for event in await handle.events()
-        if event.kind == "message.delta"
+        event.payload["delta"] for event in await handle.events() if event.kind == "message.delta"
     ] == ["do", "ne"]
 
 
@@ -500,7 +539,7 @@ async def test_handle_reports_failed_terminal_status() -> None:
     assert result.status is RunStatus.FAILED
     assert handle.status is RunStatus.FAILED
     assert await handle.events() == result.events
-    assert [event.kind for event in await handle.events(after_sequence=4)] == [
+    assert [event.kind for event in await handle.events(after_sequence=5)] == [
         "model.failed",
         "run.failed",
     ]

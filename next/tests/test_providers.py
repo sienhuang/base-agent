@@ -126,7 +126,7 @@ def _request(**changes: Any) -> ModelRequest:
     values: dict[str, Any] = {
         "model": "requested-model",
         "system_prompt": "Be concise.",
-        "messages": (Message.user("hello"),),
+        "messages": (Message.user("hello", message_id="runtime-message-1"),),
         "tools": (),
         "tool_choice": ToolChoice.AUTO,
         "response_schema": None,
@@ -272,6 +272,8 @@ async def test_openai_adapter_maps_request_response_usage_and_metadata() -> None
         "role": "system",
         "content": "Be concise.",
     }
+    assert sent["messages"][1] == {"role": "user", "content": "hello"}
+    assert all("message_id" not in message for message in sent["messages"])
     assert sent["tools"][0]["function"]["name"] == "lookup"
     assert sent["tool_choice"] == "required"
     assert sent["response_format"]["json_schema"]["strict"] is True
