@@ -72,3 +72,43 @@ async def test_cli_distinguishes_selected_and_loaded_skill(capsys) -> None:
     assert "skill.selected skill=value-recording version=1.0.0" in captured.err
     assert "skill.loaded skill=value-recording version=1.0.0 file=SKILL.md" in captured.err
     assert captured.err.index("skill.selected") < captured.err.index("skill.loaded")
+
+
+async def test_cli_runs_plan_react_with_live_flow_and_child_trace(capsys) -> None:
+    exit_code = await _run(
+        'tool=calculate_product calls=1 tool_args={"left":4,"right":30}',
+        settings=Settings(provider="offline"),
+        show_tool_results=True,
+        show_execution_trace=True,
+        stream=False,
+        flow="plan-react",
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert '"product":120' in captured.out
+    assert "/call-1: status=success, data={'product': 120}" in captured.out
+    assert "flow.started flow=starter-plan-react" in captured.err
+    assert "planner.completed phase=create action=create" in captured.err
+    assert "tool.completed tool=calculate_product call=call-1 status=success" in captured.err
+    assert "planner.completed phase=review action=complete" in captured.err
+    assert "flow.succeeded" in captured.err
+
+
+async def test_cli_streams_plan_react_providers_and_prints_only_validated_output(capsys) -> None:
+    exit_code = await _run(
+        "hello",
+        settings=Settings(provider="offline"),
+        show_tool_results=False,
+        show_execution_trace=False,
+        stream=True,
+        flow="plan-react",
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "Offline Executor completed: Complete the user request with appropriate "
+        "Tools and evidence: hello\n"
+    )
+    assert captured.err == ""

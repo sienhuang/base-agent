@@ -10,7 +10,14 @@ from typing import Any
 from base_agent.models import Event
 
 _TERMINAL_EVENT_KINDS = frozenset(
-    {"run.succeeded", "run.failed", "run.cancelled"}
+    {
+        "flow.succeeded",
+        "flow.failed",
+        "flow.cancelled",
+        "run.succeeded",
+        "run.failed",
+        "run.cancelled",
+    }
 )
 
 

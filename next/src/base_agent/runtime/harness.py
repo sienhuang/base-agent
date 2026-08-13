@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -23,7 +22,7 @@ from base_agent.context import (
     SystemContext,
 )
 from base_agent.definitions import AgentDefinition
-from base_agent.events import EventStore
+from base_agent.events import EventEmitter, EventStore
 from base_agent.governance import (
     Confirmation,
     ConfirmationPolicy,
@@ -78,48 +77,6 @@ _MAX_TURN_OBSERVATION_BYTES = 65_536
 class _SkillResourceSource:
     skill: Skill
     resource_type: str
-
-
-class _EventEmitter:
-    def __init__(
-        self,
-        run_id: str,
-        event_store: EventStore,
-        observers: Sequence[Observer],
-    ) -> None:
-        self._run_id = run_id
-        self._event_store = event_store
-        self._observers = tuple(observers)
-
-    async def events(self) -> tuple[Event, ...]:
-        return await self._event_store.list(self._run_id)
-
-    @property
-    def run_id(self) -> str:
-        return self._run_id
-
-    async def emit(
-        self,
-        kind: str,
-        *,
-        turn: int | None = None,
-        **payload: Any,
-    ) -> None:
-        event = await self._event_store.emit(
-            self._run_id,
-            kind,
-            payload,
-            turn=turn,
-        )
-        for observer in self._observers:
-            try:
-                value = observer(event)
-                if inspect.isawaitable(value):
-                    await value
-            except Exception:
-                # Observers report facts. They are deliberately fail-open and
-                # have no return channel capable of changing execution.
-                continue
 
 
 class Harness:
@@ -189,7 +146,7 @@ class Harness:
 
         resolved_run_id = run_id or str(uuid4())
         run_observers = self._observers if on_event is None else (*self._observers, on_event)
-        emitter = _EventEmitter(resolved_run_id, self._event_store, run_observers)
+        emitter = EventEmitter(resolved_run_id, self._event_store, run_observers)
         snapshot = self._create_snapshot()
         await emitter.emit(
             "run.started",
@@ -523,7 +480,7 @@ class Harness:
         request: ModelRequest,
         *,
         stream: bool,
-        emitter: _EventEmitter,
+        emitter: EventEmitter,
         turn: int,
         message_id: str,
     ) -> ModelResponse:
@@ -685,7 +642,7 @@ class Harness:
             fingerprint=fingerprint,
         )
 
-    async def _check_readiness(self, emitter: _EventEmitter) -> str | None:
+    async def _check_readiness(self, emitter: EventEmitter) -> str | None:
         for tool in self._tools:
             try:
                 readiness = await tool.check_readiness()
@@ -713,7 +670,7 @@ class Harness:
         *,
         scope: MemoryScope | None,
         run_id: str,
-        emitter: _EventEmitter,
+        emitter: EventEmitter,
     ) -> MemorySnapshot:
         if not self._memory_enabled:
             return MemorySnapshot.disabled()
@@ -774,7 +731,7 @@ class Harness:
         messages: tuple[Message, ...],
         output: str,
         turn: int,
-        emitter: _EventEmitter,
+        emitter: EventEmitter,
     ) -> None:
         if not self._memory_write_enabled:
             return
@@ -811,7 +768,7 @@ class Harness:
         *,
         turn: int,
         tools_by_name: Mapping[str, Tool],
-        emitter: _EventEmitter,
+        emitter: EventEmitter,
     ) -> ToolResult:
         tool = tools_by_name.get(call.name)
         if tool is None:
@@ -1013,7 +970,7 @@ class Harness:
 
     async def _failed(
         self,
-        emitter: _EventEmitter,
+        emitter: EventEmitter,
         snapshot: HarnessSnapshot,
         *,
         error: str,
@@ -1047,7 +1004,7 @@ class Harness:
         reason: str,
     ) -> RunResult:
         """Persist the terminal result for a cancelled background Run."""
-        emitter = _EventEmitter(run_id, self._event_store, self._observers)
+        emitter = EventEmitter(run_id, self._event_store, self._observers)
         existing_events = await emitter.events()
         if existing_events and existing_events[-1].kind in {
             "run.succeeded",
@@ -1155,7 +1112,7 @@ async def _emit_skill_view_event(
     result: ToolResult,
     *,
     turn: int,
-    emitter: _EventEmitter,
+    emitter: EventEmitter,
 ) -> None:
     data = result.data
     if not isinstance(data, Mapping):
@@ -1308,7 +1265,7 @@ def _validate_context_messages(messages: tuple[Message, ...]) -> None:
         raise ContextPolicyError("ContextView is missing one or more Tool results")
 
 
-async def _has_open_tool_event(emitter: _EventEmitter, tool_call_id: str) -> bool:
+async def _has_open_tool_event(emitter: EventEmitter, tool_call_id: str) -> bool:
     for event in reversed(await emitter.events()):
         if event.payload.get("tool_call_id") != tool_call_id:
             continue

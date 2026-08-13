@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Mapping
 from importlib import import_module
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from base_agent.models import (
     FinishReason,
@@ -32,6 +32,20 @@ from base_agent.providers.errors import (
     ProviderUnavailableError,
 )
 from base_agent.providers.models import ProviderCapabilities, ProviderInfo
+
+type OpenAIStructuredOutputMode = Literal[
+    "json-schema",
+    "json-object",
+    "prompt",
+]
+
+_STRUCTURED_OUTPUT_MODES = frozenset(
+    {
+        "json-schema",
+        "json-object",
+        "prompt",
+    }
+)
 
 
 class _CompletionCreator(Protocol):
@@ -61,6 +75,7 @@ class OpenAIChatProvider:
         timeout_seconds: float | None = None,
         temperature: float | None = None,
         max_output_tokens: int | None = None,
+        structured_output_mode: OpenAIStructuredOutputMode = "json-schema",
         name: str = "openai-compatible",
     ) -> None:
         if not default_model.strip():
@@ -69,6 +84,10 @@ class OpenAIChatProvider:
             raise ValueError("timeout_seconds must be greater than zero")
         if max_output_tokens is not None and max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be greater than zero")
+        if structured_output_mode not in _STRUCTURED_OUTPUT_MODES:
+            raise ValueError(
+                "structured_output_mode must be json-schema, json-object, or prompt"
+            )
         self._info = ProviderInfo(
             name=name,
             default_model=default_model,
@@ -80,6 +99,7 @@ class OpenAIChatProvider:
         )
         self._temperature = temperature
         self._max_output_tokens = max_output_tokens
+        self._structured_output_mode = structured_output_mode
         self._client = client or self._create_client(
             api_key=api_key,
             base_url=base_url,
@@ -243,10 +263,20 @@ class OpenAIChatProvider:
                 provider=self.info.name,
             )
 
+        system_prompt = request.system_prompt
+        if (
+            request.response_schema is not None
+            and self._structured_output_mode in {"json-object", "prompt"}
+        ):
+            system_prompt = _with_structured_output_instruction(
+                system_prompt,
+                request.response_schema,
+            )
+
         parameters: dict[str, Any] = {
             "model": request.model,
             "messages": _messages_to_openai(
-                request.system_prompt,
+                system_prompt,
                 request.messages,
             ),
         }
@@ -255,7 +285,10 @@ class OpenAIChatProvider:
             parameters["tool_choice"] = request.tool_choice.value
         elif request.tool_choice is ToolChoice.NONE:
             parameters["tool_choice"] = ToolChoice.NONE.value
-        if request.response_schema is not None:
+        if (
+            request.response_schema is not None
+            and self._structured_output_mode == "json-schema"
+        ):
             parameters["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
@@ -264,6 +297,11 @@ class OpenAIChatProvider:
                     "schema": dict(request.response_schema),
                 },
             }
+        elif (
+            request.response_schema is not None
+            and self._structured_output_mode == "json-object"
+        ):
+            parameters["response_format"] = {"type": "json_object"}
         if self._temperature is not None:
             parameters["temperature"] = self._temperature
         if self._max_output_tokens is not None:
@@ -305,6 +343,25 @@ def _messages_to_openai(
         converted.append({"role": "system", "content": system_prompt})
     converted.extend(_message_to_openai(message) for message in messages)
     return converted
+
+
+def _with_structured_output_instruction(
+    system_prompt: str,
+    response_schema: Mapping[str, Any],
+) -> str:
+    schema = json.dumps(
+        dict(response_schema),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    instruction = (
+        "When producing the final assistant response (not a Tool call), return only "
+        "one valid JSON value. Do not wrap it in Markdown or add explanatory text. "
+        "The JSON must validate against this JSON Schema:\n"
+        f"{schema}"
+    )
+    return f"{system_prompt}\n\n{instruction}" if system_prompt else instruction
 
 
 def _message_to_openai(message: Message) -> dict[str, Any]:

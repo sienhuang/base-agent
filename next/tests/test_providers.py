@@ -1,6 +1,6 @@
 from collections import deque
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel
@@ -285,6 +285,59 @@ async def test_openai_adapter_maps_request_response_usage_and_metadata() -> None
     assert response.usage.reasoning_tokens == 2
     assert response.provider_data["request_id"] == "request-1"
     assert response.provider_data["model"] == "served-model"
+
+
+async def test_openai_adapter_can_map_structured_output_through_prompt() -> None:
+    client = FakeOpenAIClient([_completion(content='{"answer":"ok"}')])
+    provider = OpenAIChatProvider(
+        default_model="default-model",
+        client=client,
+        structured_output_mode="prompt",
+    )
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+
+    await provider.complete(_request(response_schema=schema))
+
+    sent = client.completions.requests[0]
+    assert "response_format" not in sent
+    system_prompt = sent["messages"][0]["content"]
+    assert system_prompt.startswith("Be concise.\n\n")
+    assert "return only one valid JSON value" in system_prompt
+    assert '"required":["answer"]' in system_prompt
+
+
+async def test_openai_adapter_can_use_json_object_response_format() -> None:
+    client = FakeOpenAIClient([_completion(content='{"answer":"ok"}')])
+    provider = OpenAIChatProvider(
+        default_model="default-model",
+        client=client,
+        structured_output_mode="json-object",
+    )
+
+    await provider.complete(
+        _request(
+            response_schema={
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+            }
+        )
+    )
+
+    sent = client.completions.requests[0]
+    assert sent["response_format"] == {"type": "json_object"}
+    assert "return only one valid JSON value" in sent["messages"][0]["content"]
+
+
+def test_openai_adapter_rejects_unknown_structured_output_mode() -> None:
+    with pytest.raises(ValueError, match="structured_output_mode"):
+        OpenAIChatProvider(
+            default_model="default-model",
+            structured_output_mode=cast(Any, "unknown"),
+        )
 
 
 async def test_openai_adapter_streams_text_and_completes_response() -> None:

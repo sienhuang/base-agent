@@ -2,7 +2,19 @@
 
 from base_agent.agent import Agent
 from base_agent.definitions import AgentDefinition
-from base_agent.flows import Flow, FlowResult, FlowStatus, Stage, StageResult
+from base_agent.flows import (
+    Flow,
+    FlowResult,
+    FlowRunHandle,
+    FlowStatus,
+    PlannerDecision,
+    PlannerReActResult,
+    PlanningLimits,
+    PlanStepDraft,
+    Stage,
+    StageResult,
+    StepOutcome,
+)
 from base_agent.governance import Confirmation, SideEffect
 from base_agent.models import (
     Event,
@@ -24,7 +36,12 @@ __all__ = [
     "Event",
     "Flow",
     "FlowResult",
+    "FlowRunHandle",
     "FlowStatus",
+    "PlannerDecision",
+    "PlannerReActResult",
+    "PlanningLimits",
+    "PlanStepDraft",
     "RunResult",
     "RunFailure",
     "RunHandle",
@@ -36,6 +53,7 @@ __all__ = [
     "SkillPackage",
     "Stage",
     "StageResult",
+    "StepOutcome",
     "ToolChoice",
     "Toolkit",
     "ToolReadiness",

@@ -16,7 +16,11 @@ from agent_app.app import (
     run,
 )
 from agent_app.config import Settings
-from agent_app.provider import OfflineProvider, build_provider
+from agent_app.provider import (
+    OfflineProvider,
+    build_plan_react_providers,
+    build_provider,
+)
 from agent_app.skills import (
     PYTHON_CALCULATOR_SKILL_NAME,
     SKILL_CATALOG,
@@ -715,6 +719,7 @@ def test_openai_compatible_provider_reads_environment(
         "api_key": "secret-for-test",
         "base_url": "http://localhost:8000/v1",
         "timeout_seconds": 60,
+        "structured_output_mode": "prompt",
     }
 
 
@@ -766,3 +771,65 @@ def test_cli_provider_modes_preserve_local_default_model(
         "timeout_seconds": 12,
         "max_output_bytes": 1234,
     }
+
+
+def test_plan_react_provider_factory_uses_independent_endpoints(monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    class CapturingProvider:
+        def __init__(self, **kwargs: object) -> None:
+            captured.append(dict(kwargs))
+
+        @property
+        def info(self) -> ProviderInfo:
+            raise AssertionError("not used by this configuration test")
+
+    monkeypatch.setattr(
+        "agent_app.provider.OpenAIChatProvider",
+        CapturingProvider,
+    )
+
+    planner, executor = build_plan_react_providers(
+        Settings(
+            provider="openai-compatible",
+            model="default-model",
+            api_key="default-key",
+            base_url="http://default.local/v1",
+            plan_react_planner_model="planner-model",
+            plan_react_planner_api_key="planner-key",
+            plan_react_planner_base_url="http://planner.local/v1",
+            plan_react_executor_model="executor-model",
+            plan_react_executor_api_key="executor-key",
+            plan_react_executor_base_url="http://executor.local/v1",
+        )
+    )
+
+    assert planner is not executor
+    assert captured == [
+        {
+            "default_model": "planner-model",
+            "api_key": "planner-key",
+            "base_url": "http://planner.local/v1",
+            "timeout_seconds": 60,
+            "structured_output_mode": "prompt",
+        },
+        {
+            "default_model": "executor-model",
+            "api_key": "executor-key",
+            "base_url": "http://executor.local/v1",
+            "timeout_seconds": 60,
+            "structured_output_mode": "prompt",
+        },
+    ]
+
+
+def test_plan_react_provider_factory_reuses_the_default_route() -> None:
+    default = OfflineProvider()
+
+    planner, executor = build_plan_react_providers(
+        Settings(provider="offline"),
+        default_provider=default,
+    )
+
+    assert planner is default
+    assert executor is default

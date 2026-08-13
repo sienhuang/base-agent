@@ -25,7 +25,7 @@ from base_agent.providers import (
     ProviderInfo,
 )
 
-from agent_app.config import Settings
+from agent_app.config import PlanReactRole, Settings
 
 
 class OfflineProvider:
@@ -36,6 +36,7 @@ class OfflineProvider:
             default_model="starter-offline",
             capabilities=ProviderCapabilities(
                 tools=True,
+                structured_output=True,
                 streaming=True,
             ),
         )
@@ -45,6 +46,34 @@ class OfflineProvider:
         if not user_messages:
             raise ValueError("OfflineProvider requires one user message")
         tool_messages = [message for message in request.messages if message.role == "tool"]
+        response_schema_title = (
+            request.response_schema.get("title")
+            if request.response_schema is not None
+            else None
+        )
+        if response_schema_title == "PlannerDecision":
+            return ModelResponse(
+                content=json.dumps(
+                    _offline_planner_decision(user_messages[-1]),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        if response_schema_title == "StepOutcome":
+            if not tool_messages:
+                requested_calls = _requested_offline_tool_calls(user_messages[-1])
+                if requested_calls is not None and request.tools:
+                    return _offline_tool_call_response(
+                        user_messages[-1],
+                        requested_calls=requested_calls,
+                    )
+            return ModelResponse(
+                content=json.dumps(
+                    _offline_step_outcome(user_messages[-1], tool_messages),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
         if tool_messages:
             if _show_offline_observations(user_messages[-1]):
                 return ModelResponse(content=_offline_observation_details(tool_messages))
@@ -66,22 +95,9 @@ class OfflineProvider:
 
         requested_calls = _requested_offline_tool_calls(user_messages[-1])
         if requested_calls is not None and request.tools:
-            tool_name = _offline_tool_name(user_messages[-1])
-            explicit_arguments = _offline_tool_arguments(user_messages[-1])
-            return ModelResponse(
-                tool_calls=tuple(
-                    ToolCall(
-                        id=f"call-{index}",
-                        name=tool_name,
-                        arguments=(
-                            dict(explicit_arguments)
-                            if explicit_arguments is not None
-                            else _default_tool_arguments(tool_name, index)
-                        ),
-                    )
-                    for index in range(1, requested_calls + 1)
-                ),
-                finish_reason=FinishReason.TOOL_CALLS,
+            return _offline_tool_call_response(
+                user_messages[-1],
+                requested_calls=requested_calls,
             )
         return ModelResponse(content=f"Starter Agent received: {user_messages[-1]}")
 
@@ -156,7 +172,30 @@ def build_provider(
         api_key=resolved.api_key,
         base_url=resolved.base_url,
         timeout_seconds=60,
+        structured_output_mode=resolved.structured_output_mode,
     )
+
+
+def build_plan_react_providers(
+    settings: Settings | None = None,
+    *,
+    default_provider: ModelProvider | None = None,
+) -> tuple[ModelProvider, ModelProvider]:
+    """Build Planner and Executor Providers, reusing identical effective routes."""
+    resolved = settings or Settings()
+    providers: dict[Settings, ModelProvider] = {}
+    if default_provider is not None:
+        providers[resolved] = default_provider
+
+    def provider_for(role: PlanReactRole) -> ModelProvider:
+        route = resolved.for_plan_react_role(role)
+        provider = providers.get(route)
+        if provider is None:
+            provider = build_provider(route)
+            providers[route] = provider
+        return provider
+
+    return provider_for("planner"), provider_for("executor")
 
 
 def _requested_offline_tool_calls(prompt: str) -> int | None:
@@ -167,6 +206,128 @@ def _requested_offline_tool_calls(prompt: str) -> int | None:
     if requested < 1:
         raise ValueError("calls must be at least 1")
     return requested
+
+
+def _offline_tool_call_response(
+    prompt: str,
+    *,
+    requested_calls: int,
+) -> ModelResponse:
+    tool_name = _offline_tool_name(prompt)
+    explicit_arguments = _offline_tool_arguments(prompt)
+    return ModelResponse(
+        tool_calls=tuple(
+            ToolCall(
+                id=f"call-{index}",
+                name=tool_name,
+                arguments=(
+                    dict(explicit_arguments)
+                    if explicit_arguments is not None
+                    else _default_tool_arguments(tool_name, index)
+                ),
+            )
+            for index in range(1, requested_calls + 1)
+        ),
+        finish_reason=FinishReason.TOOL_CALLS,
+    )
+
+
+def _offline_planner_decision(prompt: str) -> dict[str, object]:
+    if prompt.startswith("Create a concise executable Plan"):
+        user_request = _prompt_section(
+            prompt,
+            start="User request:\n",
+            end="\n\nFixed Executor capabilities:",
+        )
+        return {
+            "action": "create",
+            "goal": user_request,
+            "steps": [
+                {
+                    "description": (
+                        "Complete the user request with appropriate Tools and evidence: "
+                        f"{user_request}"
+                    )
+                }
+            ],
+            "reason": "The offline Planner uses one deterministic executable Step.",
+            "final_output": None,
+        }
+
+    plan = _prompt_json_after(prompt, "Current Plan:\n")
+    steps = plan.get("steps")
+    if isinstance(steps, list) and any(
+        isinstance(step, dict) and step.get("status") == "pending" for step in steps
+    ):
+        return {
+            "action": "continue",
+            "goal": None,
+            "steps": [],
+            "reason": "The current Plan still has a pending Step.",
+            "final_output": None,
+        }
+
+    outcome = _prompt_json_after(prompt, "Latest outcome:\n")
+    output = outcome.get("output")
+    summary = outcome.get("summary")
+    final_output = output if isinstance(output, str) and output else summary
+    if not isinstance(final_output, str) or not final_output:
+        final_output = "Offline Planner-ReAct completed the Plan."
+    return {
+        "action": "complete",
+        "goal": None,
+        "steps": [],
+        "reason": "All deterministic Plan Steps are terminal.",
+        "final_output": final_output,
+    }
+
+
+def _offline_step_outcome(
+    prompt: str,
+    tool_messages: list[Message],
+) -> dict[str, object]:
+    step = _prompt_section(prompt, start="Current Step:\n")
+    if tool_messages:
+        output = _offline_observation_details(tool_messages)
+        summary = f"Completed the Step with {len(tool_messages)} Tool observation(s)."
+    else:
+        output = f"Offline Executor completed: {step}"
+        summary = "Completed the Step with the deterministic offline Provider."
+    return {
+        "success": True,
+        "summary": summary,
+        "output": output,
+        "error": None,
+    }
+
+
+def _prompt_section(
+    prompt: str,
+    *,
+    start: str,
+    end: str | None = None,
+) -> str:
+    start_index = prompt.find(start)
+    if start_index < 0:
+        raise ValueError(f"OfflineProvider expected prompt section {start!r}")
+    content = prompt[start_index + len(start) :]
+    if end is not None:
+        end_index = content.find(end)
+        if end_index < 0:
+            raise ValueError(f"OfflineProvider expected prompt section terminator {end!r}")
+        content = content[:end_index]
+    return content.strip()
+
+
+def _prompt_json_after(prompt: str, marker: str) -> dict[str, object]:
+    encoded = _prompt_section(prompt, start=marker)
+    try:
+        value, _ = json.JSONDecoder().raw_decode(encoded)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"OfflineProvider expected JSON after {marker!r}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"OfflineProvider expected a JSON object after {marker!r}")
+    return value
 
 
 def _offline_tool_name(prompt: str) -> str:

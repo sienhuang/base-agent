@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
@@ -16,6 +16,12 @@ ProviderName = Literal[
     "codex-cli",
     "claude-cli",
 ]
+StructuredOutputMode = Literal[
+    "json-schema",
+    "json-object",
+    "prompt",
+]
+PlanReactRole = Literal["planner", "executor"]
 
 _PROVIDER_NAMES = frozenset(
     {
@@ -23,6 +29,13 @@ _PROVIDER_NAMES = frozenset(
         "openai-compatible",
         "codex-cli",
         "claude-cli",
+    }
+)
+_STRUCTURED_OUTPUT_MODES = frozenset(
+    {
+        "json-schema",
+        "json-object",
+        "prompt",
     }
 )
 
@@ -33,8 +46,17 @@ _DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 class Settings:
     provider: ProviderName = "offline"
     model: str | None = None
+    plan_react_planner_model: str | None = None
+    plan_react_executor_model: str | None = None
+    plan_react_planner_api_key: str | None = None
+    plan_react_executor_api_key: str | None = None
+    plan_react_planner_base_url: str | None = None
+    plan_react_executor_base_url: str | None = None
+    plan_react_planner_structured_output_mode: StructuredOutputMode | None = None
+    plan_react_executor_structured_output_mode: StructuredOutputMode | None = None
     api_key: str | None = None
     base_url: str | None = None
+    structured_output_mode: StructuredOutputMode = "prompt"
     cli_executable: str | None = None
     cli_timeout_seconds: float = 300.0
     cli_max_output_bytes: int = 4 * 1024 * 1024
@@ -58,6 +80,30 @@ class Settings:
         model = _optional_env("AGENT_MODEL", file_values)
         if model is None and resolved_provider == "openai-compatible":
             model = _optional_env("OPENAI_MODEL", file_values)
+        plan_react_planner_model = _optional_env(
+            "PLAN_REACT_PLANNER_MODEL",
+            file_values,
+        )
+        plan_react_executor_model = _optional_env(
+            "PLAN_REACT_EXECUTOR_MODEL",
+            file_values,
+        )
+        plan_react_planner_api_key = _optional_env(
+            "PLAN_REACT_PLANNER_API_KEY",
+            file_values,
+        )
+        plan_react_executor_api_key = _optional_env(
+            "PLAN_REACT_EXECUTOR_API_KEY",
+            file_values,
+        )
+        plan_react_planner_base_url = _optional_env(
+            "PLAN_REACT_PLANNER_BASE_URL",
+            file_values,
+        )
+        plan_react_executor_base_url = _optional_env(
+            "PLAN_REACT_EXECUTOR_BASE_URL",
+            file_values,
+        )
 
         try:
             timeout_seconds = float(
@@ -74,15 +120,69 @@ class Settings:
         if max_output_bytes < 1:
             raise ValueError("AGENT_CLI_MAX_OUTPUT_BYTES must be greater than zero")
 
+        raw_structured_output_mode = (
+            _env_value("AGENT_STRUCTURED_OUTPUT_MODE", file_values) or "prompt"
+        ).strip().lower()
+        if raw_structured_output_mode not in _STRUCTURED_OUTPUT_MODES:
+            raise ValueError(
+                "AGENT_STRUCTURED_OUTPUT_MODE must be json-schema, json-object, or prompt"
+            )
+        planner_structured_output_mode = _optional_structured_output_mode(
+            "PLAN_REACT_PLANNER_STRUCTURED_OUTPUT_MODE",
+            file_values,
+        )
+        executor_structured_output_mode = _optional_structured_output_mode(
+            "PLAN_REACT_EXECUTOR_STRUCTURED_OUTPUT_MODE",
+            file_values,
+        )
+
         return cls(
             provider=resolved_provider,
             model=model,
+            plan_react_planner_model=plan_react_planner_model,
+            plan_react_executor_model=plan_react_executor_model,
+            plan_react_planner_api_key=plan_react_planner_api_key,
+            plan_react_executor_api_key=plan_react_executor_api_key,
+            plan_react_planner_base_url=plan_react_planner_base_url,
+            plan_react_executor_base_url=plan_react_executor_base_url,
+            plan_react_planner_structured_output_mode=planner_structured_output_mode,
+            plan_react_executor_structured_output_mode=executor_structured_output_mode,
             api_key=_optional_env("OPENAI_API_KEY", file_values),
             base_url=_optional_env("OPENAI_BASE_URL", file_values),
+            structured_output_mode=cast(
+                StructuredOutputMode,
+                raw_structured_output_mode,
+            ),
             cli_executable=_optional_env("AGENT_CLI_EXECUTABLE", file_values),
             cli_timeout_seconds=timeout_seconds,
             cli_max_output_bytes=max_output_bytes,
         )
+
+    def for_plan_react_role(self, role: PlanReactRole) -> Settings:
+        """Overlay one Plan-ReAct role's endpoint settings on the shared defaults."""
+        if role == "planner":
+            return replace(
+                self,
+                model=self.plan_react_planner_model or self.model,
+                api_key=self.plan_react_planner_api_key or self.api_key,
+                base_url=self.plan_react_planner_base_url or self.base_url,
+                structured_output_mode=(
+                    self.plan_react_planner_structured_output_mode
+                    or self.structured_output_mode
+                ),
+            )
+        if role == "executor":
+            return replace(
+                self,
+                model=self.plan_react_executor_model or self.model,
+                api_key=self.plan_react_executor_api_key or self.api_key,
+                base_url=self.plan_react_executor_base_url or self.base_url,
+                structured_output_mode=(
+                    self.plan_react_executor_structured_output_mode
+                    or self.structured_output_mode
+                ),
+            )
+        raise ValueError("Plan-ReAct role must be planner or executor")
 
 
 def _env_value(
@@ -105,3 +205,16 @@ def _optional_env(
     if not normalized:
         raise ValueError(f"{name} must not be blank")
     return normalized
+
+
+def _optional_structured_output_mode(
+    name: str,
+    file_values: Mapping[str, str | None],
+) -> StructuredOutputMode | None:
+    value = _optional_env(name, file_values)
+    if value is None:
+        return None
+    normalized = value.lower()
+    if normalized not in _STRUCTURED_OUTPUT_MODES:
+        raise ValueError(f"{name} must be json-schema, json-object, or prompt")
+    return cast(StructuredOutputMode, normalized)

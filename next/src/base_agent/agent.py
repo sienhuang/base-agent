@@ -220,6 +220,7 @@ class Agent:
         prompt: str,
         *,
         stream: bool = False,
+        on_event: Observer | None = None,
         memory_scope: MemoryScope | None = None,
     ) -> RunHandle:
         """Start a process-local background Run and return immediately."""
@@ -229,6 +230,7 @@ class Agent:
             return self._harness.run(
                 prompt,
                 stream=stream,
+                on_event=on_event,
                 run_id=run_id,
                 memory_scope=memory_scope,
             )

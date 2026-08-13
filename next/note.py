@@ -138,6 +138,26 @@ error: final model turn requested Tools while Tool use was disabled）
     按照 Skill 调用对应 Tool。如果 Tool 因权限不足被拒绝，不要自行计算，
     必须如实说明。'
 
+---flow 测试和验证。
+   uv run --project next/starter agent-app \
+    --provider openai-compatible \
+    --model qwen3.7-max \
+    --base-url https://llm.moontontech.net \
+    --flow plan-react \
+    --show-execution-trace \
+    --show-tool-results \
+    "计算 4 * 30"
+
+  确定性离线测试 Tool 调用：
+
+  uv run --project next/starter agent-app \
+    --provider openai-compatible \
+    --model deepseek-v4-pro \
+    --base-url https://llm.moontontech.net \
+    --flow plan-react \
+    --show-execution-trace \
+    --show-tool-results \
+    'tool=calculate_product calls=1 tool_args={"left":4,"right":30}'
 
   ###TODO
 

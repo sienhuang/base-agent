@@ -17,6 +17,9 @@ Prompt + Tool + Skill
 简单多 Agent 应用在此之上使用声明式 `SequentialFlow`，不直接接触生命周期仓库、
 Invoker、Worker 或恢复状态机。
 
+需要由应用持有可观察 Plan、逐步执行并在每一步后重新判断剩余工作时，使用固定角色的
+`PlannerReActFlow`。它组合多个普通 Agent Run，不修改 `Agent.run()` 或 Harness 语义。
+
 ## 最小示例
 
 ```python
@@ -101,6 +104,97 @@ Harness、RunResult 和 RunHandle 共享同一个 `EventStore`，默认使用
 `InMemoryEventStore`，不会重复保存 Event。持久化与实时扩展契约以及 PostgreSQL/Redis
 方向见 [`EVENTS.md`](EVENTS.md)。
 
+## Planner–ReAct Flow
+
+Planner 和 Executor 都是普通 Agent，但必须声明各自的结构化输出。Planner 只返回 Host
+可以校验和提交的 `PlannerDecision`；Executor 在自己的 Run 内正常使用 Tool/Skill，最终返回
+`StepOutcome`：
+
+```python
+from base_agent import (
+    Agent,
+    AgentDefinition,
+    Flow,
+    PlannerDecision,
+    PlanningLimits,
+    StepOutcome,
+)
+
+planner = Agent(
+    AgentDefinition(
+        id="planner",
+        version="1.0.0",
+        instructions="Create and review concise executable Plans.",
+        response_model=PlannerDecision,
+    ),
+    model=planner_model,
+)
+executor = Agent(
+    AgentDefinition(
+        id="executor",
+        version="1.0.0",
+        instructions="Execute exactly one Plan Step.",
+        tools=("search",),
+        response_model=StepOutcome,
+    ),
+    model=executor_model,
+    tools=(search,),
+)
+flow = Flow.planner_react(
+    id="research",
+    planner=planner,
+    executor=executor,
+    limits=PlanningLimits(max_steps=12, max_revisions=4, max_child_runs=25),
+)
+
+result = await flow.run("Research the topic and produce a checked answer")
+```
+
+这两个内置模型按 OpenAI strict JSON Schema 设计，所有属性都会出现在 `required` 中；与当前
+action 无关的值使用 `null`、空数组或空字符串。基础 `StepOutcome.output` 是 `str | None`，
+需要领域对象时可定义 `StepOutcome` 子类并把 `response_model` 指向该子类。
+
+状态机固定为 `PLANNING → EXECUTING → REVIEWING`。Review 可以保留剩余步骤、替换尚未执行的
+后缀、完成或失败；已经执行的前缀不能被 Planner 改写。Plan、Step 和 attempt id 都由 Host
+生成，模型不能生成 `agent_run_id`。
+
+每个 Planner/Executor 调用都通过 `Agent.start()` 形成独立子 Run。`FlowChildRun` 显式记录
+`flow_run_id`、`plan_id`、source/target revision、`step_id`、attempt 和 `agent_run_id`；Flow
+Event 的 `planner.started`、`step.started` 也携带同一个 `agent_run_id`。子 Run 的
+`model.*`、`tool.*` 和 `message.*` Event 保留在子 Run 自己的 EventStore 历史中，不复制到
+Flow Event。应用也可以在构造 Flow 时设置 `forward_child_events=True`：子 Run 的
+`model.*`、`tool.*`、`skill.*` 和 `context.*` 保留原 kind 与原 payload 字段，追加
+`event_scope=child_run`、角色、阶段、关联 id 和 child sequence；内部 `run.*`、`message.*`
+使用 `child.run.*`、`child.message.*`，避免与 Flow 终态和用户可见消息混淆。Flow sequence
+仍是回放与 SSE 的唯一游标。
+
+后台执行提供同样的回放、实时订阅和取消入口；Flow 取消会继续取消当前活动的子 Run：
+
+```python
+handle = flow.start("Research the topic")
+current_events = await handle.events()
+result = await handle.wait()
+
+another_handle = flow.start("Research another topic")
+cancelled = await another_handle.cancel()
+```
+
+需要让 Planner 和 Executor 都使用 Provider streaming 时，向 `run()` 或 `start()` 传入
+`stream=True`。结构化 JSON 分片会以 `child.message.delta` 进入 Flow Event stream，完整输出仍在
+校验后作为 Flow `message.completed` 发布：
+
+```python
+handle = flow.start("Research the topic", stream=True)
+```
+
+需要实时跟随时可独立迭代 `handle.stream(after_sequence=...)`；多个订阅者互不影响，stream 在
+`flow.succeeded`、`flow.failed` 或 `flow.cancelled` 后自然关闭。
+
+Planner 与 Executor 的 Memory scope 必须分别通过 `planner_memory_scope` 和
+`executor_memory_scope` 显式传入。Plan 是 Flow 领域状态，不会作为 Memory 或 Message
+隐式共享。当前 `FlowRunHandle`、Plan 和 HTTP Flow registry 仍然只存在于进程内；多
+Worker/Kubernetes 部署需要后续由共享 FlowRunStore/RunStore 驱动。
+
 ## ContextPolicy
 
 Harness 在每次构造 `ModelRequest` 前，把冻结的 SystemContext、Run 内原始 transcript 和可选
@@ -181,7 +275,10 @@ uv sync --project next --extra server --group dev
 ```python
 from base_agent.server import create_http_app
 
-app = create_http_app(agent)
+app = create_http_app(
+    agent,
+    flows={"plan-react": planner_react_flow},
+)
 ```
 
 再由任意 ASGI Server 启动，例如 `uvicorn your_application:app`。当前接口包括：
@@ -193,6 +290,11 @@ app = create_http_app(agent)
 | `POST` | `/v1/runs/{run_id}/cancel` | 取消运行中的 Run；已完成 Run 返回 `409`。 |
 | `GET` | `/v1/runs/{run_id}/events` | 按 sequence 游标回放 Event JSON。 |
 | `GET` | `/v1/runs/{run_id}/events/stream` | 先回放、再通过 SSE 实时跟随。 |
+| `POST` | `/v1/flows/{flow_name}` | 后台启动已注册 Flow，立即返回 `202`。 |
+| `GET` | `/v1/flows/{flow_run_id}` | 返回 Flow 状态、Plan 和子 Run 关联。 |
+| `POST` | `/v1/flows/{flow_run_id}/cancel` | 取消 Flow 及当前活动子 Run。 |
+| `GET` | `/v1/flows/{flow_run_id}/events` | 回放 Flow Event 和可选的关联子 Run Event。 |
+| `GET` | `/v1/flows/{flow_run_id}/events/stream` | 通过 SSE 回放并跟随 Flow。 |
 
 SSE 帧把 `Event.sequence` 同时作为 `id` 和断线续传游标：
 
@@ -204,10 +306,17 @@ data: {"sequence":8,"kind":"run.succeeded","run_id":"...","turn":1,"payload":{..
 
 客户端可用 `?after_sequence=5`、`?last_event_id=5` 或 `Last-Event-ID: 5` 只接收 sequence
 大于 5 的 Event；Header 优先于 `last_event_id`，再与 `after_sequence` 取较大值。连接空闲时
-默认每 15 秒发送一次 SSE comment 心跳，Run 终态事件发出后流自然关闭。Run registry 仍只
-存在于服务进程内，重启后原 `run_id` 不再可用，且目前不会自动清理已完成 Run。当前 Server
-因此只适合单 Worker；部署到 Kubernetes 多副本或多 Worker 前，必须迁移为共享 RunStore
-驱动，不能依赖 sticky session 维持正确性。
+默认每 15 秒发送一次 SSE comment 心跳，Run/Flow 终态事件发出后流自然关闭。Run 与 Flow
+registry 仍只存在于服务进程内，重启后原 id 不再可用，且目前不会自动清理已完成记录。当前
+Server 因此只适合单 Worker；部署到 Kubernetes 多副本或多 Worker 前，必须迁移为共享
+RunStore/FlowRunStore 驱动，不能依赖 sticky session 维持正确性。
+
+Planner-ReAct 使用与普通 Agent 相同的 `message.created` 表示原始用户消息，并在成功时发送
+`message.completed`（payload 含最终 `content`），随后发送 `flow.succeeded` 关闭 SSE。启用
+`forward_child_events` 后，客户端还可在同一条流中按原有 `model.*`、`tool.*`、`skill.*`
+kind 观察 Planner/Executor，同时通过 payload 的 `event_scope` 和 `agent_run_id` 关联来源。
+`POST /v1/flows/{flow_name}` 的 JSON body 接受 `stream` 布尔值；它控制子 Agent Provider
+streaming，而 SSE Event 订阅能力始终存在。
 
 Tool、Skill 和 Flow 的完整离线示例见 `examples/quickstart.py`。
 Skill Package 的目录、Tool 贡献、Script 执行边界和 snapshot 契约见
@@ -242,7 +351,9 @@ Skill Package 的目录、Tool 贡献、Script 执行边界和 snapshot 契约�
 - 可选 `base_agent.server` FastAPI Run 提交、状态查询与取消；
 - 有序只读 Event；
 - 结构化最终输出验证；
-- 简单 SequentialFlow 与显式阶段交接。
+- 简单 SequentialFlow 与显式阶段交接；
+- 固定 Planner/Executor 的 Planner–ReAct Flow、结构化 Plan/Step outcome、逐步 Review/Replan、
+  子 Run 关联、事件回放和取消传播。
 
 SDK Runtime 核心明确不依赖 HTTP Server、Worker、Lease、持久化恢复、Operator API、
 插件市场、动态 Tool Search、复杂多 Agent 调度或产品级会话路由。FastAPI Run Server 位于

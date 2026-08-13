@@ -1,6 +1,17 @@
-"""The application's single Agent definition and composition root."""
+"""The application's Agent and Flow definitions and composition root."""
+
+from collections.abc import Sequence
+from dataclasses import replace
 
 from base_agent import Agent, AgentDefinition, RunResult
+from base_agent.flows import (
+    Flow,
+    PlannerDecision,
+    PlannerReActFlow,
+    PlannerReActResult,
+    PlanningLimits,
+    StepOutcome,
+)
 from base_agent.governance import ConfirmationPolicy
 from base_agent.observability import Observer
 from base_agent.providers import ModelProvider
@@ -41,12 +52,30 @@ STARTER_AGENT_DEFINITION = AgentDefinition(
     max_tool_calls_per_turn=3,
 )
 
+PLAN_REACT_PLANNER_DEFINITION = AgentDefinition(
+    id="starter-planner",
+    version="1.0.0",
+    description="A fixed Planner that creates and reviews Host-owned Plans.",
+    instructions=prompt("planner.md"),
+    response_model=PlannerDecision,
+    max_model_turns=1,
+)
+
+PLAN_REACT_EXECUTOR_DEFINITION = replace(
+    STARTER_AGENT_DEFINITION,
+    id="starter-executor",
+    description="A ReAct Executor that completes one Host-selected Plan Step.",
+    instructions=prompt("executor.md"),
+    response_model=StepOutcome,
+)
+
 
 def build_agent(
     model: ModelProvider | None = None,
     *,
     definition: AgentDefinition = STARTER_AGENT_DEFINITION,
     confirmation_policy: ConfirmationPolicy | None = None,
+    observers: Sequence[Observer] = (),
 ) -> Agent:
     """Compose application Prompt and Provider with the SDK Agent facade."""
     return Agent(
@@ -55,6 +84,49 @@ def build_agent(
         tools=REGISTERED_TOOLS,
         skills=SKILL_CATALOG,
         confirmation_policy=confirmation_policy,
+        observers=observers,
+    )
+
+
+def build_plan_react_flow(
+    model: ModelProvider | None = None,
+    *,
+    planner_provider: ModelProvider | None = None,
+    executor_provider: ModelProvider | None = None,
+    planner_model: str | None = None,
+    executor_model: str | None = None,
+    confirmation_policy: ConfirmationPolicy | None = None,
+    limits: PlanningLimits | None = None,
+    observers: Sequence[Observer] = (),
+) -> PlannerReActFlow:
+    """Compose Planner and Executor Agents with independently selectable Providers."""
+    provider = model or OfflineProvider()
+    planner_definition = (
+        PLAN_REACT_PLANNER_DEFINITION
+        if planner_model is None
+        else replace(PLAN_REACT_PLANNER_DEFINITION, model=planner_model)
+    )
+    executor_definition = (
+        PLAN_REACT_EXECUTOR_DEFINITION
+        if executor_model is None
+        else replace(PLAN_REACT_EXECUTOR_DEFINITION, model=executor_model)
+    )
+    planner = Agent(
+        planner_definition,
+        model=planner_provider or provider,
+    )
+    executor = build_agent(
+        executor_provider or provider,
+        definition=executor_definition,
+        confirmation_policy=confirmation_policy,
+    )
+    return Flow.planner_react(
+        id="starter-plan-react",
+        planner=planner,
+        executor=executor,
+        limits=limits,
+        observers=observers,
+        forward_child_events=True,
     )
 
 
@@ -77,3 +149,31 @@ async def run(
             raise ValueError("streaming run requires an on_event observer")
         return await agent.stream(prompt_text, on_event=on_event)
     return await agent.run(prompt_text, on_event=on_event)
+
+
+async def run_plan_react(
+    prompt_text: str,
+    *,
+    model: ModelProvider | None = None,
+    planner_provider: ModelProvider | None = None,
+    executor_provider: ModelProvider | None = None,
+    planner_model: str | None = None,
+    executor_model: str | None = None,
+    confirmation_policy: ConfirmationPolicy | None = None,
+    limits: PlanningLimits | None = None,
+    stream: bool = False,
+    on_event: Observer | None = None,
+) -> PlannerReActResult:
+    """Run the Starter's fixed Planner/ReAct composition to completion."""
+    observers = () if on_event is None else (on_event,)
+    flow = build_plan_react_flow(
+        model,
+        planner_provider=planner_provider,
+        executor_provider=executor_provider,
+        planner_model=planner_model,
+        executor_model=executor_model,
+        confirmation_policy=confirmation_policy,
+        limits=limits,
+        observers=observers,
+    )
+    return await flow.run(prompt_text, stream=stream)

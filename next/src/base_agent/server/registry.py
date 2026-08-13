@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from base_agent.agent import Agent
+from base_agent.flows import FlowRunHandle, PlannerReActFlow, PlannerReActResult
 from base_agent.run_handle import RunHandle
 
 
 class RunNotFoundError(LookupError):
     """The requested process-local Run is unknown."""
+
+
+class FlowNotRegisteredError(LookupError):
+    """The requested Flow strategy is not registered by the application."""
+
+
+class FlowRunNotFoundError(LookupError):
+    """The requested process-local Flow Run is unknown."""
 
 
 class InMemoryRunRegistry:
@@ -27,3 +38,40 @@ class InMemoryRunRegistry:
             return self._handles[run_id]
         except KeyError as exc:
             raise RunNotFoundError(f"Run '{run_id}' was not found") from exc
+
+
+class InMemoryFlowRegistry:
+    """Retain named Flow factories and their process-local background handles."""
+
+    def __init__(self, flows: Mapping[str, PlannerReActFlow]) -> None:
+        if any(not name.strip() for name in flows):
+            raise ValueError("Flow registration names must not be blank")
+        self._flows = dict(flows)
+        self._handles: dict[str, FlowRunHandle[PlannerReActResult]] = {}
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._flows)
+
+    def start(
+        self,
+        name: str,
+        prompt: str,
+        *,
+        stream: bool = False,
+    ) -> FlowRunHandle[PlannerReActResult]:
+        try:
+            flow = self._flows[name]
+        except KeyError as exc:
+            raise FlowNotRegisteredError(f"Flow '{name}' is not registered") from exc
+        handle = flow.start(prompt, stream=stream)
+        self._handles[handle.flow_run_id] = handle
+        return handle
+
+    def get(self, flow_run_id: str) -> FlowRunHandle[PlannerReActResult]:
+        try:
+            return self._handles[flow_run_id]
+        except KeyError as exc:
+            raise FlowRunNotFoundError(
+                f"Flow Run '{flow_run_id}' was not found"
+            ) from exc

@@ -46,8 +46,8 @@ Flow.sequence(...)
 | `events/` | EventStore/EventStream 契约和默认内存事实源 | 扩展 API |
 | `context/` | 每次 Model Request 的只读上下文投影、预算和选择契约 | 扩展 API |
 | `memory/` | 显式作用域的长期 Memory recall 与非阻塞写入队列契约 | 扩展 API |
-| `server/` | 可选 FastAPI Run 提交、状态查询和进程内 Handle registry | 否 |
-| `flows/` | Stage 和简单 SequentialFlow | 是 |
+| `server/` | 可选 FastAPI Agent/Flow 提交、状态、Event/SSE 和进程内 registry | 否 |
+| `flows/` | SequentialFlow，以及固定角色、Host-owned Plan 的 PlannerReActFlow | 是 |
 | `runtime/` | snapshot、model/tool loop、结果边界 | 否 |
 | `governance/` | 副作用分类和 fail-closed 确认 | 常用枚举是 |
 | `observability/` | 只读 Observer 契约 | 按需 |
@@ -76,7 +76,7 @@ base_agent facade ──> runtime Harness
 | 来源 | 已落地原则 |
 | --- | --- |
 | AgentDemo | 薄 Agent、Tool 能力组合、Stage Prompt、显式交接和阶段验证 |
-| mock-manus | model/tool 闭环、有序执行事件、Planner/Executor 的后续预设方向 |
+| mock-manus | typed Plan/Step、逐步 Review/Replan、已执行前缀不可修改和 Flow 实时事件 |
 | Hermes | 窄腰核心、运行期固定 snapshot、Tool readiness、Observer fail-open、Governance fail-closed |
 
 没有按源码复制任何一个项目的 Agent 基类、全局注册表、FlowFactory、Gateway 或产品配置。
@@ -128,7 +128,45 @@ base_agent facade ──> runtime Harness
 Stage 间只传递原始 Flow 输入和显式、有限、可验证的 Stage output/handoff。不得隐式继承上一个
 Agent 的消息历史、Tool/Skill、权限、Provider 客户端或其他运行期对象。
 
-### 4.2 Skill Package 不变量
+### 4.2 Planner–ReAct Flow 不变量
+
+PlannerReActFlow 是 Agent/Harness 上层的 Host 编排，不是新的 Agent Runtime。Planner 与
+Executor 在 Flow 构造时固定；动态变化的是 Plan 和 Executor 在独立 Run 内选择的 ToolCall，
+第一版不根据 Step 动态路由 Agent：
+
+```text
+PLANNING
+   ↓
+EXECUTING(one Step / one Agent Run)
+   ↓
+REVIEWING ── continue/revise ──> EXECUTING
+   └────── complete/fail ──────> terminal
+```
+
+1. Planner Agent 必须返回 `PlannerDecision`，Executor Agent 必须返回 `StepOutcome`；模型不能
+   直接修改 Flow PlanStore，也不能生成 `flow_run_id`、`plan_id`、`step_id` 或 `agent_run_id`；
+2. 每次 Planner create/review 和 Executor Step 都使用 `Agent.start()` 创建独立普通 Run，保留
+   原有 snapshot、Context、Memory、Tool/Skill、预算、Event 和取消语义；
+3. `FlowChildRun` 是关联事实，显式保存 `flow_run_id`、`plan_id`、source/target revision、
+   `step_id`、attempt 和 `agent_run_id`；不得从 Prompt、Message 或 Event 内容反向猜测关联；
+4. Plan revision 表示 Planner 接受的一次结构变更。Review 只能保留剩余后缀或用全新的 Host id
+   替换它；已经执行为 succeeded/failed 的终态前缀不可修改；
+5. Agent Run 的 `RunStatus.SUCCEEDED` 只表示运行与结构化输出校验成功，Step 的业务成功由
+   `StepOutcome.success` 单独表达；业务失败可以交给 Planner revise，Agent Run 失败直接使 Flow
+   fail-closed；
+6. Flow 有独立 `max_steps`、`max_revisions` 和 `max_child_runs`，不能依赖单个 Agent 的
+   Model Turn/ToolCall 预算阻止跨 Run 循环；
+7. Flow Event 只记录 `plan.*`、`planner.*`、`step.*` 和 `flow.*` 编排事实并引用
+   `agent_run_id`；子 Run 的详细 `model.*`、`tool.*`、`message.*` Event 不复制到 Flow stream；
+8. Flow 取消必须取消当前活动的子 Run，并闭合 `step.cancelled`/`planner.cancelled`、
+   `plan.cancelled` 和 `flow.cancelled`；直接取消 `flow.run()` 的调用方 Task 仍向调用方传播
+   `CancelledError`，后台 `FlowRunHandle.cancel()` 返回 cancelled 终态结果；
+9. Planner 与 Executor 的 Memory scope 分开显式传入。Plan/Step/Outcome 是 Flow 领域状态，
+   不作为 Message、Memory 或 Context 隐式共享；
+10. 当前 FlowRunHandle、Plan 状态和子 Run 关系只支持单进程。多 Worker 时必须先持久化关联，
+    再投递预分配 `agent_run_id` 的 Run，不能依靠进程内 Handle 补记关系。
+
+### 4.3 Skill Package 不变量
 
 1. 一个 Skill 一个目录，`SKILL.md` 是经验 playbook，不是 Tool 清单；
 2. `dependencies` 表示外部 required/optional Tool，`contributions` 表示 Skill 自带能力；
@@ -145,7 +183,7 @@ Agent 的消息历史、Tool/Skill、权限、Provider 客户端或其他运行�
    `skill.resource.used` 把 Skill 自有资源与 ToolCall 关联，
    Tool 的最终结果仍由 `tool.completed` 和 `ToolResult` 表达。
 
-### 4.3 Event 不变量
+### 4.4 Event 不变量
 
 1. EventStore 是唯一事实源，Harness 和 RunHandle 不各自保存 Event 副本；
 2. `emit()` 原子分配 Run 内 sequence，并在 Observer 扇出前完成提交；
@@ -159,7 +197,7 @@ Agent 的消息历史、Tool/Skill、权限、Provider 客户端或其他运行�
 8. user/assistant `message.*` Event 的 `message_id` 与 Harness transcript、后续 ModelRequest
    中对应的 `Message.message_id` 相同；Tool Message 使用独立 id，并以 `tool_call_id` 关联调用。
 
-### 4.4 Context 不变量
+### 4.5 Context 不变量
 
 `HarnessSnapshot.system_prompt` 和 `messages` 分别是 Run 启动时冻结的完整 system prompt 与
 Run 内形成的原始 transcript；`ContextView.system_prompt/messages` 是一次模型请求实际使用的
@@ -246,13 +284,15 @@ AgentDefinition(
 2. 已增加进程内 `RunHandle.cancel()`、HTTP cancel 和 `run.cancelled` 终态语义；
 3. 已增加小型 ContextPolicy、默认 KeepAll 策略、ContextBudget 和 request-only
    ContextView，以及默认禁用的 scoped Memory recall/non-blocking write 契约；
-4. 增加声明式 Stage output contract；
-5. 用 AgentDemo MTBI Flow 验证 Artifact/Verifier；
-6. 增加固定角色的 Planner/Executor Flow 预设；
-7. 用 mock-manus PlannerReActFlow 验证重新规划和实时事件；
-8. 在已有 Skill 受控目录发现、Descriptor/Catalog/`skill_view` 基础上，根据真实
+4. 已增加固定角色、Host-owned Plan 的 PlannerReActFlow，使用 `PlannerDecision` 和
+   `StepOutcome` 验证逐步执行、Review/Replan、实时事件、子 Run 关联和取消传播；并通过
+   独立 `/v1/flows` HTTP API 提供提交、查询、取消、回放和 SSE；
+5. 根据 PlannerReActFlow 的真实 StepOutcome 和后续 AgentDemo MTBI 场景，再判断是否提取
+   SequentialFlow 共用的声明式 Stage/Artifact output contract；
+6. 用 AgentDemo MTBI Flow 验证 Artifact/Verifier；
+7. 在已有 Skill 受控目录发现、Descriptor/Catalog/`skill_view` 基础上，根据真实
    目录规模再增加检索、缓存和外部 Skill 源 Adapter；
-9. 在已有 EventStore/EventStream 小型契约上按真实部署需求增加 PostgreSQL durable store
+8. 在已有 EventStore/EventStream 小型契约上按真实部署需求增加 PostgreSQL durable store
    和 Redis notification adapter，再迁入 Artifact、Resource 等其他 Protocol。
 
 Worker、Lease、Operator API 和分布式恢复不在以上主路径内；只有明确部署需求出现时，才
@@ -260,8 +300,9 @@ Worker、Lease、Operator API 和分布式恢复不在以上主路径内；只�
 
 ### 多进程 Run 管理（已记录，暂缓实现）
 
-当前 `InMemoryRunRegistry` 和 `RunHandle` 都是执行进程内对象，只支持单 Worker。以后支持
-多进程或多实例时，HTTP 层不能再把 `RunHandle` 当权威 Run 记录：
+当前 `InMemoryRunRegistry`、`InMemoryFlowRegistry`、`RunHandle` 和 `FlowRunHandle` 都是执行
+进程内对象，只支持单 Worker。以后支持多进程或多实例时，HTTP 层不能再把 Handle 当权威
+记录：
 
 1. 共享 `RunStore` 保存 Run 状态、结果、取消标记和执行租约；
 2. API Worker 只创建/查询 RunRecord，不直接持有后台 `asyncio.Task`；
@@ -271,9 +312,9 @@ Worker、Lease、Operator API 和分布式恢复不在以上主路径内；只�
 
 已经明确的部署门槛：`RunHandle` 只保留为 Execution Worker 内部控制本地 Task 的原语；任何
 Kubernetes、多 Pod、多 Worker、滚动更新或弹性扩缩容部署，都必须先把 HTTP Run 创建、查询、
-取消和结果读取迁移为共享 `RunStore` 驱动。API Pod 通过 RunStore 写入取消请求，持有 lease
-的 Worker 再取消自己的本地 RunHandle；负载均衡、sticky session 或共享 EventStore 都不能
-替代 RunStore。
+取消和结果读取迁移为共享 `RunStore`/`FlowRunStore` 驱动。API Pod 通过 Store 写入取消请求，
+持有 lease 的 Worker 再取消自己的本地 Handle；负载均衡、sticky session 或共享 EventStore
+都不能替代状态 Store。
 
 这部分等单进程 Run/Event/Server 契约稳定后再实现，当前 Starter 明确保持单 Worker，不能
 作为多副本 K8s Run Server 部署。

@@ -25,7 +25,10 @@ from base_agent.providers.errors import (
     ProviderUnavailableError,
 )
 from base_agent.providers.models import ProviderCapabilities, ProviderInfo
-from base_agent.providers.openai_chat import OpenAIChatProvider
+from base_agent.providers.openai_chat import (
+    OpenAIChatProvider,
+    OpenAIStructuredOutputMode,
+)
 from base_agent.providers.protocol import ModelProvider, StreamingModelProvider
 
 __all__ = [
@@ -43,6 +46,7 @@ __all__ = [
     "MissingProviderDependencyError",
     "ModelProvider",
     "OpenAIChatProvider",
+    "OpenAIStructuredOutputMode",
     "ProviderAuthenticationError",
     "ProviderCapabilities",
     "ProviderConfigurationError",

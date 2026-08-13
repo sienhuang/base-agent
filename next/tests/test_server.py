@@ -6,11 +6,19 @@ from typing import Any
 import httpx
 import pytest
 
-from base_agent import Agent, AgentDefinition
+from base_agent import (
+    Agent,
+    AgentDefinition,
+    Flow,
+    FlowStatus,
+    PlannerDecision,
+    StepOutcome,
+)
 from base_agent.events import InMemoryEventStore
+from base_agent.flows import PlannerReActFlow
 from base_agent.models import Event, ModelRequest, ModelResponse
 from base_agent.providers import ModelProvider, ProviderCapabilities, ProviderInfo
-from base_agent.server import InMemoryRunRegistry, create_http_app
+from base_agent.server import InMemoryFlowRegistry, InMemoryRunRegistry, create_http_app
 from base_agent.testing import FakeModel
 
 
@@ -49,8 +57,13 @@ async def _client(
     agent: Agent,
     *,
     sse_ping_seconds: int = 15,
+    flows: Mapping[str, PlannerReActFlow] | None = None,
 ) -> AsyncIterator[tuple[httpx.AsyncClient, Any]]:
-    app = create_http_app(agent, sse_ping_seconds=sse_ping_seconds)
+    app = create_http_app(
+        agent,
+        sse_ping_seconds=sse_ping_seconds,
+        flows=flows,
+    )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield client, app
@@ -69,6 +82,79 @@ async def _wait_for_status(
             return payload
         await asyncio.sleep(0)
     raise AssertionError(f"Run did not reach status {expected!r}")
+
+
+async def _wait_for_flow_status(
+    client: httpx.AsyncClient,
+    flow_run_id: str,
+    expected: str,
+) -> dict[str, Any]:
+    for _ in range(100):
+        response = await client.get(f"/v1/flows/{flow_run_id}")
+        assert response.status_code == 200
+        payload = response.json()
+        if payload["status"] == expected:
+            return payload
+        await asyncio.sleep(0)
+    raise AssertionError(f"Flow Run did not reach status {expected!r}")
+
+
+def _planner_react_flow(
+    *,
+    planner_model: ModelProvider | None = None,
+    executor_model: ModelProvider | None = None,
+) -> PlannerReActFlow:
+    planner = Agent(
+        AgentDefinition(
+            id="http-planner",
+            version="1.0.0",
+            instructions="Create and review the Plan.",
+            response_model=PlannerDecision,
+        ),
+        model=planner_model
+        or FakeModel(
+            [
+                ModelResponse(
+                    content=(
+                        '{"action":"create","goal":"Return a checked result",'
+                        '"steps":[{"description":"Execute one Step"}],'
+                        '"reason":"One Step is enough","final_output":null}'
+                    )
+                ),
+                ModelResponse(
+                    content=(
+                        '{"action":"complete","goal":null,"steps":[],'
+                        '"reason":"The Step succeeded","final_output":"HTTP Flow done"}'
+                    )
+                ),
+            ]
+        ),
+    )
+    executor = Agent(
+        AgentDefinition(
+            id="http-executor",
+            version="1.0.0",
+            instructions="Execute one Step.",
+            response_model=StepOutcome,
+        ),
+        model=executor_model
+        or FakeModel(
+            [
+                ModelResponse(
+                    content=(
+                        '{"success":true,"summary":"Step completed",'
+                        '"output":"checked","error":null}'
+                    )
+                )
+            ]
+        ),
+    )
+    return Flow.planner_react(
+        id="http-plan-react",
+        planner=planner,
+        executor=executor,
+        forward_child_events=True,
+    )
 
 
 async def test_http_starts_without_waiting_and_returns_completed_result() -> None:
@@ -105,6 +191,147 @@ async def test_http_starts_without_waiting_and_returns_completed_result() -> Non
         "text": "HTTP done",
         "error": None,
     }
+
+
+async def test_http_starts_plan_react_and_exposes_result_events_and_sse() -> None:
+    flow = _planner_react_flow()
+
+    async with _client(
+        _agent(FakeModel.text("ordinary")),
+        flows={"plan-react": flow},
+    ) as (client, app):
+        started = await client.post(
+            "/v1/flows/plan-react",
+            json={"prompt": "Complete checked work"},
+        )
+
+        assert started.status_code == 202
+        assert started.json()["status"] == "running"
+        flow_run_id = started.json()["flow_run_id"]
+        assert isinstance(app.state.flow_registry, InMemoryFlowRegistry)
+
+        completed = await _wait_for_flow_status(client, flow_run_id, "succeeded")
+        events = await client.get(f"/v1/flows/{flow_run_id}/events")
+        stream = await client.get(f"/v1/flows/{flow_run_id}/events/stream")
+
+    assert completed["flow_run_id"] == flow_run_id
+    assert completed["status"] == FlowStatus.SUCCEEDED
+    assert completed["output"] == "HTTP Flow done"
+    assert completed["error"] is None
+    assert completed["plan_id"] == completed["plan"]["id"]
+    assert completed["plan"]["status"] == "succeeded"
+    assert [child["role"] for child in completed["child_runs"]] == [
+        "planner",
+        "executor",
+        "planner",
+    ]
+    payloads = events.json()
+    assert len(payloads) == completed["event_count"]
+    assert payloads[0]["kind"] == "flow.started"
+    assert payloads[-1]["kind"] == "flow.succeeded"
+    child_events = [
+        event
+        for event in payloads
+        if event["payload"].get("event_scope") == "child_run"
+    ]
+    assert {event["payload"]["child_role"] for event in child_events} == {
+        "planner",
+        "executor",
+    }
+    assert "model.responded" in {event["kind"] for event in child_events}
+    assert "child.run.succeeded" in {event["kind"] for event in child_events}
+    assert all(event["run_id"] == flow_run_id for event in payloads)
+    stream_text = stream.text.replace("\r\n", "\n")
+    assert "event: model.responded" in stream_text
+    assert "event: child.run.succeeded" in stream_text
+    assert "event: message.completed" in stream_text
+    assert '"content":"HTTP Flow done"' in stream_text
+    assert "event: flow.succeeded" in stream_text
+
+
+async def test_http_flow_routes_validate_names_ids_payloads_and_cursor() -> None:
+    async with _client(
+        _agent(FakeModel.text("ordinary")),
+        flows={"plan-react": _planner_react_flow()},
+    ) as (client, _):
+        unknown_run = await client.get("/v1/flows/missing")
+        blank = await client.post(
+            "/v1/flows/plan-react",
+            json={"prompt": " "},
+        )
+        extra = await client.post(
+            "/v1/flows/plan-react",
+            json={"prompt": "hello", "permissions": ["admin"]},
+        )
+        negative_cursor = await client.get(
+            "/v1/flows/missing/events",
+            params={"after_sequence": -1},
+        )
+
+    assert unknown_run.status_code == 404
+    assert unknown_run.json() == {"detail": "Flow Run 'missing' was not found"}
+    assert blank.status_code == extra.status_code == 422
+    assert negative_cursor.status_code == 422
+
+
+async def test_http_flow_reports_unsupported_provider_streaming() -> None:
+    async with _client(
+        _agent(FakeModel.text("ordinary")),
+        flows={"plan-react": _planner_react_flow()},
+    ) as (client, _):
+        started = await client.post(
+            "/v1/flows/plan-react",
+            json={"prompt": "stream the Flow", "stream": True},
+        )
+        failed = await _wait_for_flow_status(
+            client,
+            started.json()["flow_run_id"],
+            "failed",
+        )
+
+    assert started.status_code == 202
+    assert "does not support streaming" in failed["error"]
+    assert failed["child_runs"] == []
+
+
+async def test_http_cancels_running_plan_react_flow_idempotently() -> None:
+    class GatedStructuredModel(GatedModel):
+        @property
+        def info(self) -> ProviderInfo:
+            return ProviderInfo(
+                name="http-gated-structured-model",
+                default_model="http-gated-structured-model",
+                capabilities=ProviderCapabilities(structured_output=True),
+            )
+
+    model = GatedStructuredModel()
+    flow = _planner_react_flow(executor_model=model)
+
+    async with _client(
+        _agent(FakeModel.text("ordinary")),
+        flows={"plan-react": flow},
+    ) as (client, _):
+        started = await client.post(
+            "/v1/flows/plan-react",
+            json={"prompt": "Wait for cancellation"},
+        )
+        flow_run_id = started.json()["flow_run_id"]
+        await asyncio.wait_for(model.requested.wait(), timeout=1)
+
+        cancelled = await client.post(f"/v1/flows/{flow_run_id}/cancel")
+        repeated = await client.post(f"/v1/flows/{flow_run_id}/cancel")
+        events = await client.get(f"/v1/flows/{flow_run_id}/events")
+
+    assert cancelled.status_code == repeated.status_code == 200
+    assert cancelled.json() == repeated.json()
+    assert cancelled.json()["status"] == "cancelled"
+    assert cancelled.json()["error"] == "flow cancellation requested"
+    assert cancelled.json()["plan"]["status"] == "cancelled"
+    assert events.json()[-1]["kind"] == "flow.cancelled"
+    assert any(
+        event["payload"].get("event_scope") == "child_run"
+        for event in events.json()
+    )
 
 
 async def test_http_cancels_running_run_and_replays_terminal_event() -> None:

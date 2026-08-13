@@ -5,12 +5,12 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
 from base_agent.agent import Agent
+from base_agent.flows.models import FlowStatus
 from base_agent.models import Event, RunResult, RunStatus
 from base_agent.verification import VerificationEvidence
 
@@ -19,11 +19,6 @@ StageVerifier = Callable[
     [RunResult],
     bool | VerificationEvidence | Awaitable[bool | VerificationEvidence],
 ]
-
-
-class FlowStatus(StrEnum):
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,14 +180,6 @@ class SequentialFlow:
             stages=tuple(stage_results),
             events=tuple(events),
         )
-
-
-class Flow:
-    """Construction namespace; Strategy and Lifecycle stay out of the main path."""
-
-    @staticmethod
-    def sequence(*, id: str, stages: Sequence[Stage]) -> SequentialFlow:
-        return SequentialFlow(id=id, stages=stages)
 
 
 def _select_stage_input(

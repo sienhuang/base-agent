@@ -4,13 +4,15 @@ import argparse
 import asyncio
 import sys
 from dataclasses import replace
-from typing import cast
+from typing import Literal, cast
 
 from base_agent.models import Event
 
-from agent_app.app import run
-from agent_app.config import ProviderName, Settings
-from agent_app.provider import build_provider
+from agent_app.app import run, run_plan_react
+from agent_app.config import ProviderName, Settings, StructuredOutputMode
+from agent_app.provider import build_plan_react_providers, build_provider
+
+RunMode = Literal["agent", "plan-react"]
 
 
 async def _run(
@@ -20,9 +22,17 @@ async def _run(
     show_tool_results: bool,
     show_execution_trace: bool,
     stream: bool,
+    flow: RunMode = "agent",
 ) -> int:
     try:
         provider = build_provider(settings)
+        if flow == "plan-react":
+            planner_provider, executor_provider = build_plan_react_providers(
+                settings,
+                default_provider=provider,
+            )
+        else:
+            planner_provider = executor_provider = provider
     except (ImportError, ValueError) as exc:
         print(f"configuration error: {exc}")
         return 2
@@ -32,7 +42,10 @@ async def _run(
     def observe_event(event: Event) -> None:
         nonlocal streamed_text
         if show_execution_trace:
-            line = _execution_trace_line(event)
+            line = _execution_trace_line(
+                event,
+                include_run_id=(flow == "plan-react"),
+            )
             if line is not None:
                 print(line, file=sys.stderr, flush=True)
         if stream and event.kind == "message.delta":
@@ -41,12 +54,41 @@ async def _run(
                 print(text, end="", flush=True)
                 streamed_text = True
 
+    observer = observe_event if stream or show_execution_trace else None
     try:
+        if flow == "plan-react":
+            flow_result = await run_plan_react(
+                prompt,
+                model=provider,
+                planner_provider=planner_provider,
+                executor_provider=executor_provider,
+                planner_model=settings.plan_react_planner_model,
+                executor_model=settings.plan_react_executor_model,
+                stream=stream,
+                on_event=observer,
+            )
+            if flow_result.output:
+                print(flow_result.output)
+            if show_tool_results:
+                for child in flow_result.child_runs:
+                    for item in child.run.tool_results:
+                        line = (
+                            f"{child.agent_run_id}/{item.call.id}: "
+                            f"status={item.status.value}, data={item.data!r}"
+                        )
+                        if item.error is not None:
+                            line += f", error={item.error!r}"
+                        print(line)
+            if flow_result.error is not None:
+                print(f"error: {flow_result.error}")
+                return 1
+            return 0
+
         result = await run(
             prompt,
             model=provider,
             stream=stream,
-            on_event=(observe_event if stream or show_execution_trace else None),
+            on_event=observer,
         )
     except ValueError as exc:
         print(f"configuration error: {exc}")
@@ -67,8 +109,27 @@ async def _run(
     return 0
 
 
-def _execution_trace_line(event: Event) -> str | None:
-    prefix = f"[trace {event.sequence}] {event.kind}"
+def _execution_trace_line(
+    event: Event,
+    *,
+    include_run_id: bool = False,
+) -> str | None:
+    if event.payload.get("event_scope") == "child_run":
+        child_payload = dict(event.payload)
+        child_payload.pop("event_scope", None)
+        child_kind = event.kind.removeprefix("child.")
+        return _execution_trace_line(
+            Event(
+                sequence=event.payload["child_sequence"],
+                kind=child_kind,
+                run_id=event.payload["agent_run_id"],
+                turn=event.turn,
+                payload=child_payload,
+            ),
+            include_run_id=True,
+        )
+    trace_id = f"{event.run_id[:8]}:{event.sequence}" if include_run_id else str(event.sequence)
+    prefix = f"[trace {trace_id}] {event.kind}"
     if event.kind == "run.started":
         return f"{prefix} agent={event.payload['agent_id']}"
     if event.kind in {"skill.selected", "skill.loaded", "skill.file.loaded"}:
@@ -106,11 +167,67 @@ def _execution_trace_line(event: Event) -> str | None:
         return f"{prefix} turn={event.turn}"
     if event.kind == "run.failed":
         return f"{prefix} error={event.payload['error']!r}"
+    if event.kind == "flow.started":
+        return (
+            f"{prefix} flow={event.payload['flow_id']} "
+            f"plan={event.payload['plan_id']}"
+        )
+    if event.kind == "planner.started":
+        return (
+            f"{prefix} phase={event.payload['phase']} "
+            f"run={event.payload['agent_run_id']}"
+        )
+    if event.kind == "planner.completed":
+        return (
+            f"{prefix} phase={event.payload['phase']} "
+            f"action={event.payload['action']} run={event.payload['agent_run_id']}"
+        )
+    if event.kind == "plan.created":
+        return (
+            f"{prefix} plan={event.payload['plan_id']} "
+            f"revision={event.payload['plan_revision']}"
+        )
+    if event.kind == "plan.reviewed":
+        return (
+            f"{prefix} revision={event.payload['plan_revision']} "
+            f"step={event.payload['step_id']} action={event.payload['action']}"
+        )
+    if event.kind == "plan.revised":
+        return (
+            f"{prefix} plan={event.payload['plan_id']} "
+            f"revision={event.payload['source_plan_revision']}"
+            f"->{event.payload['target_plan_revision']}"
+        )
+    if event.kind == "step.started":
+        return (
+            f"{prefix} revision={event.payload['plan_revision']} "
+            f"step={event.payload['step_id']} attempt={event.payload['attempt']} "
+            f"run={event.payload['agent_run_id']}"
+        )
+    if event.kind in {"step.completed", "step.failed"}:
+        return (
+            f"{prefix} revision={event.payload['plan_revision']} "
+            f"step={event.payload['step_id']} success={event.payload.get('success')} "
+            f"run={event.payload['agent_run_id']}"
+        )
+    if event.kind in {"plan.completed", "plan.failed", "plan.cancelled"}:
+        return (
+            f"{prefix} plan={event.payload['plan_id']} "
+            f"revision={event.payload['plan_revision']}"
+        )
+    if event.kind in {"flow.succeeded", "flow.failed", "flow.cancelled"}:
+        return f"{prefix} plan={event.payload['plan_id']}"
     return None
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Starter Agent.")
+    parser.add_argument(
+        "--flow",
+        choices=("agent", "plan-react"),
+        default="agent",
+        help="Run the ordinary Agent or the fixed Planner-ReAct Flow",
+    )
     parser.add_argument(
         "--provider",
         choices=(
@@ -126,8 +243,30 @@ def main() -> None:
         help="OpenAI-compatible model name; defaults to OPENAI_MODEL",
     )
     parser.add_argument(
+        "--planner-model",
+        help=(
+            "Planner model for plan-react; defaults to "
+            "PLAN_REACT_PLANNER_MODEL, then --model/AGENT_MODEL"
+        ),
+    )
+    parser.add_argument(
+        "--executor-model",
+        help=(
+            "Executor model for plan-react; defaults to "
+            "PLAN_REACT_EXECUTOR_MODEL, then --model/AGENT_MODEL"
+        ),
+    )
+    parser.add_argument(
         "--base-url",
         help="OpenAI-compatible API base URL; defaults to OPENAI_BASE_URL",
+    )
+    parser.add_argument(
+        "--structured-output-mode",
+        choices=("json-schema", "json-object", "prompt"),
+        help=(
+            "OpenAI-compatible structured output transport; defaults to "
+            "AGENT_STRUCTURED_OUTPUT_MODE or prompt"
+        ),
     )
     parser.add_argument(
         "--cli-executable",
@@ -158,15 +297,42 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
     if provider_override in {"codex-cli", "claude-cli"} and arguments.model is None:
-        settings = replace(settings, model=None)
+        settings = replace(
+            settings,
+            model=None,
+            plan_react_planner_model=None,
+            plan_react_executor_model=None,
+        )
     if arguments.model is not None:
         if not arguments.model.strip():
             parser.error("--model must not be blank")
         settings = replace(settings, model=arguments.model.strip())
+    if arguments.planner_model is not None:
+        if not arguments.planner_model.strip():
+            parser.error("--planner-model must not be blank")
+        settings = replace(
+            settings,
+            plan_react_planner_model=arguments.planner_model.strip(),
+        )
+    if arguments.executor_model is not None:
+        if not arguments.executor_model.strip():
+            parser.error("--executor-model must not be blank")
+        settings = replace(
+            settings,
+            plan_react_executor_model=arguments.executor_model.strip(),
+        )
     if arguments.base_url is not None:
         if not arguments.base_url.strip():
             parser.error("--base-url must not be blank")
         settings = replace(settings, base_url=arguments.base_url.strip())
+    if arguments.structured_output_mode is not None:
+        settings = replace(
+            settings,
+            structured_output_mode=cast(
+                StructuredOutputMode,
+                arguments.structured_output_mode,
+            ),
+        )
     if arguments.cli_executable is not None:
         if not arguments.cli_executable.strip():
             parser.error("--cli-executable must not be blank")
@@ -182,6 +348,7 @@ def main() -> None:
                 show_tool_results=arguments.show_tool_results,
                 show_execution_trace=arguments.show_execution_trace,
                 stream=arguments.stream,
+                flow=cast(RunMode, arguments.flow),
             )
         )
     )

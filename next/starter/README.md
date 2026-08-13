@@ -1,14 +1,16 @@
-# base-agent Starter — Step 03: Skill 组合
+# base-agent Starter — Planner-ReAct 集成
 
-当前 Starter 在已经验收的 Prompt、Provider、Tool 和 Model Streaming 之上增加一个
-应用拥有的 Skill Package：
+当前 Starter 在已经验收的 Prompt、Provider、Tool、Skill 和 Model Streaming 之上，接入了
+SDK 的固定 Planner + ReAct Executor Flow，既可运行普通 Agent，也可直接测试 Plan 的
+create → execute → review → complete/revise 生命周期。
 
 > `SKILL.md` frontmatter 提供可自动发现的身份，正文总结可复用操作经验；
 > 受信任 Skill 目录中的 `tools.py` 自动提供类型化 Tool，`scripts/` 默认作为 Tool
 > 的私有实现。
 
-本阶段没有 Flow、持久化或恢复；已支持 Provider 到 CLI 的模型文本 streaming，并通过一个
-薄 ASGI composition root 使用 SDK 提供的 HTTP Run Server。
+Planner 只负责返回结构化 `PlannerDecision`，没有 Tool；Executor 复用 Starter 已有的
+Tool、Skill、权限和确认策略，并返回结构化 `StepOutcome`。Plan、Step 状态和调度权仍由 Host
+拥有，两个角色不会动态路由。
 
 ## 目录
 
@@ -36,7 +38,9 @@ src/agent_app/
 │       └── scripts/
 │           └── calculate.py
 └── prompts/
-    └── assistant.md       # 开发者首先修改的文件
+    ├── assistant.md       # 普通 Agent Prompt
+    ├── planner.md         # 固定 Planner Prompt
+    └── executor.md        # 固定 ReAct Executor Prompt
 ```
 
 `app.py` 只使用 SDK 公共门面；Starter 禁止导入 `base_agent.runtime`。
@@ -67,6 +71,46 @@ cp next/starter/.env.example next/starter/.env
 占位配置。若既没有 `.env` 也没有相关进程环境变量，Starter 才会回退到
 OfflineProvider。
 
+Starter 默认设置 `AGENT_STRUCTURED_OUTPUT_MODE=prompt`，适用于只兼容 Chat Completions、
+但不支持 `response_format.type=json_schema` 的服务。Provider 会把 JSON Schema 写入系统指令，
+Harness 仍会用 Pydantic 严格校验最终输出。原生支持严格响应格式的服务可以改为：
+
+```dotenv
+AGENT_STRUCTURED_OUTPUT_MODE=json-schema
+```
+
+只支持旧版 JSON mode 的服务也可以选择 `json-object`。
+
+普通 Agent 使用 `AGENT_MODEL`。Planner-ReAct 默认让 Planner 和 Executor 继承这个模型；如果
+需要按角色优化质量或成本，可以单独覆盖：
+
+```dotenv
+AGENT_MODEL=YOUR_DEFAULT_MODEL
+PLAN_REACT_PLANNER_MODEL=YOUR_PLANNER_MODEL
+PLAN_REACT_EXECUTOR_MODEL=YOUR_EXECUTOR_MODEL
+```
+
+Planner 模型负责创建和 Review Plan，需要可靠地产生结构化 `PlannerDecision`，但不调用 Tool；
+Executor 模型负责多轮 ReAct、Tool Calling 和结构化 `StepOutcome`。CLI 也可使用
+`--planner-model` 和 `--executor-model` 临时覆盖。未设置角色覆盖时会自动回退到 `--model`、
+`AGENT_MODEL` 或 `OPENAI_MODEL` 选出的 Provider 默认模型。
+
+如果两个角色不在同一个 OpenAI-compatible 端点，还可以分别配置完整的连接路由：
+
+```dotenv
+PLAN_REACT_PLANNER_BASE_URL=https://planner.example/v1
+PLAN_REACT_PLANNER_API_KEY=YOUR_PLANNER_API_KEY
+PLAN_REACT_PLANNER_STRUCTURED_OUTPUT_MODE=json-schema
+
+PLAN_REACT_EXECUTOR_BASE_URL=https://executor.example/v1
+PLAN_REACT_EXECUTOR_API_KEY=YOUR_EXECUTOR_API_KEY
+PLAN_REACT_EXECUTOR_STRUCTURED_OUTPUT_MODE=prompt
+```
+
+每个未设置的角色字段都会继承对应的 `OPENAI_BASE_URL`、`OPENAI_API_KEY` 和
+`AGENT_STRUCTURED_OUTPUT_MODE`。当两个角色解析出的连接配置完全相同时，Starter 会复用同一个
+Provider；只要模型、Base URL、API Key 或结构化输出模式不同，就会构造独立 Provider。
+
 `.env` 只配置 Provider 和基础设施，不定义 Agent 能力。普通 Tool、Skill、权限和执行预算统一
 收敛在 `app.py` 的 `STARTER_AGENT_DEFINITION`；CLI 与 HTTP 都调用同一个 `build_agent()`，
 不能分别改变能力白名单。
@@ -81,6 +125,54 @@ uv run --project next/starter agent-app "hello"
 
 ```text
 Hello! How can I help?
+```
+
+## 测试 Planner-ReAct
+
+使用 `.env` 中现有的 OpenAI-compatible 配置运行真实模型：
+
+```bash
+uv run --project next/starter agent-app \
+  --flow plan-react \
+  --show-execution-trace \
+  --show-tool-results \
+  "计算 4 * 30"
+```
+
+Trace 会同时显示 Flow Event 和 Planner/Executor 子 Run Event。由于每个 Event stream 都有自己
+的 sequence，Planner-ReAct 模式使用 `run_id` 前八位加 sequence 作为显示游标，例如
+`[trace a1b2c3d4:5] step.started`。`flow.started` 给出 `plan_id`，每次
+`planner.started`/`step.started` 给出对应 `agent_run_id`，因此可以核对所有子 Run 都属于同一次
+Flow。
+
+不依赖外部模型的确定性测试可显式选择 OfflineProvider，并要求 Executor 调用
+`python-calculator` Skill 提供的 Tool：
+
+```bash
+uv run --project next/starter agent-app \
+  --provider offline \
+  --flow plan-react \
+  --show-execution-trace \
+  --show-tool-results \
+  'tool=calculate_product calls=1 tool_args={"left":4,"right":30}'
+```
+
+预期可以看到 `calculate_product` 的 ToolResult 为 `{'product': 120}`，Flow 最终产生
+`plan.completed` 和 `flow.succeeded`。OfflineProvider 现在声明并模拟严格结构化输出，因此这条
+命令会经过与真实 Provider 相同的 `PlannerDecision`/`StepOutcome` 校验路径。
+
+Planner-ReAct 同样接受 `--stream`，它会让 Planner 和 Executor 的 Provider 都使用
+streaming。由于两者返回的是内部结构化 JSON，分片只作为 `child.message.delta` Event 发布，
+不会直接写到 stdout；CLI 最终只打印完整校验后的 Flow output。`--show-execution-trace` 可实时
+查看 Flow 与子 Run 生命周期。HTTP `/v1/runs` 仍保持普通 Agent Run 语义；Planner-ReAct
+使用独立的 `/v1/flows` API。
+
+```bash
+uv run --project next/starter agent-app \
+  --flow plan-react \
+  --stream \
+  --show-execution-trace \
+  "计算 4 * 30"
 ```
 
 ## 启动 FastAPI
@@ -136,6 +228,50 @@ curl -N -H 'Last-Event-ID: 3' \
 ```
 
 空闲 SSE 默认每 15 秒发送 comment 心跳。心跳不写入 EventStore，也不改变事件游标。
+
+### 通过 FastAPI 测试 Planner-ReAct
+
+提交 Flow，接口立即返回 `202` 和 `flow_run_id`：
+
+```bash
+curl http://127.0.0.1:8000/v1/flows/plan-react \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"计算 4 * 30","stream":true}'
+```
+
+查询状态与最终 Plan：
+
+```bash
+curl http://127.0.0.1:8000/v1/flows/<flow_run_id>
+```
+
+从头订阅 Flow SSE：
+
+```bash
+curl -N -H 'Accept: text/event-stream' \
+  http://127.0.0.1:8000/v1/flows/<flow_run_id>/events/stream
+```
+
+也可以回放、续传或取消：
+
+```bash
+curl 'http://127.0.0.1:8000/v1/flows/<flow_run_id>/events?after_sequence=3'
+
+curl -N -H 'Last-Event-ID: 3' \
+  http://127.0.0.1:8000/v1/flows/<flow_run_id>/events/stream
+
+curl -X POST http://127.0.0.1:8000/v1/flows/<flow_run_id>/cancel
+```
+
+Flow SSE 除了 `plan.created`、`step.completed` 等外层 Event，还直接使用普通 Agent 的
+`model.*`、`skill.*`、`tool.*` 和 `context.*` kind。原 payload 字段保持不变，并追加
+`event_scope=child_run`、`child_role`、`flow_phase`、`agent_run_id`、`child_sequence` 等关联信息；
+内部 Run 和 Message 使用 `child.run.*`、`child.message.*`，避免误判 Flow 终态或最终消息。
+Flow 原始请求与最终结果分别使用标准 `message.created`、`message.completed`，随后发送
+`flow.succeeded` 并关闭 SSE。所有事件仍以 Flow 自己的 sequence 作为唯一续传游标。
+请求中的 `stream=true` 只控制子 Agent 是否调用 Provider streaming；无论该值如何，Event
+历史和 SSE 路由始终可用。不支持 streaming 的任一角色 Provider 会使 Flow 明确进入
+`flow.failed`，不会静默回退为完整响应。
 
 HTTP 服务和 CLI 使用同一份 `.env` Provider 配置。模板选择 `openai-compatible`，需要配置
 `AGENT_MODEL`、`OPENAI_API_KEY`，连接非 OpenAI 服务时再设置 `OPENAI_BASE_URL`；Agent 能力
