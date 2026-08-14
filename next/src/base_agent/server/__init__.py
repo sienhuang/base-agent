@@ -6,6 +6,7 @@ from base_agent.server.registry import (
     FlowRunNotFoundError,
     InMemoryFlowRegistry,
     InMemoryRunRegistry,
+    RegisteredFlow,
     RunNotFoundError,
 )
 from base_agent.server.schemas import (
@@ -21,6 +22,7 @@ from base_agent.server.schemas import (
 
 __all__ = [
     "InMemoryRunRegistry",
+    "RegisteredFlow",
     "InMemoryFlowRegistry",
     "EventResponse",
     "FlowChildRunResponse",

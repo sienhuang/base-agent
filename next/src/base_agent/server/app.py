@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import FastAPI, Header, HTTPException, Query, status
 from sse_starlette import EventSourceResponse, ServerSentEvent
+from starlette.types import Lifespan
 
 from base_agent.agent import Agent
 from base_agent.flows import (
+    FlowResult,
     FlowRunHandle,
     FlowRunNotCancellableError,
     FlowStatus,
-    PlannerReActFlow,
     PlannerReActResult,
 )
 from base_agent.models import Event, RunStatus
@@ -27,6 +28,7 @@ from base_agent.server.registry import (
     FlowRunNotFoundError,
     InMemoryFlowRegistry,
     InMemoryRunRegistry,
+    RegisteredFlow,
     RunNotFoundError,
 )
 from base_agent.server.schemas import (
@@ -47,7 +49,8 @@ def create_http_app(
     prefix: str = "/v1",
     title: str = "base-agent Run Server",
     sse_ping_seconds: int = 15,
-    flows: Mapping[str, PlannerReActFlow] | None = None,
+    flows: Mapping[str, RegisteredFlow] | None = None,
+    lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
     """Create an HTTP adapter for process-local Agent and named Flow Runs."""
     if not prefix.startswith("/") or (len(prefix) > 1 and prefix.endswith("/")):
@@ -57,7 +60,7 @@ def create_http_app(
     route_prefix = "" if prefix == "/" else prefix
     registry = InMemoryRunRegistry(agent)
     flow_registry = InMemoryFlowRegistry(flows or {})
-    app = FastAPI(title=title)
+    app = FastAPI(title=title, lifespan=lifespan)
     app.state.run_registry = registry
     app.state.flow_registry = flow_registry
     app.state.sse_ping_seconds = sse_ping_seconds
@@ -220,7 +223,7 @@ def _get_handle(registry: InMemoryRunRegistry, run_id: str) -> RunHandle:
 def _get_flow_handle(
     registry: InMemoryFlowRegistry,
     flow_run_id: str,
-) -> FlowRunHandle[PlannerReActResult]:
+) -> FlowRunHandle[Any]:
     try:
         return registry.get(flow_run_id)
     except FlowRunNotFoundError as exc:
@@ -307,7 +310,7 @@ async def _run_response(handle: RunHandle) -> RunResponse:
 
 
 async def _flow_response(
-    handle: FlowRunHandle[PlannerReActResult],
+    handle: FlowRunHandle[Any],
 ) -> FlowResponse:
     current_status = handle.status
     if current_status is FlowStatus.RUNNING:
@@ -331,27 +334,60 @@ async def _flow_response(
             error=f"{type(exc).__name__}: {exc}",
         )
     events = await handle.events()
+    if isinstance(result, PlannerReActResult):
+        return FlowResponse(
+            flow_run_id=handle.flow_run_id,
+            plan_id=result.plan_id,
+            status=result.status,
+            event_count=len(events),
+            output=result.output,
+            error=result.error,
+            plan=(
+                result.plan.model_dump(mode="json")
+                if result.plan is not None
+                else None
+            ),
+            child_runs=tuple(
+                FlowChildRunResponse(
+                    role=child.role.value,
+                    phase=child.phase,
+                    agent_run_id=child.agent_run_id,
+                    status=child.run.status,
+                    source_plan_revision=child.source_plan_revision,
+                    target_plan_revision=child.target_plan_revision,
+                    step_id=child.step_id,
+                    attempt=child.attempt,
+                )
+                for child in result.child_runs
+            ),
+        )
+    if isinstance(result, FlowResult):
+        return FlowResponse(
+            flow_run_id=handle.flow_run_id,
+            status=result.status,
+            event_count=len(events),
+            output=result.output,
+            error=result.error,
+            child_runs=tuple(
+                FlowChildRunResponse(
+                    role="stage",
+                    phase=stage.name,
+                    agent_run_id=stage.run.run_id,
+                    status=stage.run.status,
+                    source_plan_revision=None,
+                    target_plan_revision=None,
+                    step_id=None,
+                    attempt=None,
+                )
+                for stage in result.stages
+            ),
+        )
     return FlowResponse(
         flow_run_id=handle.flow_run_id,
-        plan_id=result.plan_id,
         status=result.status,
         event_count=len(events),
-        output=result.output,
-        error=result.error,
-        plan=(result.plan.model_dump(mode="json") if result.plan is not None else None),
-        child_runs=tuple(
-            FlowChildRunResponse(
-                role=child.role.value,
-                phase=child.phase,
-                agent_run_id=child.agent_run_id,
-                status=child.run.status,
-                source_plan_revision=child.source_plan_revision,
-                target_plan_revision=child.target_plan_revision,
-                step_id=child.step_id,
-                attempt=child.attempt,
-            )
-            for child in result.child_runs
-        ),
+        output=getattr(result, "output", None),
+        error=getattr(result, "error", None),
     )
 
 

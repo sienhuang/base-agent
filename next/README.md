@@ -328,9 +328,10 @@ Skill Package 的目录、Tool 贡献、Script 执行边界和 snapshot 契约�
 当前 Provider 契约、OpenAI-compatible Adapter、错误分类和验收命令见
 [`PROVIDERS.md`](PROVIDERS.md)。
 
-需要按能力逐步开发和测试时，使用独立下游项目
-[`starter/`](starter/README.md)。Starter 当前验收 Step 03：Skill Package；后续仍按单个
-能力逐步加入 Flow 等能力，并始终禁止导入 Harness 内部模块。
+需要查看通用组合方式和逐步能力示例时，使用独立下游参考项目
+[`starter/`](starter/README.md)。需要查看真实领域应用如何只依赖公共 API 时，使用与 Starter
+平级的 [`mtbi-analysis/`](mtbi-analysis/README.md)：它组合固定查询/分析 Agent、真实
+`mtbi-cli` Adapter、workspace 产物校验和 SequentialFlow，不导入 Starter 或 Harness 内部模块。
 
 ## 当前边界
 

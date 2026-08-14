@@ -1,0 +1,51 @@
+[project]
+name = "base-agent-mtbi-analysis"
+version = "0.1.0"
+description = "An MTBI analysis application built on base-agent-next."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "base-agent-next[openai,server]==0.1.0",
+    "python-dotenv>=1.1,<2",
+]
+
+[tool.uv.sources]
+base-agent-next = { path = "..", editable = true }
+
+[dependency-groups]
+dev = [
+    "mypy>=1.15",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.11",
+]
+
+[project.scripts]
+mtbi-analysis = "mtbi_analysis.cli:main"
+mtbi-analysis-server = "mtbi_analysis.asgi:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mtbi_analysis"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["../src", "src"]
+asyncio_mode = "auto"
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["mtbi_analysis"]

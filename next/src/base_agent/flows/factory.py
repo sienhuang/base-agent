@@ -13,8 +13,21 @@ class Flow:
     """Construct a Flow while keeping concrete lifecycle types available."""
 
     @staticmethod
-    def sequence(*, id: str, stages: Sequence[Stage]) -> SequentialFlow:
-        return SequentialFlow(id=id, stages=stages)
+    def sequence(
+        *,
+        id: str,
+        stages: Sequence[Stage],
+        observers: Sequence[Observer] = (),
+        event_store: EventStore | None = None,
+        forward_child_events: bool = False,
+    ) -> SequentialFlow:
+        return SequentialFlow(
+            id=id,
+            stages=stages,
+            observers=observers,
+            event_store=event_store,
+            forward_child_events=forward_child_events,
+        )
 
     @staticmethod
     def planner_react(

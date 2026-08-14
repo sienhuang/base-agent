@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Any, Protocol
 
 from base_agent.agent import Agent
-from base_agent.flows import FlowRunHandle, PlannerReActFlow, PlannerReActResult
+from base_agent.flows import FlowRunHandle
 from base_agent.run_handle import RunHandle
 
 
@@ -19,6 +20,17 @@ class FlowNotRegisteredError(LookupError):
 
 class FlowRunNotFoundError(LookupError):
     """The requested process-local Flow Run is unknown."""
+
+
+class RegisteredFlow(Protocol):
+    """A Flow strategy that can launch a process-local background execution."""
+
+    def start(
+        self,
+        prompt: str,
+        *,
+        stream: bool = False,
+    ) -> FlowRunHandle[Any]: ...
 
 
 class InMemoryRunRegistry:
@@ -43,11 +55,11 @@ class InMemoryRunRegistry:
 class InMemoryFlowRegistry:
     """Retain named Flow factories and their process-local background handles."""
 
-    def __init__(self, flows: Mapping[str, PlannerReActFlow]) -> None:
+    def __init__(self, flows: Mapping[str, RegisteredFlow]) -> None:
         if any(not name.strip() for name in flows):
             raise ValueError("Flow registration names must not be blank")
         self._flows = dict(flows)
-        self._handles: dict[str, FlowRunHandle[PlannerReActResult]] = {}
+        self._handles: dict[str, FlowRunHandle[Any]] = {}
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -59,7 +71,7 @@ class InMemoryFlowRegistry:
         prompt: str,
         *,
         stream: bool = False,
-    ) -> FlowRunHandle[PlannerReActResult]:
+    ) -> FlowRunHandle[Any]:
         try:
             flow = self._flows[name]
         except KeyError as exc:
@@ -68,7 +80,7 @@ class InMemoryFlowRegistry:
         self._handles[handle.flow_run_id] = handle
         return handle
 
-    def get(self, flow_run_id: str) -> FlowRunHandle[PlannerReActResult]:
+    def get(self, flow_run_id: str) -> FlowRunHandle[Any]:
         try:
             return self._handles[flow_run_id]
         except KeyError as exc:

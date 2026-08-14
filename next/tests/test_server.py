@@ -12,13 +12,19 @@ from base_agent import (
     Flow,
     FlowStatus,
     PlannerDecision,
+    Stage,
     StepOutcome,
 )
 from base_agent.events import InMemoryEventStore
 from base_agent.flows import PlannerReActFlow
 from base_agent.models import Event, ModelRequest, ModelResponse
 from base_agent.providers import ModelProvider, ProviderCapabilities, ProviderInfo
-from base_agent.server import InMemoryFlowRegistry, InMemoryRunRegistry, create_http_app
+from base_agent.server import (
+    InMemoryFlowRegistry,
+    InMemoryRunRegistry,
+    RegisteredFlow,
+    create_http_app,
+)
 from base_agent.testing import FakeModel
 
 
@@ -57,7 +63,7 @@ async def _client(
     agent: Agent,
     *,
     sse_ping_seconds: int = 15,
-    flows: Mapping[str, PlannerReActFlow] | None = None,
+    flows: Mapping[str, RegisteredFlow] | None = None,
 ) -> AsyncIterator[tuple[httpx.AsyncClient, Any]]:
     app = create_http_app(
         agent,
@@ -246,6 +252,75 @@ async def test_http_starts_plan_react_and_exposes_result_events_and_sse() -> Non
     assert "event: child.run.succeeded" in stream_text
     assert "event: message.completed" in stream_text
     assert '"content":"HTTP Flow done"' in stream_text
+    assert "event: flow.succeeded" in stream_text
+
+
+async def test_http_starts_sequential_flow_and_forwards_every_child_run_event() -> None:
+    query = Agent(
+        AgentDefinition(
+            id="http-query",
+            version="1.0.0",
+            instructions="Query data.",
+        ),
+        model=FakeModel.text("dataset=checked"),
+    )
+    analysis = Agent(
+        AgentDefinition(
+            id="http-analysis",
+            version="1.0.0",
+            instructions="Analyze data.",
+        ),
+        model=FakeModel.text("analysis=complete"),
+    )
+    flow = Flow.sequence(
+        id="http-sequence",
+        stages=(
+            Stage(name="query", agent=query),
+            Stage(name="analysis", agent=analysis, input_from="query"),
+        ),
+        forward_child_events=True,
+    )
+
+    async with _client(
+        _agent(FakeModel.text("ordinary")),
+        flows={"sequence": flow},
+    ) as (client, _):
+        started = await client.post(
+            "/v1/flows/sequence",
+            json={"prompt": "Analyze checked data", "stream": False},
+        )
+        flow_run_id = started.json()["flow_run_id"]
+        completed = await _wait_for_flow_status(client, flow_run_id, "succeeded")
+        events = await client.get(f"/v1/flows/{flow_run_id}/events")
+        stream = await client.get(f"/v1/flows/{flow_run_id}/events/stream")
+
+    assert completed["output"] == "analysis=complete"
+    assert [(child["role"], child["phase"]) for child in completed["child_runs"]] == [
+        ("stage", "query"),
+        ("stage", "analysis"),
+    ]
+    payloads = events.json()
+    assert payloads[0]["kind"] == "flow.started"
+    assert payloads[-1]["kind"] == "flow.succeeded"
+    child_events = [
+        event
+        for event in payloads
+        if event["payload"].get("event_scope") == "child_run"
+    ]
+    assert {event["payload"]["stage"] for event in child_events} == {
+        "query",
+        "analysis",
+    }
+    assert "child.run.started" in {event["kind"] for event in child_events}
+    assert "child.message.completed" in {event["kind"] for event in child_events}
+    assert "model.requested" in {event["kind"] for event in child_events}
+    assert all(event["run_id"] == flow_run_id for event in payloads)
+    stream_text = stream.text.replace("\r\n", "\n")
+    assert "event: child.run.started" in stream_text
+    assert "event: model.requested" in stream_text
+    assert "event: tool.completed" not in stream_text
+    assert '"stage":"query"' in stream_text
+    assert '"stage":"analysis"' in stream_text
     assert "event: flow.succeeded" in stream_text
 
 

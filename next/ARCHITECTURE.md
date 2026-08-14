@@ -289,7 +289,9 @@ AgentDefinition(
    独立 `/v1/flows` HTTP API 提供提交、查询、取消、回放和 SSE；
 5. 根据 PlannerReActFlow 的真实 StepOutcome 和后续 AgentDemo MTBI 场景，再判断是否提取
    SequentialFlow 共用的声明式 Stage/Artifact output contract；
-6. 用 AgentDemo MTBI Flow 验证 Artifact/Verifier；
+6. 已建立独立 `mtbi-analysis` 下游应用，用 AgentDemo 的固定查询/分析场景离线验证
+   SequentialFlow handoff、SQL/CSV/Markdown 产物和 Host verifier；下一步使用真实 Provider 与
+   `mtbi-cli` 验收，再决定是否提取公共 Artifact/StageOutput 契约；
 7. 在已有 Skill 受控目录发现、Descriptor/Catalog/`skill_view` 基础上，根据真实
    目录规模再增加检索、缓存和外部 Skill 源 Adapter；
 8. 在已有 EventStore/EventStream 小型契约上按真实部署需求增加 PostgreSQL durable store

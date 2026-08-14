@@ -1,0 +1,7 @@
+.env
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
+workspace/
