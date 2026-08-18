@@ -25,7 +25,7 @@
 简单多 Agent 只增加一层：
 
 ```text
-Stage(agent, prompt, input_from, handoff, verify)
+Stage(agent, prompt, input_from, handoff, verify, retry)
           │
           ▼
 Flow.sequence(...)
@@ -91,7 +91,8 @@ base_agent facade ──> runtime Harness
 6. Governance 默认拒绝无法取得的副作用确认；
 7. Tool observation 有单结果和累计预算；
 8. 结构化输出验证产生 Evidence；
-9. Stage 失败或验证失败时，SequentialFlow 不继续下一个 Stage。
+9. Stage Run 失败时 SequentialFlow 不继续；验证失败时按 RetryPolicy 将 Host Evidence 反馈给
+   新的 Agent Run，重试耗尽后才失败且不继续下一个 Stage。
 
 ### 4.1 Flow Stage 拆分边界标准
 
@@ -287,11 +288,10 @@ AgentDefinition(
 4. 已增加固定角色、Host-owned Plan 的 PlannerReActFlow，使用 `PlannerDecision` 和
    `StepOutcome` 验证逐步执行、Review/Replan、实时事件、子 Run 关联和取消传播；并通过
    独立 `/v1/flows` HTTP API 提供提交、查询、取消、回放和 SSE；
-5. 根据 PlannerReActFlow 的真实 StepOutcome 和后续 AgentDemo MTBI 场景，再判断是否提取
-   SequentialFlow 共用的声明式 Stage/Artifact output contract；
-6. 已建立独立 `mtbi-analysis` 下游应用，用 AgentDemo 的固定查询/分析场景离线验证
-   SequentialFlow handoff、SQL/CSV/Markdown 产物和 Host verifier；下一步使用真实 Provider 与
-   `mtbi-cli` 验收，再决定是否提取公共 Artifact/StageOutput 契约；
+5. 已根据 MTBI 场景为 SequentialFlow 增加 Host-owned `ArtifactRef`、验证证据反馈
+   `RetryPolicy`、attempt/child Run 关联，以及 Flow-only `AgentApplication` HTTP 组合；
+6. 已建立独立 `mtbi-analysis` 下游应用，使用真实 `mtbi-cli` Adapter 验证
+   SequentialFlow handoff、SQL/CSV/Markdown Artifact、Host verifier、自动修正和 SSE；
 7. 在已有 Skill 受控目录发现、Descriptor/Catalog/`skill_view` 基础上，根据真实
    目录规模再增加检索、缓存和外部 Skill 源 Adapter；
 8. 在已有 EventStore/EventStream 小型契约上按真实部署需求增加 PostgreSQL durable store

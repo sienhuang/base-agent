@@ -55,10 +55,6 @@ def validate_query_output(
         raise TypeError("query Agent did not return MTBIQueryOutcome")
     if not outcome.success:
         raise ValueError(f"query Agent reported failure: {outcome.error}")
-    if outcome.sql_path != expected_sql_path:
-        raise ValueError("query Agent returned an unexpected SQL path")
-    if outcome.csv_path != expected_csv_path:
-        raise ValueError("query Agent returned an unexpected CSV path")
 
     sql_path = workspace.resolve(expected_sql_path)
     csv_path = workspace.resolve(expected_csv_path)
@@ -132,10 +128,6 @@ def validate_analysis_output(
     outcome = run.output
     if not isinstance(outcome, MTBIAnalysisOutcome):
         raise TypeError("analysis Agent did not return MTBIAnalysisOutcome")
-    if outcome.source_csv_path != expected_csv_path:
-        raise ValueError("analysis Agent returned an unexpected source CSV path")
-    if outcome.report_path != expected_report_path:
-        raise ValueError("analysis Agent returned an unexpected report path")
 
     report_path = workspace.resolve(expected_report_path)
     report = workspace.read_bytes(expected_report_path)

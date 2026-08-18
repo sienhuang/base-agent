@@ -9,6 +9,7 @@ import pytest
 from base_agent import (
     Agent,
     AgentDefinition,
+    ArtifactRef,
     Flow,
     FlowStatus,
     PlannerDecision,
@@ -20,6 +21,7 @@ from base_agent.flows import PlannerReActFlow
 from base_agent.models import Event, ModelRequest, ModelResponse
 from base_agent.providers import ModelProvider, ProviderCapabilities, ProviderInfo
 from base_agent.server import (
+    AgentApplication,
     InMemoryFlowRegistry,
     InMemoryRunRegistry,
     RegisteredFlow,
@@ -322,6 +324,59 @@ async def test_http_starts_sequential_flow_and_forwards_every_child_run_event() 
     assert '"stage":"query"' in stream_text
     assert '"stage":"analysis"' in stream_text
     assert "event: flow.succeeded" in stream_text
+
+
+async def test_agent_application_hosts_a_flow_without_dummy_run_routes() -> None:
+    checks: list[str] = []
+
+    async def preflight() -> None:
+        checks.append("ready")
+
+    flow = Flow.sequence(
+        id="flow-only",
+        stages=(
+            Stage(
+                name="query",
+                agent=_agent(FakeModel.text("dataset=checked")),
+            ),
+        ),
+        artifacts=(
+            ArtifactRef(
+                name="dataset",
+                location="runs/flow-id/dataset.csv",
+                media_type="text/csv",
+            ),
+        ),
+    )
+    app = AgentApplication(
+        flows={"analysis": flow},
+        preflight=(preflight,),
+        title="Flow-only application",
+    ).fastapi()
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            run_route = await client.post("/v1/runs", json={"prompt": "hello"})
+            started = await client.post(
+                "/v1/flows/analysis",
+                json={"prompt": "query data"},
+            )
+            flow_run_id = started.json()["flow_run_id"]
+            completed = await _wait_for_flow_status(client, flow_run_id, "succeeded")
+
+    assert checks == ["ready"]
+    assert run_route.status_code == 404
+    assert completed["artifacts"] == [
+        {
+            "name": "dataset",
+            "location": "runs/flow-id/dataset.csv",
+            "media_type": "text/csv",
+        }
+    ]
+    assert completed["child_runs"][0]["attempt"] == 1
 
 
 async def test_http_flow_routes_validate_names_ids_payloads_and_cursor() -> None:

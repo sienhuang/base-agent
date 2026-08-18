@@ -18,8 +18,6 @@ class _StrictOutcome(BaseModel):
 
 class MTBIQueryOutcome(_StrictOutcome):
     success: bool
-    sql_path: str | None
-    csv_path: str | None
     selected_tables: tuple[str, ...]
     confirmed_columns: tuple[str, ...]
     summary: str = Field(min_length=1)
@@ -28,8 +26,6 @@ class MTBIQueryOutcome(_StrictOutcome):
     @model_validator(mode="after")
     def validate_result(self) -> MTBIQueryOutcome:
         if self.success:
-            if not self.sql_path or not self.csv_path:
-                raise ValueError("successful query requires SQL and CSV paths")
             if not self.selected_tables or not self.confirmed_columns:
                 raise ValueError("successful query requires confirmed table and column metadata")
             if self.error is not None:
@@ -40,8 +36,6 @@ class MTBIQueryOutcome(_StrictOutcome):
 
 
 class MTBIAnalysisOutcome(_StrictOutcome):
-    report_path: str = Field(min_length=1)
-    source_csv_path: str = Field(min_length=1)
     summary: str = Field(min_length=1)
 
 

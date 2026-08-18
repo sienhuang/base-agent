@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 
 import uvicorn
 from base_agent.providers import ModelProvider
-from base_agent.server import create_http_app
+from base_agent.server import AgentApplication
 from fastapi import FastAPI
 
 from mtbi_analysis.app import build_application
@@ -26,17 +24,14 @@ def create_app(
     """Build the independent MTBI application on the SDK HTTP adapter."""
     application = build_application(settings, provider=provider, runner=runner)
 
-    @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    async def preflight() -> None:
         await check_mtbi_environment(application.workspace, application.runner)
-        yield
 
-    return create_http_app(
-        application.flow.query_agent,
+    return AgentApplication(
         title="base-agent MTBI Analysis",
         flows={"mtbi-analysis": application.flow},
-        lifespan=lifespan,
-    )
+        preflight=(preflight,),
+    ).fastapi()
 
 
 app = create_app()

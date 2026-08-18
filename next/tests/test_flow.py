@@ -14,6 +14,7 @@ from base_agent import (
     PlannerReActResult,
     PlanningLimits,
     PlanStepDraft,
+    RetryPolicy,
     RunStatus,
     Stage,
     StepOutcome,
@@ -120,6 +121,52 @@ async def test_sequential_flow_passes_previous_stage_output_to_the_next_agent() 
         "flow.succeeded",
     ]
     assert result.stages[1].evidence[0].status == "passed"
+
+
+async def test_sequential_flow_retries_with_host_verification_evidence() -> None:
+    model = FakeModel(
+        [
+            ModelResponse(content="empty dataset"),
+            ModelResponse(content="checked dataset"),
+        ]
+    )
+    agent = Agent(
+        AgentDefinition(
+            id="retrying-query",
+            version="1.0.0",
+            instructions="Produce a checked dataset.",
+        ),
+        model=model,
+    )
+    flow = Flow.sequence(
+        id="verified-query",
+        stages=(
+            Stage(
+                name="query",
+                agent=agent,
+                verify=lambda run: VerificationEvidence(
+                    verifier="dataset_non_empty",
+                    scope="stage_output",
+                    status=("passed" if run.text == "checked dataset" else "failed"),
+                    detail=("CSV has no data rows" if run.text != "checked dataset" else ""),
+                ),
+                retry=RetryPolicy(max_attempts=2),
+            ),
+        ),
+    )
+
+    result = await flow.run("Query recent users")
+
+    assert result.status is FlowStatus.SUCCEEDED
+    assert result.output == "checked dataset"
+    assert [attempt.attempt for attempt in result.stage_attempts] == [1, 2]
+    assert result.stages[0].attempt == 2
+    assert result.stage_attempts[0].run.run_id != result.stage_attempts[1].run.run_id
+    assert "Host verification rejected the previous attempt" in (
+        model.requests[1].messages[0].content
+    )
+    assert "CSV has no data rows" in model.requests[1].messages[0].content
+    assert "stage.retrying" in {event.kind for event in result.events}
 
 
 async def test_planner_react_correlates_every_plan_phase_with_an_agent_run() -> None:

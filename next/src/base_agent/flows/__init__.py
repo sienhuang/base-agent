@@ -20,6 +20,7 @@ from base_agent.flows.planning import (
 )
 from base_agent.flows.sequential import (
     FlowResult,
+    RetryPolicy,
     SequentialFlow,
     Stage,
     StageResult,
@@ -43,6 +44,7 @@ __all__ = [
     "PlanStep",
     "PlanStepDraft",
     "PlanStepStatus",
+    "RetryPolicy",
     "SequentialFlow",
     "Stage",
     "StageResult",

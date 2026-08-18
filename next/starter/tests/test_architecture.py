@@ -48,7 +48,8 @@ def test_starter_only_owns_the_asgi_composition_root() -> None:
     assert not (STARTER_SRC / "runs.py").exists()
     assert not (STARTER_SRC / "server.py").exists()
     asgi_source = (STARTER_SRC / "asgi.py").read_text(encoding="utf-8")
-    assert "from base_agent.server import create_http_app" in asgi_source
+    assert "from base_agent.server import AgentApplication" in asgi_source
+    assert ").fastapi()" in asgi_source
     assert "@app." not in asgi_source
 
 

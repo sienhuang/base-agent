@@ -5,6 +5,7 @@ def test_root_api_is_intentionally_small() -> None:
     assert set(base_agent.__all__) == {
         "Agent",
         "AgentDefinition",
+        "ArtifactRef",
         "Confirmation",
         "Event",
         "Flow",
@@ -16,6 +17,7 @@ def test_root_api_is_intentionally_small() -> None:
         "PlanningLimits",
         "PlanStepDraft",
         "RunResult",
+        "RetryPolicy",
         "RunFailure",
         "RunHandle",
         "RunStatus",

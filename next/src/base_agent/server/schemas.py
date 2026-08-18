@@ -86,6 +86,14 @@ class FlowChildRunResponse(BaseModel):
     attempt: int | None
 
 
+class ArtifactRefResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    location: str
+    media_type: str
+
+
 class FlowResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -97,3 +105,4 @@ class FlowResponse(BaseModel):
     error: str | None = None
     plan: dict[str, Any] | None = None
     child_runs: tuple[FlowChildRunResponse, ...] = ()
+    artifacts: tuple[ArtifactRefResponse, ...] = ()

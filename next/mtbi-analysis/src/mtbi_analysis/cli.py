@@ -21,10 +21,10 @@ async def _run(prompt: str, settings: Settings) -> int:
         print(f"configuration error: {exc}")
         return 2
 
-    if result.query is not None and result.query.success:
-        print(f"SQL: {result.query.sql_path}")
-        print(f"CSV: {result.query.csv_path}")
-    elif result.query is not None:
+    if result.dataset is not None:
+        print(f"SQL: {result.dataset.sql_path}")
+        print(f"CSV: {result.dataset.csv_path}")
+    elif result.query is not None and not result.query.success:
         print(f"Query failed: {result.query.error}")
     if result.dataset is not None:
         print(
@@ -33,12 +33,14 @@ async def _run(prompt: str, settings: Settings) -> int:
         )
     if result.analysis is not None:
         print(result.analysis.summary)
-        print(f"Report: {result.analysis.report_path}")
+    if result.report is not None:
+        print(f"Report: {result.report.report_path}")
     if result.error is not None:
-        for stage in result.flow.stages:
+        for stage in result.flow.stage_attempts or result.flow.stages:
             for tool_result in stage.run.tool_results:
                 diagnostic = (
-                    f"tool: stage={stage.name}, name={tool_result.call.name}, "
+                    f"tool: stage={stage.name}, attempt={stage.attempt}, "
+                    f"name={tool_result.call.name}, "
                     f"status={tool_result.status.value}"
                 )
                 if tool_result.error is not None:

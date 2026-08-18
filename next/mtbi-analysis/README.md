@@ -16,6 +16,8 @@ SDK。Starter 仅作为项目配置和 Provider 组合方式的参考。
 Query Agent 只能调用只读配置/认证检查、元数据和 OneSQL 命令。所有 SQL、CSV 和 Markdown
 必须写到配置的 workspace 内；绝对路径、目录穿越、超限文件、无表头或无数据行 CSV 都会被
 Host 拒绝。第一个 Stage 验证失败时，第二个 Agent 不会启动。
+Query Stage 最多尝试三次，Analysis Stage 最多尝试两次。只有 Agent Run 已成功、但 Host
+verifier 拒绝产物时才会重试；验证证据会进入下一次独立 Agent Run。
 
 ## 配置
 
@@ -88,11 +90,15 @@ uv run --project next/mtbi-analysis mtbi-analysis \
 成功后 CLI 会打印 SQL、CSV、数据校验摘要和报告路径。每次执行使用独立目录：
 
 ```text
-workspace/runs/<artifact-token>/
+workspace/runs/<flow-run-id>/
 ├── query.sql
 ├── dataset.csv
 └── report.md
 ```
+
+这三个位置由 Host 创建为 `ArtifactRef`，模型只使用它们调用 Tool，不再负责在结构化输出中
+复述路径。`flow_run_id` 同时作为 workspace 目录名，因此 HTTP、Event 和本地产物不需要额外
+的 artifact token 映射。CLI 打印 Host 校验后的绝对路径。
 
 ## FastAPI 与完整 Run Event Stream
 
@@ -126,16 +132,21 @@ Flow Event Stream 同时包含 `flow.*`、`stage.*`，以及转发后的 `child.
 都带 `event_scope=child_run`，并包含 `stage`、`agent_run_id`、`child_kind` 和
 `child_sequence`，可区分 query 与 analysis。
 
+这是纯 Flow 服务，不注册 `/v1/runs`。`GET /v1/flows/{flow_run_id}` 的 `artifacts` 字段返回
+Host-owned SQL、CSV 和报告引用；发生验证重试时，`child_runs` 会列出同一 Stage 的多次
+attempt，Event Stream 会出现 `stage.verification_failed` 和 `stage.retrying`。
+
 ## 测试
 
 自动测试不访问真实 Provider 或 MTBI 服务。`FakeModel` 仍会走完整 Agent/Tool 循环，假的
 MTBI runner 负责生成确定性 CSV：
 
 ```bash
-uv sync --project next/mtbi-analysis --group dev
-uv run --project next/mtbi-analysis pytest
-uv run --project next/mtbi-analysis ruff check src tests
-uv run --project next/mtbi-analysis mypy src
+cd next/mtbi-analysis
+uv sync --group dev
+uv run pytest
+uv run ruff check src tests
+uv run mypy src
 ```
 
 ## 当前边界
@@ -144,4 +155,4 @@ uv run --project next/mtbi-analysis mypy src
 - `mtbi_cli` 不允许 `config set` 等配置修改命令。
 - CSV 分析使用有界行数、文件大小、样本和数值摘要；不是无限制的数据处理引擎。
 - 文件存在并不代表成功，最终以 Host verifier 的确定性检查为准。
-- 后续根据这个真实应用暴露的问题，再判断是否向 SDK 提取公共 Artifact/StageOutput 契约。
+- ArtifactRef 当前是 Host-owned 逻辑引用，尚未扩展为可替换的 ArtifactStore。

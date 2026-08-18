@@ -21,8 +21,15 @@ REPORT_PATH = f"runs/{RUN_TOKEN}/report.md"
 
 
 class FakeMTBIRunner:
-    def __init__(self, *, create_csv: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        create_csv: bool = True,
+        empty_query_attempts: int = 0,
+    ) -> None:
         self.create_csv = create_csv
+        self.empty_query_attempts = empty_query_attempts
+        self.onesql_calls = 0
         self.calls: list[list[str]] = []
 
     def readiness(self) -> tuple[bool, str]:
@@ -31,13 +38,16 @@ class FakeMTBIRunner:
     async def run(self, args: list[str], *, cwd: Path) -> CommandResult:
         self.calls.append(list(args))
         if args[0] == "onesql" and self.create_csv:
+            self.onesql_calls += 1
             output_index = args.index("--output") + 1
             output = cwd / args[output_index]
             output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(
-                "date,active_users\n2026-08-12,120\n2026-08-13,150\n",
-                encoding="utf-8",
+            content = (
+                "date,active_users\n"
+                if self.onesql_calls <= self.empty_query_attempts
+                else "date,active_users\n2026-08-12,120\n2026-08-13,150\n"
             )
+            output.write_text(content, encoding="utf-8")
         return CommandResult(returncode=0, stdout="ok", stderr="")
 
 
@@ -88,8 +98,6 @@ def _successful_model() -> FakeModel:
             _json_response(
                 {
                     "success": True,
-                    "sql_path": SQL_PATH,
-                    "csv_path": CSV_PATH,
                     "selected_tables": ["verified.login_events"],
                     "confirmed_columns": ["event_date", "user_id"],
                     "summary": "Queried verified daily active-user data.",
@@ -114,8 +122,6 @@ def _successful_model() -> FakeModel:
             ),
             _json_response(
                 {
-                    "report_path": REPORT_PATH,
-                    "source_csv_path": CSV_PATH,
                     "summary": "Daily active users increased by 25%.",
                 }
             ),
@@ -147,6 +153,12 @@ async def test_mtbi_analysis_runs_two_verified_agent_stages(
     assert result.dataset.columns == ("date", "active_users")
     assert result.report is not None
     assert result.report.report_path == tmp_path / REPORT_PATH
+    assert result.flow.flow_run_id == RUN_TOKEN
+    assert [artifact.location for artifact in result.flow.artifacts] == [
+        SQL_PATH,
+        CSV_PATH,
+        REPORT_PATH,
+    ]
     assert [stage.name for stage in result.flow.stages] == ["query", "analysis"]
     assert [stage.evidence[0].status for stage in result.flow.stages] == [
         "passed",
@@ -163,6 +175,114 @@ async def test_mtbi_analysis_runs_two_verified_agent_stages(
     assert runner.calls[:2] == [["auth", "status"], ["config", "show"]]
     assert runner.calls[2][-2:] == ["--output", CSV_PATH]
     assert len(model.requests) == 6
+
+
+async def test_empty_query_result_is_repaired_with_verifier_feedback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(flow_module, "uuid4", lambda: UUID(RUN_TOKEN))
+    first_sql = "SELECT user_id FROM verified.login_events WHERE event_date = '2024-03-29'"
+    repaired_sql = (
+        "SELECT user_id FROM verified.login_events "
+        "WHERE event_date = (SELECT max(event_date) FROM verified.login_events)"
+    )
+    model = FakeModel(
+        [
+            _tool_response(
+                "query-1-write",
+                "write_workspace_text",
+                {"path": SQL_PATH, "content": first_sql},
+            ),
+            _tool_response(
+                "query-1-run",
+                "mtbi_cli",
+                {
+                    "args": [
+                        "onesql",
+                        first_sql,
+                        "--engine",
+                        "PRESTO",
+                        "--format",
+                        "csv",
+                        "--output",
+                        CSV_PATH,
+                    ]
+                },
+            ),
+            _json_response(
+                {
+                    "success": True,
+                    "selected_tables": ["verified.login_events"],
+                    "confirmed_columns": ["event_date", "user_id"],
+                    "summary": "Queried one candidate partition.",
+                    "error": None,
+                }
+            ),
+            _tool_response(
+                "query-2-write",
+                "write_workspace_text",
+                {"path": SQL_PATH, "content": repaired_sql},
+            ),
+            _tool_response(
+                "query-2-run",
+                "mtbi_cli",
+                {
+                    "args": [
+                        "onesql",
+                        repaired_sql,
+                        "--engine",
+                        "PRESTO",
+                        "--format",
+                        "csv",
+                        "--output",
+                        CSV_PATH,
+                    ]
+                },
+            ),
+            _json_response(
+                {
+                    "success": True,
+                    "selected_tables": ["verified.login_events"],
+                    "confirmed_columns": ["event_date", "user_id"],
+                    "summary": "Requeried the latest available partition.",
+                    "error": None,
+                }
+            ),
+            _tool_response("analysis-1", "summarize_csv", {"path": CSV_PATH}),
+            _tool_response(
+                "analysis-2",
+                "write_workspace_text",
+                {
+                    "path": REPORT_PATH,
+                    "content": "# Active-user analysis\n\nLatest partition contains users.",
+                },
+            ),
+            _json_response({"summary": "Analyzed the latest available partition."}),
+        ]
+    )
+    runner = FakeMTBIRunner(empty_query_attempts=1)
+    application = build_application(
+        Settings(workspace=tmp_path),
+        provider=model,
+        runner=runner,
+    )
+
+    result = await application.run("Analyze the most recent day")
+
+    assert result.status is FlowStatus.SUCCEEDED
+    assert result.dataset is not None
+    assert result.dataset.row_count == 2
+    assert (tmp_path / SQL_PATH).read_text(encoding="utf-8") == repaired_sql
+    assert [(item.name, item.attempt) for item in result.flow.stage_attempts] == [
+        ("query", 1),
+        ("query", 2),
+        ("analysis", 1),
+    ]
+    assert "CSV must contain at least one data row" in (
+        model.requests[3].messages[0].content
+    )
+    assert "stage.retrying" in {event.kind for event in result.flow.events}
 
 
 async def test_fastapi_exposes_query_and_analysis_child_run_streams(
@@ -185,6 +305,7 @@ async def test_fastapi_exposes_query_and_analysis_child_run_streams(
                 "/v1/flows/mtbi-analysis",
                 json={"prompt": "Analyze daily active users", "stream": False},
             )
+            run_route = await client.post("/v1/runs", json={"prompt": "raw query"})
             flow_run_id = started.json()["flow_run_id"]
             for _ in range(100):
                 response = await client.get(f"/v1/flows/{flow_run_id}")
@@ -195,6 +316,13 @@ async def test_fastapi_exposes_query_and_analysis_child_run_streams(
             stream = await client.get(f"/v1/flows/{flow_run_id}/events/stream")
 
     assert response.json()["status"] == "succeeded"
+    assert flow_run_id == RUN_TOKEN
+    assert run_route.status_code == 404
+    assert [item["location"] for item in response.json()["artifacts"]] == [
+        SQL_PATH,
+        CSV_PATH,
+        REPORT_PATH,
+    ]
     assert runner.calls[:2] == [["auth", "status"], ["config", "show"]]
     assert [(item["role"], item["phase"]) for item in response.json()["child_runs"]] == [
         ("stage", "query"),
@@ -225,26 +353,27 @@ async def test_query_artifact_verification_blocks_analysis_stage(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(flow_module, "uuid4", lambda: UUID(RUN_TOKEN))
-    model = FakeModel(
-        [
+    responses: list[ModelResponse] = []
+    for attempt in range(1, 4):
+        responses.extend(
+            (
             _tool_response(
-                "query-1",
+                f"query-{attempt}",
                 "mtbi_cli",
                 {"args": ["help"]},
             ),
             _json_response(
                 {
                     "success": True,
-                    "sql_path": SQL_PATH,
-                    "csv_path": CSV_PATH,
                     "selected_tables": ["verified.login_events"],
                     "confirmed_columns": ["event_date", "user_id"],
                     "summary": "Claimed output without creating artifacts.",
                     "error": None,
                 }
             ),
-        ]
-    )
+            )
+        )
+    model = FakeModel(responses)
     application = build_application(
         Settings(workspace=tmp_path),
         provider=model,
@@ -258,5 +387,9 @@ async def test_query_artifact_verification_blocks_analysis_stage(
     assert result.dataset is None
     assert len(result.flow.stages) == 1
     assert result.flow.stages[0].evidence[0].status == "failed"
+    assert [attempt.attempt for attempt in result.flow.stage_attempts] == [1, 2, 3]
     assert "failed verification" in (result.error or "")
-    assert len(model.requests) == 2
+    assert len(model.requests) == 6
+    assert "Host verification rejected the previous attempt" in (
+        model.requests[2].messages[0].content
+    )

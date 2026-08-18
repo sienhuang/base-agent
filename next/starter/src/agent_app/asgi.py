@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 
 import uvicorn
-from base_agent.server import create_http_app
+from base_agent.server import AgentApplication
 from fastapi import FastAPI
 
 from agent_app.app import build_agent, build_plan_react_flow
@@ -29,11 +29,11 @@ def create_app() -> FastAPI:
         planner_model=settings.plan_react_planner_model,
         executor_model=settings.plan_react_executor_model,
     )
-    return create_http_app(
-        agent,
+    return AgentApplication(
+        agent=agent,
         title="base-agent Starter",
         flows={"plan-react": plan_react},
-    )
+    ).fastapi()
 
 
 app = create_app()

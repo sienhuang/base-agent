@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 from base_agent.agent import Agent
+from base_agent.artifacts import ArtifactRef
 from base_agent.events import EventEmitter, EventStore, InMemoryEventStore
 from base_agent.flows.handle import FlowRunHandle
 from base_agent.flows.models import FlowStatus
@@ -27,6 +28,18 @@ _UNFORWARDED_CHILD_EVENT_KINDS = frozenset({"model.tool_call.delta"})
 
 
 @dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    """Retry a Stage when its Host verifier rejects an otherwise successful Run."""
+
+    max_attempts: int = 1
+    feedback_verification_failure: bool = True
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+
+
+@dataclass(frozen=True, slots=True)
 class Stage:
     name: str
     agent: Agent
@@ -34,6 +47,7 @@ class Stage:
     input_from: str | None = None
     handoff: StageHandoff | None = None
     verify: StageVerifier | None = None
+    retry: RetryPolicy = RetryPolicy()
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -48,6 +62,7 @@ class StageResult:
     run: RunResult
     handoff: str
     evidence: tuple[VerificationEvidence, ...] = ()
+    attempt: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +72,8 @@ class FlowResult:
     output: str
     stages: tuple[StageResult, ...]
     events: tuple[Event, ...]
+    stage_attempts: tuple[StageResult, ...] = ()
+    artifacts: tuple[ArtifactRef, ...] = ()
     error: str | None = None
 
 
@@ -67,11 +84,14 @@ class _SequentialFlowState:
     emitter: EventEmitter
     stream: bool
     stage_results: list[StageResult] = field(default_factory=list)
+    stage_attempts: list[StageResult] = field(default_factory=list)
     handoffs: dict[str, str] = field(default_factory=dict)
     active_stage: Stage | None = None
     active_handle: RunHandle | None = None
+    active_attempt: int | None = None
     cancelled_stage: Stage | None = None
     cancelled_run: RunResult | None = None
+    cancelled_attempt: int | None = None
 
 
 class SequentialFlow:
@@ -83,6 +103,7 @@ class SequentialFlow:
         observers: Sequence[Observer] = (),
         event_store: EventStore | None = None,
         forward_child_events: bool = False,
+        artifacts: Sequence[ArtifactRef] = (),
     ) -> None:
         if not id.strip():
             raise ValueError("flow id must not be blank")
@@ -104,6 +125,7 @@ class SequentialFlow:
         self.stages = tuple(stages)
         self.event_store = event_store if event_store is not None else InMemoryEventStore()
         self.forward_child_events = forward_child_events
+        self.artifacts = tuple(artifacts)
         self._observers = tuple(observers)
 
     async def run(
@@ -112,10 +134,16 @@ class SequentialFlow:
         *,
         stream: bool = False,
         on_event: Observer | None = None,
+        flow_run_id: str | None = None,
     ) -> FlowResult:
         if not prompt.strip():
             raise ValueError("flow prompt must not be blank")
-        state = self._new_state(prompt, stream=stream, on_event=on_event)
+        state = self._new_state(
+            prompt,
+            stream=stream,
+            on_event=on_event,
+            flow_run_id=flow_run_id,
+        )
         return await self._execute(state)
 
     def start(
@@ -124,11 +152,17 @@ class SequentialFlow:
         *,
         stream: bool = False,
         on_event: Observer | None = None,
+        flow_run_id: str | None = None,
     ) -> FlowRunHandle[FlowResult]:
         """Start one process-local Flow with replayable, live Events."""
         if not prompt.strip():
             raise ValueError("flow prompt must not be blank")
-        state = self._new_state(prompt, stream=stream, on_event=on_event)
+        state = self._new_state(
+            prompt,
+            stream=stream,
+            on_event=on_event,
+            flow_run_id=flow_run_id,
+        )
 
         async def operation() -> FlowResult:
             return await self._execute(state)
@@ -149,13 +183,16 @@ class SequentialFlow:
         *,
         stream: bool,
         on_event: Observer | None,
+        flow_run_id: str | None,
     ) -> _SequentialFlowState:
         observers = self._observers if on_event is None else (*self._observers, on_event)
-        flow_run_id = str(uuid4())
+        resolved_flow_run_id = flow_run_id or str(uuid4())
+        if not resolved_flow_run_id.strip():
+            raise ValueError("flow_run_id must not be blank")
         return _SequentialFlowState(
-            flow_run_id=flow_run_id,
+            flow_run_id=resolved_flow_run_id,
             prompt=prompt,
-            emitter=EventEmitter(flow_run_id, self.event_store, observers),
+            emitter=EventEmitter(resolved_flow_run_id, self.event_store, observers),
             stream=stream,
         )
 
@@ -177,6 +214,7 @@ class SequentialFlow:
             flow_id=self.id,
             stage_count=len(self.stages),
             stream=state.stream,
+            artifacts=[_artifact_payload(artifact) for artifact in self.artifacts],
         )
         for index, stage in enumerate(self.stages):
             stage_input = _select_stage_input(
@@ -188,68 +226,109 @@ class SequentialFlow:
                     state.stage_results[-1].handoff if state.stage_results else None
                 ),
             )
-            run_prompt = (
-                f"{stage.prompt.strip()}\n\nInput:\n{stage_input}"
-                if stage.prompt.strip()
-                else stage_input
-            )
-            handle = self._start_child(state, stage=stage, prompt=run_prompt)
-            await state.emitter.emit(
-                "stage.started",
-                stage=stage.name,
-                agent_id=stage.agent.definition.id,
-                agent_run_id=handle.run_id,
-            )
-            run = await handle.wait()
-            state.active_stage = None
-            state.active_handle = None
-            if run.status is not RunStatus.SUCCEEDED:
-                failed_stage = StageResult(
+            retry_feedback: str | None = None
+            for attempt in range(1, stage.retry.max_attempts + 1):
+                run_prompt = _stage_run_prompt(
+                    stage,
+                    stage_input=stage_input,
+                    retry_feedback=retry_feedback,
+                )
+                handle = self._start_child(
+                    state,
+                    stage=stage,
+                    prompt=run_prompt,
+                    attempt=attempt,
+                )
+                await state.emitter.emit(
+                    "stage.started",
+                    stage=stage.name,
+                    agent_id=stage.agent.definition.id,
+                    agent_run_id=handle.run_id,
+                    attempt=attempt,
+                    max_attempts=stage.retry.max_attempts,
+                )
+                run = await handle.wait()
+                state.active_stage = None
+                state.active_handle = None
+                state.active_attempt = None
+                if run.status is not RunStatus.SUCCEEDED:
+                    failed_stage = StageResult(
+                        name=stage.name,
+                        run=run,
+                        handoff=run.text,
+                        attempt=attempt,
+                    )
+                    state.stage_attempts.append(failed_stage)
+                    state.stage_results.append(failed_stage)
+                    await state.emitter.emit(
+                        "stage.failed",
+                        stage=stage.name,
+                        agent_run_id=run.run_id,
+                        attempt=attempt,
+                        error=(
+                            run.error
+                            or f"Run ended with status '{run.status.value}'"
+                        ),
+                    )
+                    return await self._failed_result(
+                        state,
+                        f"Stage '{stage.name}' failed: "
+                        f"{run.error or run.status.value}",
+                        stage=stage.name,
+                    )
+
+                evidence, verification_error = await _verify_stage(stage, run)
+                handoff = stage.handoff(run) if stage.handoff is not None else run.text
+                result = StageResult(
                     name=stage.name,
                     run=run,
-                    handoff=run.text,
+                    handoff=handoff,
+                    evidence=evidence,
+                    attempt=attempt,
                 )
-                state.stage_results.append(failed_stage)
+                state.stage_attempts.append(result)
+                if verification_error is not None:
+                    evidence_payload = [_evidence_payload(item) for item in evidence]
+                    await state.emitter.emit(
+                        "stage.verification_failed",
+                        stage=stage.name,
+                        agent_run_id=run.run_id,
+                        attempt=attempt,
+                        error=verification_error,
+                        evidence=evidence_payload,
+                    )
+                    if attempt < stage.retry.max_attempts:
+                        retry_feedback = (
+                            _verification_retry_feedback(verification_error, evidence)
+                            if stage.retry.feedback_verification_failure
+                            else None
+                        )
+                        await state.emitter.emit(
+                            "stage.retrying",
+                            stage=stage.name,
+                            previous_agent_run_id=run.run_id,
+                            attempt=attempt,
+                            next_attempt=attempt + 1,
+                            max_attempts=stage.retry.max_attempts,
+                            error=verification_error,
+                            evidence=evidence_payload,
+                        )
+                        continue
+                    state.stage_results.append(result)
+                    return await self._failed_result(
+                        state,
+                        verification_error,
+                        stage=stage.name,
+                    )
+                state.stage_results.append(result)
+                state.handoffs[stage.name] = handoff
                 await state.emitter.emit(
-                    "stage.failed",
+                    "stage.succeeded",
                     stage=stage.name,
                     agent_run_id=run.run_id,
-                    error=run.error or f"Run ended with status '{run.status.value}'",
+                    attempt=attempt,
                 )
-                return await self._failed_result(
-                    state,
-                    f"Stage '{stage.name}' failed: "
-                    f"{run.error or run.status.value}",
-                    stage=stage.name,
-                )
-
-            evidence, verification_error = await _verify_stage(stage, run)
-            handoff = stage.handoff(run) if stage.handoff is not None else run.text
-            result = StageResult(
-                name=stage.name,
-                run=run,
-                handoff=handoff,
-                evidence=evidence,
-            )
-            state.stage_results.append(result)
-            state.handoffs[stage.name] = handoff
-            if verification_error is not None:
-                await state.emitter.emit(
-                    "stage.verification_failed",
-                    stage=stage.name,
-                    agent_run_id=run.run_id,
-                    error=verification_error,
-                )
-                return await self._failed_result(
-                    state,
-                    verification_error,
-                    stage=stage.name,
-                )
-            await state.emitter.emit(
-                "stage.succeeded",
-                stage=stage.name,
-                agent_run_id=run.run_id,
-            )
+                break
 
         await state.emitter.emit("flow.succeeded")
         return await self._result(state, FlowStatus.SUCCEEDED)
@@ -260,6 +339,7 @@ class SequentialFlow:
         *,
         stage: Stage,
         prompt: str,
+        attempt: int,
     ) -> RunHandle:
         if state.active_handle is not None:
             raise RuntimeError("Flow already has an active child Run")
@@ -274,6 +354,7 @@ class SequentialFlow:
                     "flow_run_id": state.flow_run_id,
                     "agent_run_id": event.run_id,
                     "stage": stage.name,
+                    "attempt": attempt,
                     "child_sequence": event.sequence,
                     "child_kind": event.kind,
                 }
@@ -291,24 +372,33 @@ class SequentialFlow:
         )
         state.active_stage = stage
         state.active_handle = handle
+        state.active_attempt = attempt
         return handle
 
     async def _cancel_active_child(self, state: _SequentialFlowState) -> None:
         stage = state.active_stage
         handle = state.active_handle
-        if stage is None or handle is None:
+        attempt = state.active_attempt
+        if stage is None or handle is None or attempt is None:
             return
         try:
             run = await handle.cancel()
         except RunNotCancellableError:
             run = await handle.wait()
-        state.stage_results.append(
-            StageResult(name=stage.name, run=run, handoff=run.text)
+        result = StageResult(
+            name=stage.name,
+            run=run,
+            handoff=run.text,
+            attempt=attempt,
         )
+        state.stage_attempts.append(result)
+        state.stage_results.append(result)
         state.cancelled_stage = stage
         state.cancelled_run = run
+        state.cancelled_attempt = attempt
         state.active_stage = None
         state.active_handle = None
+        state.active_attempt = None
 
     async def _failed_result(
         self,
@@ -326,6 +416,7 @@ class SequentialFlow:
                 "stage.cancelled",
                 stage=state.cancelled_stage.name,
                 agent_run_id=state.cancelled_run.run_id,
+                attempt=state.cancelled_attempt,
             )
         await state.emitter.emit(
             "flow.cancelled",
@@ -348,6 +439,8 @@ class SequentialFlow:
             output=(state.stage_results[-1].handoff if state.stage_results else ""),
             stages=tuple(state.stage_results),
             events=await state.emitter.events(),
+            stage_attempts=tuple(state.stage_attempts),
+            artifacts=self.artifacts,
             error=error,
         )
 
@@ -367,6 +460,53 @@ def _select_stage_input(
     if previous is None:
         return user_input
     return previous
+
+
+def _stage_run_prompt(
+    stage: Stage,
+    *,
+    stage_input: str,
+    retry_feedback: str | None,
+) -> str:
+    stage_prompt = stage.prompt.strip()
+    sections = [stage_prompt, f"Input:\n{stage_input}" if stage_prompt else stage_input]
+    if retry_feedback is not None:
+        sections.append(retry_feedback)
+    return "\n\n".join(section for section in sections if section)
+
+
+def _verification_retry_feedback(
+    error: str,
+    evidence: tuple[VerificationEvidence, ...],
+) -> str:
+    details = "\n".join(
+        f"- verifier={item.verifier}; scope={item.scope}; "
+        f"status={item.status}; detail={item.detail or '(none)'}"
+        for item in evidence
+    )
+    return (
+        "Host verification rejected the previous attempt. Correct the output and "
+        "execute the required Tools again before returning.\n"
+        f"Verification error: {error}\n"
+        f"Evidence:\n{details}"
+    )
+
+
+def _evidence_payload(evidence: VerificationEvidence) -> dict[str, str]:
+    return {
+        "verifier": evidence.verifier,
+        "scope": evidence.scope,
+        "status": evidence.status,
+        "detail": evidence.detail,
+    }
+
+
+def _artifact_payload(artifact: ArtifactRef) -> dict[str, str]:
+    return {
+        "name": artifact.name,
+        "location": artifact.location,
+        "media_type": artifact.media_type,
+    }
 
 
 async def _verify_stage(

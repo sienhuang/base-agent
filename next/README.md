@@ -270,7 +270,7 @@ HTTP 服务属于 `base-agent` 的可选 `server` 能力，不由 Starter 实现
 uv sync --project next --extra server --group dev
 ```
 
-应用构造好 Agent 后，直接创建 FastAPI app：
+普通 Agent 应用可以直接创建 FastAPI app：
 
 ```python
 from base_agent.server import create_http_app
@@ -280,6 +280,24 @@ app = create_http_app(
     flows={"plan-react": planner_react_flow},
 )
 ```
+
+只有 Flow 的应用不需要注册一个无意义的默认 Agent。`AgentApplication` 同时收敛命名 Flow、
+启动 preflight 和 FastAPI 组合：
+
+```python
+from base_agent.server import AgentApplication
+
+app = AgentApplication(
+    flows={"analysis": analysis_flow},
+    preflight=(check_dependencies,),
+    title="Analysis Service",
+).fastapi()
+```
+
+`SequentialFlow` 的 Stage 可以声明 `RetryPolicy(max_attempts=3)`。仅当 Agent Run 本身成功、
+但 Host verifier 拒绝结果时才重试；框架把 `VerificationEvidence` 写入下一次 Run 的输入，保留
+相同 `flow_run_id`，并为每次尝试创建独立 `agent_run_id`。`ArtifactRef` 由 Host 创建并进入
+FlowResult、Event 和 HTTP 响应，模型无需在结构化输出中复述路径。
 
 再由任意 ASGI Server 启动，例如 `uvicorn your_application:app`。当前接口包括：
 
@@ -352,7 +370,7 @@ Skill Package 的目录、Tool 贡献、Script 执行边界和 snapshot 契约�
 - 可选 `base_agent.server` FastAPI Run 提交、状态查询与取消；
 - 有序只读 Event；
 - 结构化最终输出验证；
-- 简单 SequentialFlow 与显式阶段交接；
+- 支持 Host-owned ArtifactRef、验证证据反馈重试和显式阶段交接的 SequentialFlow；
 - 固定 Planner/Executor 的 Planner–ReAct Flow、结构化 Plan/Step outcome、逐步 Review/Replan、
   子 Run 关联、事件回放和取消传播。
 

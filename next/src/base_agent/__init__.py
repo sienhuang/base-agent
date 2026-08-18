@@ -1,6 +1,7 @@
 """The intentionally small public surface of base-agent next."""
 
 from base_agent.agent import Agent
+from base_agent.artifacts import ArtifactRef
 from base_agent.definitions import AgentDefinition
 from base_agent.flows import (
     Flow,
@@ -11,6 +12,7 @@ from base_agent.flows import (
     PlannerReActResult,
     PlanningLimits,
     PlanStepDraft,
+    RetryPolicy,
     Stage,
     StageResult,
     StepOutcome,
@@ -32,6 +34,7 @@ from base_agent.verification import VerificationEvidence
 __all__ = [
     "Agent",
     "AgentDefinition",
+    "ArtifactRef",
     "Confirmation",
     "Event",
     "Flow",
@@ -53,6 +56,7 @@ __all__ = [
     "SkillPackage",
     "Stage",
     "StageResult",
+    "RetryPolicy",
     "StepOutcome",
     "ToolChoice",
     "Toolkit",

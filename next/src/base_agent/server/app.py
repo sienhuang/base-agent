@@ -32,6 +32,7 @@ from base_agent.server.registry import (
     RunNotFoundError,
 )
 from base_agent.server.schemas import (
+    ArtifactRefResponse,
     EventResponse,
     FlowChildRunResponse,
     FlowResponse,
@@ -44,7 +45,7 @@ from base_agent.server.schemas import (
 
 
 def create_http_app(
-    agent: Agent,
+    agent: Agent | None = None,
     *,
     prefix: str = "/v1",
     title: str = "base-agent Run Server",
@@ -58,84 +59,21 @@ def create_http_app(
     if sse_ping_seconds < 1:
         raise ValueError("sse_ping_seconds must be at least 1")
     route_prefix = "" if prefix == "/" else prefix
-    registry = InMemoryRunRegistry(agent)
+    if agent is None and not flows:
+        raise ValueError("create_http_app requires at least one Agent or Flow")
+    registry = InMemoryRunRegistry(agent) if agent is not None else None
     flow_registry = InMemoryFlowRegistry(flows or {})
     app = FastAPI(title=title, lifespan=lifespan)
     app.state.run_registry = registry
     app.state.flow_registry = flow_registry
     app.state.sse_ping_seconds = sse_ping_seconds
 
-    @app.post(
-        f"{route_prefix}/runs",
-        response_model=StartRunResponse,
-        status_code=status.HTTP_202_ACCEPTED,
-    )
-    async def start_run(payload: StartRunRequest) -> StartRunResponse:
-        handle = registry.start(payload.prompt, stream=payload.stream)
-        return StartRunResponse(run_id=handle.run_id, status=handle.status)
-
-    @app.get(
-        f"{route_prefix}/runs/{{run_id}}",
-        response_model=RunResponse,
-    )
-    async def get_run(run_id: str) -> RunResponse:
-        handle = _get_handle(registry, run_id)
-        return await _run_response(handle)
-
-    @app.post(
-        f"{route_prefix}/runs/{{run_id}}/cancel",
-        response_model=RunResponse,
-    )
-    async def cancel_run(run_id: str) -> RunResponse:
-        handle = _get_handle(registry, run_id)
-        try:
-            await handle.cancel()
-        except RunNotCancellableError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return await _run_response(handle)
-
-    @app.get(
-        f"{route_prefix}/runs/{{run_id}}/events",
-        response_model=tuple[EventResponse, ...],
-    )
-    async def list_events(
-        run_id: str,
-        after_sequence: Annotated[int, Query(ge=0)] = 0,
-    ) -> tuple[EventResponse, ...]:
-        """Replay the persisted Event history strictly after one cursor."""
-        handle = _get_handle(registry, run_id)
-        return tuple(
-            _event_response(event)
-            for event in await handle.events(after_sequence=after_sequence)
-        )
-
-    @app.get(f"{route_prefix}/runs/{{run_id}}/events/stream")
-    async def stream_events(
-        run_id: str,
-        after_sequence: Annotated[int, Query(ge=0)] = 0,
-        last_event_id_header: Annotated[
-            str | None,
-            Header(alias="Last-Event-ID"),
-        ] = None,
-        last_event_id_query: Annotated[
-            str | None,
-            Query(alias="last_event_id"),
-        ] = None,
-    ) -> EventSourceResponse:
-        """Replay and follow Events over SSE until the Run reaches a terminal state."""
-        handle = _get_handle(registry, run_id)
-        cursor = _event_cursor(
-            after_sequence,
-            last_event_id_header or last_event_id_query,
-        )
-        try:
-            events = handle.stream(after_sequence=cursor)
-        except EventStreamingNotSupportedError as exc:
-            raise HTTPException(status_code=501, detail=str(exc)) from exc
-        return EventSourceResponse(
-            _sse_events(events),
-            ping=sse_ping_seconds,
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    if registry is not None:
+        _register_run_routes(
+            app,
+            registry,
+            route_prefix=route_prefix,
+            sse_ping_seconds=sse_ping_seconds,
         )
 
     if flow_registry.names:
@@ -211,6 +149,87 @@ def create_http_app(
             )
 
     return app
+
+
+def _register_run_routes(
+    app: FastAPI,
+    registry: InMemoryRunRegistry,
+    *,
+    route_prefix: str,
+    sse_ping_seconds: int,
+) -> None:
+    @app.post(
+        f"{route_prefix}/runs",
+        response_model=StartRunResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def start_run(payload: StartRunRequest) -> StartRunResponse:
+        handle = registry.start(payload.prompt, stream=payload.stream)
+        return StartRunResponse(run_id=handle.run_id, status=handle.status)
+
+    @app.get(
+        f"{route_prefix}/runs/{{run_id}}",
+        response_model=RunResponse,
+    )
+    async def get_run(run_id: str) -> RunResponse:
+        handle = _get_handle(registry, run_id)
+        return await _run_response(handle)
+
+    @app.post(
+        f"{route_prefix}/runs/{{run_id}}/cancel",
+        response_model=RunResponse,
+    )
+    async def cancel_run(run_id: str) -> RunResponse:
+        handle = _get_handle(registry, run_id)
+        try:
+            await handle.cancel()
+        except RunNotCancellableError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return await _run_response(handle)
+
+    @app.get(
+        f"{route_prefix}/runs/{{run_id}}/events",
+        response_model=tuple[EventResponse, ...],
+    )
+    async def list_events(
+        run_id: str,
+        after_sequence: Annotated[int, Query(ge=0)] = 0,
+    ) -> tuple[EventResponse, ...]:
+        """Replay the persisted Event history strictly after one cursor."""
+        handle = _get_handle(registry, run_id)
+        return tuple(
+            _event_response(event)
+            for event in await handle.events(after_sequence=after_sequence)
+        )
+
+    @app.get(f"{route_prefix}/runs/{{run_id}}/events/stream")
+    async def stream_events(
+        run_id: str,
+        after_sequence: Annotated[int, Query(ge=0)] = 0,
+        last_event_id_header: Annotated[
+            str | None,
+            Header(alias="Last-Event-ID"),
+        ] = None,
+        last_event_id_query: Annotated[
+            str | None,
+            Query(alias="last_event_id"),
+        ] = None,
+    ) -> EventSourceResponse:
+        """Replay and follow Events over SSE until the Run reaches a terminal state."""
+        handle = _get_handle(registry, run_id)
+        cursor = _event_cursor(
+            after_sequence,
+            last_event_id_header or last_event_id_query,
+        )
+        try:
+            events = handle.stream(after_sequence=cursor)
+        except EventStreamingNotSupportedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        return EventSourceResponse(
+            _sse_events(events),
+            ping=sse_ping_seconds,
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
 
 def _get_handle(registry: InMemoryRunRegistry, run_id: str) -> RunHandle:
@@ -321,6 +340,7 @@ async def _flow_response(
                 plan_id=_plan_id(running_events),
                 status=current_status,
                 event_count=len(running_events),
+                artifacts=_artifact_responses(running_events),
             )
     try:
         result = await handle.wait()
@@ -332,6 +352,7 @@ async def _flow_response(
             status=FlowStatus.FAILED,
             event_count=len(failed_events),
             error=f"{type(exc).__name__}: {exc}",
+            artifacts=_artifact_responses(failed_events),
         )
     events = await handle.events()
     if isinstance(result, PlannerReActResult):
@@ -368,6 +389,14 @@ async def _flow_response(
             event_count=len(events),
             output=result.output,
             error=result.error,
+            artifacts=tuple(
+                ArtifactRefResponse(
+                    name=artifact.name,
+                    location=artifact.location,
+                    media_type=artifact.media_type,
+                )
+                for artifact in result.artifacts
+            ),
             child_runs=tuple(
                 FlowChildRunResponse(
                     role="stage",
@@ -377,9 +406,9 @@ async def _flow_response(
                     source_plan_revision=None,
                     target_plan_revision=None,
                     step_id=None,
-                    attempt=None,
+                    attempt=stage.attempt,
                 )
-                for stage in result.stages
+                for stage in (result.stage_attempts or result.stages)
             ),
         )
     return FlowResponse(
@@ -397,3 +426,17 @@ def _plan_id(events: tuple[Event, ...]) -> str | None:
         if isinstance(plan_id, str):
             return plan_id
     return None
+
+
+def _artifact_responses(events: tuple[Event, ...]) -> tuple[ArtifactRefResponse, ...]:
+    for event in events:
+        if event.kind != "flow.started":
+            continue
+        artifacts = event.payload.get("artifacts")
+        if not isinstance(artifacts, list):
+            return ()
+        return tuple(
+            ArtifactRefResponse.model_validate(artifact)
+            for artifact in artifacts
+        )
+    return ()

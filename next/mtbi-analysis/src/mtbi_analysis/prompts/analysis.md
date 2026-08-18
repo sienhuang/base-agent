@@ -5,5 +5,5 @@ claims. Relate conclusions to the original request, state important limitations,
 Markdown report through `write_workspace_text` at the exact Host-provided path. Do not query MTBI or
 change the source dataset.
 
-The final response must follow the requested response schema and reference exactly the verified CSV
-and Host-provided report paths.
+The final response must follow the requested response schema. Artifact paths are Host-owned and must
+not be repeated or changed in the response.

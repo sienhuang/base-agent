@@ -177,7 +177,8 @@ uv run --project next/starter agent-app \
 
 ## 启动 FastAPI
 
-Starter 的 `asgi.py` 只负责构造具体 Agent，路由、schemas 和 Run registry 全部由
+Starter 的 `asgi.py` 只负责构造具体 Agent 与 Flow，再通过统一的 `AgentApplication` 生成
+FastAPI；路由、schemas、preflight 生命周期和 Run/Flow registry 全部由
 `base_agent.server` 提供。启动本地服务：
 
 ```bash
