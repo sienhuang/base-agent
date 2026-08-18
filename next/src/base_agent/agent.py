@@ -6,6 +6,7 @@ from collections.abc import Coroutine, Iterable, Sequence
 from typing import Any
 from uuid import uuid4
 
+from base_agent.artifacts import ArtifactStore, InMemoryArtifactStore
 from base_agent.context import (
     ContextBudget,
     ContextPolicy,
@@ -22,9 +23,10 @@ from base_agent.memory import (
     MemoryScope,
     MemoryWriter,
 )
-from base_agent.models import RunResult
+from base_agent.models import RunInvocation, RunResult
 from base_agent.observability import Observer
 from base_agent.providers import ModelProvider
+from base_agent.resources import ResourceSpec
 from base_agent.run_handle import RunHandle
 from base_agent.runtime.harness import Harness
 from base_agent.skills import Skill, SkillCatalog, SkillDescriptor
@@ -59,6 +61,8 @@ class Agent:
         memory_recall_timeout_seconds: float = 2.0,
         observers: Sequence[Observer] = (),
         event_store: EventStore | None = None,
+        artifact_store: ArtifactStore | None = None,
+        resources: Iterable[ResourceSpec] = (),
     ) -> None:
         resolved_context_policy = (
             context_policy if context_policy is not None else KeepAllContextPolicy()
@@ -88,6 +92,10 @@ class Agent:
             raise ValueError("memory_recall_limit must be at least 1")
         if memory_recall_timeout_seconds <= 0:
             raise ValueError("memory_recall_timeout_seconds must be positive")
+        resource_specs = tuple(resources)
+        resource_names = [spec.name for spec in resource_specs]
+        if len(set(resource_names)) != len(resource_names):
+            raise ValueError("registered resources must have unique names")
         direct_tools = flatten_tools(tools)
         registered_catalog = skills if isinstance(skills, SkillCatalog) else SkillCatalog(skills)
         selected_catalog = _select_skills(definition, registered_catalog)
@@ -169,6 +177,9 @@ class Agent:
             raise ValueError(f"Provider '{model.info.name}' does not support structured output")
         self.definition = definition
         self.event_store = event_store if event_store is not None else InMemoryEventStore()
+        self.artifact_store = (
+            artifact_store if artifact_store is not None else InMemoryArtifactStore()
+        )
         self._harness = Harness(
             definition=definition,
             model=model,
@@ -184,6 +195,8 @@ class Agent:
             memory_recall_timeout_seconds=memory_recall_timeout_seconds,
             observers=observers,
             event_store=self.event_store,
+            artifact_store=self.artifact_store,
+            resources=resource_specs,
         )
 
     async def run(
@@ -192,12 +205,14 @@ class Agent:
         *,
         on_event: Observer | None = None,
         memory_scope: MemoryScope | None = None,
+        invocation: RunInvocation | None = None,
     ) -> RunResult:
         """Run to completion with an optional per-Run live Event observer."""
         return await self._harness.run(
             prompt,
             on_event=on_event,
             memory_scope=memory_scope,
+            invocation=invocation,
         )
 
     async def stream(
@@ -206,6 +221,7 @@ class Agent:
         *,
         on_event: Observer,
         memory_scope: MemoryScope | None = None,
+        invocation: RunInvocation | None = None,
     ) -> RunResult:
         """Run with Provider streaming and publish live Harness events."""
         return await self._harness.run(
@@ -213,6 +229,7 @@ class Agent:
             stream=True,
             on_event=on_event,
             memory_scope=memory_scope,
+            invocation=invocation,
         )
 
     def start(
@@ -222,6 +239,7 @@ class Agent:
         stream: bool = False,
         on_event: Observer | None = None,
         memory_scope: MemoryScope | None = None,
+        invocation: RunInvocation | None = None,
     ) -> RunHandle:
         """Start a process-local background Run and return immediately."""
         run_id = str(uuid4())
@@ -233,6 +251,7 @@ class Agent:
                 on_event=on_event,
                 run_id=run_id,
                 memory_scope=memory_scope,
+                invocation=invocation,
             )
 
         def cancel_in_background() -> Coroutine[Any, Any, RunResult]:

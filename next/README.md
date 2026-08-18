@@ -262,6 +262,61 @@ HarnessSnapshot/fingerprint。
 内置 HTTP Run Server 暂不从请求 body 接受 MemoryScope，避免客户端自行声明 tenant/user
 身份。启用 Memory 的 HTTP 应用以后应从认证上下文注入 scope。
 
+## Artifact 与 Resource
+
+Resource 是 Run 期间存活的能力，Artifact 是 Run 提交的不可变内容，两者不能用一个
+workspace 路径代替。应用在构造 Agent 时注册 Resource 和共享 ArtifactStore；Tool 声明
+`ToolContext` 参数后，Harness 会自动注入它，但这个参数不会出现在模型看到的 JSON Schema：
+
+```python
+from contextlib import asynccontextmanager
+from base_agent import Agent, LocalArtifactStore, ResourceSpec, ToolContext, tool
+
+@asynccontextmanager
+async def workspace_resource(context):
+    workspace = await open_workspace(context.run_id)
+    try:
+        yield workspace
+    finally:
+        await workspace.close()
+
+@tool
+async def write_report(content: str, context: ToolContext):
+    workspace = await context.resources.get("workspace")
+    await workspace.write_text("report.md", content)
+    return await context.artifacts.create(
+        name="report",
+        media_type="text/markdown",
+        content=content,
+        location="report.md",
+    )
+
+agent = Agent(
+    definition,
+    model=model,
+    tools=(write_report,),
+    artifact_store=LocalArtifactStore(artifact_root),
+    resources=(ResourceSpec("workspace", workspace_resource, eager=True),),
+)
+```
+
+`InMemoryArtifactStore` 用于测试和单进程临时应用；`LocalArtifactStore` 原子提交内容和 JSON
+元数据，并在读取时重新校验 size/SHA-256。`RunResult.artifacts` 返回本 Run 产生的 Artifact，
+包含 producer Run/Agent、Flow/Stage/attempt、Tool call、源 Artifact ID 和安全元数据。
+
+Sequential Stage 通过 `artifacts=(ArtifactSpec(...),)` 声明输出契约。框架先检查 required、
+media type 和大小，再运行领域 verifier；只有全部通过的 Artifact 才会被显式授权给依赖它的
+下游 Stage。`FlowResult.artifact_bindings` 同时保留成功和失败 attempt 的绑定结果，
+`FlowResult.artifacts` 只聚合已接受的不可变引用。完整边界见
+[`docs/adr/0001-artifact-resource-boundary.md`](docs/adr/0001-artifact-resource-boundary.md)。
+需要跨 Stage 或 Planner/Executor 读取 Artifact 时，相关 Agent 必须显式使用同一个
+ArtifactStore；框架在第一次跨 Store 授权时会直接失败，避免产生看似有效但无法读取的引用。
+
+Tool observation 预算由 `AgentDefinition.max_tool_observation_bytes` 和
+`max_run_observation_bytes` 控制，默认分别为 16 KiB 和 64 KiB。应用可以针对大型 metadata
+Tool 提高预算；这两个值会进入 HarnessSnapshot/fingerprint。单次超限内容仍会被截断，整 Run
+累计超限会返回结构化的 `tool_observation_budget_exceeded` failure。
+
 ## 可选 HTTP Run Server
 
 HTTP 服务属于 `base-agent` 的可选 `server` 能力，不由 Starter 实现。安装依赖：
@@ -296,8 +351,9 @@ app = AgentApplication(
 
 `SequentialFlow` 的 Stage 可以声明 `RetryPolicy(max_attempts=3)`。仅当 Agent Run 本身成功、
 但 Host verifier 拒绝结果时才重试；框架把 `VerificationEvidence` 写入下一次 Run 的输入，保留
-相同 `flow_run_id`，并为每次尝试创建独立 `agent_run_id`。`ArtifactRef` 由 Host 创建并进入
-FlowResult、Event 和 HTTP 响应，模型无需在结构化输出中复述路径。
+相同 `flow_run_id`，并为每次尝试创建独立 `agent_run_id`。`ArtifactSpec` 由 Host 声明；Tool
+提交的不可变 Artifact 经过契约和领域验证后进入 FlowResult、Event 和 HTTP 响应，模型无需
+在结构化输出中复述路径。
 
 再由任意 ASGI Server 启动，例如 `uvicorn your_application:app`。当前接口包括：
 
@@ -370,7 +426,7 @@ Skill Package 的目录、Tool 贡献、Script 执行边界和 snapshot 契约�
 - 可选 `base_agent.server` FastAPI Run 提交、状态查询与取消；
 - 有序只读 Event；
 - 结构化最终输出验证；
-- 支持 Host-owned ArtifactRef、验证证据反馈重试和显式阶段交接的 SequentialFlow；
+- 支持 ArtifactSpec/ArtifactStore、验证证据反馈重试和显式阶段交接的 SequentialFlow；
 - 固定 Planner/Executor 的 Planner–ReAct Flow、结构化 Plan/Step outcome、逐步 Review/Replan、
   子 Run 关联、事件回放和取消传播。
 

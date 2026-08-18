@@ -95,6 +95,25 @@ async def test_cli_runs_plan_react_with_live_flow_and_child_trace(capsys) -> Non
     assert "flow.succeeded" in captured.err
 
 
+async def test_cli_plan_react_persists_and_traces_artifact(capsys, tmp_path) -> None:
+    exit_code = await _run(
+        'tool=record_value calls=1 tool_args={"value":42}',
+        settings=Settings(provider="offline", artifact_root=tmp_path / "artifacts"),
+        show_tool_results=True,
+        show_execution_trace=True,
+        stream=False,
+        flow="plan-react",
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "artifact.created artifact=recorded_value" in captured.err
+    assert "artifact.granted artifact=recorded_value" in captured.err
+    assert "status=success, data=42" in captured.out
+    assert len(tuple((tmp_path / "artifacts" / "metadata").glob("*.json"))) == 1
+    assert len(tuple((tmp_path / "artifacts" / "objects").glob("*.bin"))) == 1
+
+
 async def test_cli_streams_plan_react_providers_and_prints_only_validated_output(capsys) -> None:
     exit_code = await _run(
         "hello",

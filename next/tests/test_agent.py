@@ -37,18 +37,18 @@ from base_agent.testing import FakeModel
 from base_agent.tools.core import ToolContext
 
 
-def test_tool_context_is_runtime_owned() -> None:
-    with pytest.raises(
-        TypeError,
-        match="ToolContext is runtime-owned",
-    ):
+async def test_tool_context_is_hidden_from_schema_and_injected_at_runtime() -> None:
+    seen: list[ToolContext] = []
 
-        @tool
-        async def invalid_context_tool(
-            value: int,
-            context: ToolContext,
-        ) -> int:
-            return value
+    @tool
+    async def context_tool(value: int, context: ToolContext) -> int:
+        seen.append(context)
+        return value
+
+    assert set(context_tool.spec.input_schema["properties"]) == {"value"}
+    context = ToolContext(run_id="run-1", agent_id="agent-1", tool_call_id="call-1")
+    assert await context_tool.invoke({"value": 7}, context) == 7
+    assert seen == [context]
 
 
 def test_toolkit_rejects_blank_name_and_duplicate_tools() -> None:
@@ -908,6 +908,113 @@ async def test_harness_executes_only_the_first_tool_calls_per_model_turn() -> No
         "skipped": 2,
         "limit": 3,
     }
+
+
+async def test_agent_definition_can_raise_the_run_observation_budget() -> None:
+    @tool
+    async def large_observation(value: int) -> str:
+        return f"{value}:" + ("x" * 20_000)
+
+    calls = tuple(
+        ToolCall(
+            id=f"large-{value}",
+            name="large_observation",
+            arguments={"value": value},
+        )
+        for value in range(5)
+    )
+    model = FakeModel(
+        [
+            ModelResponse(tool_calls=calls),
+            ModelResponse(content="processed large metadata"),
+        ]
+    )
+    agent = Agent(
+        AgentDefinition(
+            id="large-observation-agent",
+            version="1.0.0",
+            instructions="Process bounded metadata.",
+            tools=("large_observation",),
+            max_model_turns=2,
+            max_tool_calls_per_turn=5,
+            max_tool_observation_bytes=16_384,
+            max_run_observation_bytes=131_072,
+        ),
+        model=model,
+        tools=(large_observation,),
+    )
+
+    result = await agent.run("process metadata")
+
+    assert result.status is RunStatus.SUCCEEDED
+    assert result.snapshot.max_tool_observation_bytes == 16_384
+    assert result.snapshot.max_run_observation_bytes == 131_072
+    tool_messages = [
+        message for message in model.requests[-1].messages if message.role == "tool"
+    ]
+    assert len(tool_messages) == 5
+    assert all(json.loads(message.content)["truncated"] for message in tool_messages)
+
+
+async def test_run_observation_budget_failure_is_structured() -> None:
+    @tool
+    async def large_observation() -> str:
+        return "x" * 20_000
+
+    agent = Agent(
+        AgentDefinition(
+            id="bounded-observation-agent",
+            version="1.0.0",
+            instructions="Process bounded metadata.",
+            tools=("large_observation",),
+            max_model_turns=2,
+            max_tool_calls_per_turn=3,
+            max_tool_observation_bytes=16_384,
+            max_run_observation_bytes=32_768,
+        ),
+        model=FakeModel(
+            [
+                ModelResponse(
+                    tool_calls=tuple(
+                        ToolCall(
+                            id=f"large-{index}",
+                            name="large_observation",
+                            arguments={},
+                        )
+                        for index in range(3)
+                    )
+                ),
+                ModelResponse(content="not reached"),
+            ]
+        ),
+        tools=(large_observation,),
+    )
+
+    result = await agent.run("process metadata")
+
+    assert result.status is RunStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.code == "tool_observation_budget_exceeded"
+    assert result.failure.details["max_run_observation_bytes"] == 32_768
+    assert result.failure.details["observed_bytes"] > 32_768
+
+
+def test_agent_definition_rejects_invalid_observation_budgets() -> None:
+    with pytest.raises(ValueError, match="at least 1024"):
+        AgentDefinition(
+            id="small-observation",
+            version="1.0.0",
+            instructions="Answer.",
+            max_tool_observation_bytes=1_023,
+        )
+    with pytest.raises(ValueError, match="must be at least max_tool"):
+        AgentDefinition(
+            id="inverted-observation",
+            version="1.0.0",
+            instructions="Answer.",
+            max_tool_observation_bytes=4_096,
+            max_run_observation_bytes=2_048,
+        )
 
 
 async def test_final_model_turn_never_executes_more_tools() -> None:

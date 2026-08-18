@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 
 import uvicorn
+from base_agent import LocalArtifactStore
 from base_agent.server import AgentApplication
 from fastapi import FastAPI
 
@@ -21,13 +22,15 @@ def create_app() -> FastAPI:
         settings,
         default_provider=provider,
     )
-    agent = build_agent(provider)
+    artifact_store = LocalArtifactStore(settings.artifact_root)
+    agent = build_agent(provider, artifact_store=artifact_store)
     plan_react = build_plan_react_flow(
         provider,
         planner_provider=planner_provider,
         executor_provider=executor_provider,
         planner_model=settings.plan_react_planner_model,
         executor_model=settings.plan_react_executor_model,
+        artifact_store=artifact_store,
     )
     return AgentApplication(
         agent=agent,

@@ -12,6 +12,7 @@ from base_agent.server.registry import (
 )
 from base_agent.server.schemas import (
     ArtifactRefResponse,
+    ArtifactResponse,
     EventResponse,
     FlowChildRunResponse,
     FlowResponse,
@@ -25,6 +26,7 @@ from base_agent.server.schemas import (
 __all__ = [
     "AgentApplication",
     "ArtifactRefResponse",
+    "ArtifactResponse",
     "InMemoryRunRegistry",
     "Preflight",
     "RegisteredFlow",

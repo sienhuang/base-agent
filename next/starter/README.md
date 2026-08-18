@@ -232,6 +232,11 @@ curl -N -H 'Last-Event-ID: 3' \
 
 ### 通过 FastAPI 测试 Planner-ReAct
 
+Starter 在组装 Planner-ReAct 时会让 Planner 和 Executor 共享同一个
+`LocalArtifactStore`，因此一个子 Run 产生的 Artifact 可以经 Flow 授权给后续子 Run。
+Store 默认位于 `next/starter/.artifacts`，可通过 `AGENT_ARTIFACT_ROOT` 修改。
+`ArtifactManager` 仍然按 Run 隔离：共享的是 Store，不是 Run 的访问权限。
+
 提交 Flow，接口立即返回 `202` 和 `flow_run_id`：
 
 ```bash

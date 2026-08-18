@@ -13,11 +13,12 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from base_agent.agent import Agent
+from base_agent.artifacts import Artifact
 from base_agent.events import EventEmitter, EventStore, InMemoryEventStore
 from base_agent.flows.handle import FlowRunHandle
 from base_agent.flows.models import FlowStatus
 from base_agent.memory import MemoryScope
-from base_agent.models import Event, RunResult, RunStatus
+from base_agent.models import Event, RunInvocation, RunResult, RunStatus
 from base_agent.observability import Observer
 from base_agent.run_handle import RunHandle, RunNotCancellableError
 
@@ -173,6 +174,7 @@ class PlannerReActResult:
     child_runs: tuple[FlowChildRun, ...]
     events: tuple[Event, ...]
     error: str | None = None
+    artifacts: tuple[Artifact, ...] = ()
 
 
 @dataclass(slots=True)
@@ -669,6 +671,16 @@ class PlannerReActFlow:
             stream=state.stream,
             on_event=(forward_child_event if self.forward_child_events else None),
             memory_scope=memory_scope,
+            invocation=RunInvocation(
+                flow_run_id=state.flow_run_id,
+                invocation_id=(
+                    f"{state.flow_run_id}:{role.value}:{len(state.child_runs) + 1}"
+                ),
+                stage=phase,
+                step_id=step_id,
+                attempt=attempt,
+                artifact_ids=self._child_artifact_ids(state, agent),
+            ),
         )
         active = _ActiveChild(
             role=role,
@@ -683,6 +695,28 @@ class PlannerReActFlow:
         )
         state.active_child = active
         return active
+
+    def _child_artifact_ids(
+        self,
+        state: _FlowRunState,
+        target_agent: Agent,
+    ) -> tuple[str, ...]:
+        artifact_ids: list[str] = []
+        for child in state.child_runs:
+            if child.run.status is not RunStatus.SUCCEEDED or not child.run.artifacts:
+                continue
+            producer = (
+                self.planner
+                if child.role is ChildRunRole.PLANNER
+                else self.executor
+            )
+            if producer.artifact_store is not target_agent.artifact_store:
+                raise _FlowExecutionError(
+                    "Planner and Executor must share one ArtifactStore to grant "
+                    "Artifact inputs across child Runs"
+                )
+            artifact_ids.extend(artifact.id for artifact in child.run.artifacts)
+        return tuple(artifact_ids)
 
     async def _wait_for_active_child(self, state: _FlowRunState) -> RunResult:
         active = state.active_child
@@ -784,7 +818,18 @@ class PlannerReActFlow:
             child_runs=tuple(state.child_runs),
             events=await state.emitter.events(),
             error=state.error,
+            artifacts=_child_artifacts(state),
         )
+
+
+def _child_artifacts(state: _FlowRunState) -> tuple[Artifact, ...]:
+    by_id: dict[str, Artifact] = {}
+    for child in state.child_runs:
+        if child.run.status is not RunStatus.SUCCEEDED:
+            continue
+        for artifact in child.run.artifacts:
+            by_id[artifact.id] = artifact
+    return tuple(by_id.values())
 
 
 def _create_plan(

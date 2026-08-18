@@ -11,6 +11,7 @@ from base_agent.governance import (
 from base_agent.tools.core import (
     FunctionTool,
     Tool,
+    ToolContext,
     Toolkit,
     ToolReadiness,
     flatten_tools,
@@ -26,6 +27,7 @@ __all__ = [
     "FunctionTool",
     "SideEffect",
     "Tool",
+    "ToolContext",
     "Toolkit",
     "ToolReadiness",
     "flatten_tools",

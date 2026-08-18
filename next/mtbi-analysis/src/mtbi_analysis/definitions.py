@@ -1,6 +1,16 @@
 """Agent definitions and composition for the MTBI application."""
 
-from base_agent import Agent, AgentDefinition, ToolChoice, Toolkit
+from collections.abc import Iterable
+from dataclasses import replace
+
+from base_agent import (
+    Agent,
+    AgentDefinition,
+    ArtifactStore,
+    ResourceSpec,
+    ToolChoice,
+    Toolkit,
+)
 from base_agent.providers import ModelProvider
 
 from mtbi_analysis.assets import prompt
@@ -37,16 +47,36 @@ MTBI_ANALYSIS_AGENT_DEFINITION = AgentDefinition(
 def build_agents(
     provider: ModelProvider,
     toolkit: Toolkit,
+    *,
+    artifact_store: ArtifactStore,
+    resources: Iterable[ResourceSpec],
+    max_tool_observation_bytes: int,
+    max_run_observation_bytes: int,
 ) -> tuple[Agent, Agent]:
+    resource_specs = tuple(resources)
+    query_definition = replace(
+        MTBI_QUERY_AGENT_DEFINITION,
+        max_tool_observation_bytes=max_tool_observation_bytes,
+        max_run_observation_bytes=max_run_observation_bytes,
+    )
+    analysis_definition = replace(
+        MTBI_ANALYSIS_AGENT_DEFINITION,
+        max_tool_observation_bytes=max_tool_observation_bytes,
+        max_run_observation_bytes=max_run_observation_bytes,
+    )
     return (
         Agent(
-            MTBI_QUERY_AGENT_DEFINITION,
+            query_definition,
             model=provider,
             tools=(toolkit,),
+            artifact_store=artifact_store,
+            resources=resource_specs,
         ),
         Agent(
-            MTBI_ANALYSIS_AGENT_DEFINITION,
+            analysis_definition,
             model=provider,
             tools=(toolkit,),
+            artifact_store=artifact_store,
+            resources=resource_specs,
         ),
     )

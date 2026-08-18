@@ -186,6 +186,7 @@ async def test_http_starts_without_waiting_and_returns_completed_result() -> Non
             "output": None,
             "text": None,
             "error": None,
+            "artifacts": [],
         }
 
         model.release.set()
@@ -198,6 +199,7 @@ async def test_http_starts_without_waiting_and_returns_completed_result() -> Non
         "output": "HTTP done",
         "text": "HTTP done",
         "error": None,
+        "artifacts": [],
     }
 
 
@@ -369,13 +371,7 @@ async def test_agent_application_hosts_a_flow_without_dummy_run_routes() -> None
 
     assert checks == ["ready"]
     assert run_route.status_code == 404
-    assert completed["artifacts"] == [
-        {
-            "name": "dataset",
-            "location": "runs/flow-id/dataset.csv",
-            "media_type": "text/csv",
-        }
-    ]
+    assert completed["artifacts"] == []
     assert completed["child_runs"][0]["attempt"] == 1
 
 
@@ -484,6 +480,7 @@ async def test_http_cancels_running_run_and_replays_terminal_event() -> None:
         "output": None,
         "text": "",
         "error": "run cancellation requested",
+        "artifacts": [],
     }
     assert cancelled.status_code == repeated.status_code == 200
     assert cancelled.json() == repeated.json() == expected

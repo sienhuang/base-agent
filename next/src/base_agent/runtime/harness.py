@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from base_agent.artifacts import ArtifactManager, ArtifactStore
 from base_agent.context import (
     ContextBudget,
     ContextInput,
@@ -47,7 +48,9 @@ from base_agent.models import (
     ModelStreamCompleted,
     ModelTextDelta,
     ModelToolCallDelta,
+    ResourceSnapshot,
     RunFailure,
+    RunInvocation,
     RunResult,
     RunStatus,
     SkillSnapshot,
@@ -62,15 +65,13 @@ from base_agent.providers.errors import (
     InvalidProviderResponseError,
     ProviderError,
 )
+from base_agent.resources import ResourceContext, ResourceManager, ResourceSpec
 from base_agent.skills import Skill
 from base_agent.skills.execution import skill_script_tool_name
 from base_agent.skills.loading import SKILL_VIEW_TOOL_NAME
 from base_agent.tools import Tool, flatten_tools
 from base_agent.tools.core import ToolContext
 from base_agent.verification import VerificationEvidence
-
-_MAX_OBSERVATION_BYTES = 16_384
-_MAX_TURN_OBSERVATION_BYTES = 65_536
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +100,8 @@ class Harness:
         memory_recall_timeout_seconds: float,
         observers: Sequence[Observer],
         event_store: EventStore,
+        artifact_store: ArtifactStore,
+        resources: tuple[ResourceSpec, ...],
     ) -> None:
         self._definition = definition
         self._model = model
@@ -120,6 +123,8 @@ class Harness:
         self._memory_recall_timeout_seconds = memory_recall_timeout_seconds
         self._observers = tuple(observers)
         self._event_store = event_store
+        self._artifact_store = artifact_store
+        self._resources = resources
 
     async def run(
         self,
@@ -129,6 +134,70 @@ class Harness:
         on_event: Observer | None = None,
         run_id: str | None = None,
         memory_scope: MemoryScope | None = None,
+        invocation: RunInvocation | None = None,
+    ) -> RunResult:
+        resolved_run_id = run_id or str(uuid4())
+        resolved_invocation = invocation or RunInvocation()
+        run_observers = self._observers if on_event is None else (*self._observers, on_event)
+        emitter = EventEmitter(resolved_run_id, self._event_store, run_observers)
+        artifact_manager = ArtifactManager(
+            self._artifact_store,
+            run_id=resolved_run_id,
+            agent_id=self._definition.id,
+            emitter=emitter,
+            flow_run_id=resolved_invocation.flow_run_id,
+            invocation_id=resolved_invocation.invocation_id,
+            stage=resolved_invocation.stage,
+            step_id=resolved_invocation.step_id,
+            attempt=resolved_invocation.attempt,
+            granted_artifact_ids=resolved_invocation.artifact_ids,
+        )
+        resource_manager = ResourceManager(
+            self._resources,
+            context=ResourceContext(
+                run_id=resolved_run_id,
+                agent_id=self._definition.id,
+                flow_run_id=resolved_invocation.flow_run_id,
+                invocation_id=resolved_invocation.invocation_id,
+                stage=resolved_invocation.stage,
+                step_id=resolved_invocation.step_id,
+                attempt=resolved_invocation.attempt,
+            ),
+            emitter=emitter,
+        )
+        try:
+            result = await self._run(
+                prompt,
+                stream=stream,
+                memory_scope=memory_scope,
+                emitter=emitter,
+                artifact_manager=artifact_manager,
+                resource_manager=resource_manager,
+            )
+        except BaseException:
+            try:
+                await resource_manager.close()
+            except Exception:
+                pass
+            raise
+        try:
+            await resource_manager.close()
+        except Exception:
+            # The main Run has already failed; preserve that primary failure.
+            # Successful Runs close Resources before committing run.succeeded.
+            if result.status is RunStatus.SUCCEEDED:
+                raise
+        return result
+
+    async def _run(
+        self,
+        prompt: str,
+        *,
+        stream: bool = False,
+        memory_scope: MemoryScope | None = None,
+        emitter: EventEmitter,
+        artifact_manager: ArtifactManager,
+        resource_manager: ResourceManager,
     ) -> RunResult:
         if not prompt.strip():
             raise ValueError("run prompt must not be blank")
@@ -144,15 +213,15 @@ class Harness:
                 "enabled Memory requires an explicit MemoryScope"
             )
 
-        resolved_run_id = run_id or str(uuid4())
-        run_observers = self._observers if on_event is None else (*self._observers, on_event)
-        emitter = EventEmitter(resolved_run_id, self._event_store, run_observers)
+        resolved_run_id = emitter.run_id
         snapshot = self._create_snapshot()
         await emitter.emit(
             "run.started",
             agent_id=snapshot.agent_id,
             agent_version=snapshot.agent_version,
             snapshot_fingerprint=snapshot.fingerprint,
+            artifact_store=snapshot.artifact_store,
+            resources=tuple(resource.name for resource in snapshot.resources),
         )
         user_message = Message.user(prompt, message_id=str(uuid4()))
         await emitter.emit(
@@ -167,6 +236,32 @@ class Harness:
                 skill_name=skill.name,
                 skill_version=skill.version,
                 package_fingerprint=skill.package_fingerprint,
+            )
+
+        try:
+            await resource_manager.start()
+        except Exception as exc:
+            return await self._failed(
+                emitter,
+                snapshot,
+                error=f"resource acquisition failed: {type(exc).__name__}: {exc}",
+                failure=RunFailure(
+                    code="resource_acquisition_failed",
+                    message=str(exc),
+                ),
+            )
+
+        try:
+            await artifact_manager.validate_inputs()
+        except Exception as exc:
+            return await self._failed(
+                emitter,
+                snapshot,
+                error=f"artifact input validation failed: {type(exc).__name__}: {exc}",
+                failure=RunFailure(
+                    code="artifact_input_invalid",
+                    message=str(exc),
+                ),
             )
 
         readiness_error = await self._check_readiness(emitter)
@@ -355,6 +450,26 @@ class Harness:
                         evidence=evidence,
                         turn=turn,
                     )
+                try:
+                    await resource_manager.close()
+                except Exception as exc:
+                    await emitter.emit(
+                        "resource.release_failed",
+                        turn=turn,
+                        error_type=type(exc).__name__,
+                    )
+                    return await self._failed(
+                        emitter,
+                        snapshot,
+                        error=f"resource cleanup failed: {type(exc).__name__}: {exc}",
+                        failure=RunFailure(
+                            code="resource_cleanup_failed",
+                            message=str(exc),
+                        ),
+                        tool_results=tool_results,
+                        evidence=evidence,
+                        turn=turn,
+                    )
                 await self._queue_memory_write(
                     scope=memory_scope,
                     run_id=resolved_run_id,
@@ -379,6 +494,8 @@ class Harness:
                     events=await emitter.events(),
                     tool_results=tuple(tool_results),
                     evidence=evidence,
+                    artifacts=await artifact_manager.list_outputs(),
+                    artifact_inputs=await artifact_manager.list_inputs(),
                 )
 
             if self._definition.tool_choice.value == "none":
@@ -417,6 +534,8 @@ class Harness:
                     turn=turn,
                     tools_by_name=tools_by_name,
                     emitter=emitter,
+                    artifact_manager=artifact_manager,
+                    resource_manager=resource_manager,
                 )
                 turn_results.append(result)
             for call in overflow_calls:
@@ -440,13 +559,33 @@ class Harness:
 
             for result in turn_results:
                 tool_results.append(result)
-                observation = _tool_result_observation(result)
+                observation = _tool_result_observation(
+                    result,
+                    max_bytes=self._definition.max_tool_observation_bytes,
+                )
                 observation_bytes += len(observation.encode("utf-8"))
-                if observation_bytes > _MAX_TURN_OBSERVATION_BYTES:
+                if observation_bytes > self._definition.max_run_observation_bytes:
                     return await self._failed(
                         emitter,
                         snapshot,
-                        error="Tool observations exceeded the per-Run context budget",
+                        error=(
+                            "Tool observations exceeded the per-Run context budget "
+                            f"({observation_bytes} > "
+                            f"{self._definition.max_run_observation_bytes} bytes)"
+                        ),
+                        failure=RunFailure(
+                            code="tool_observation_budget_exceeded",
+                            message="Tool observations exceeded the per-Run context budget",
+                            details={
+                                "observed_bytes": observation_bytes,
+                                "max_run_observation_bytes": (
+                                    self._definition.max_run_observation_bytes
+                                ),
+                                "max_tool_observation_bytes": (
+                                    self._definition.max_tool_observation_bytes
+                                ),
+                            },
+                        ),
                         tool_results=tool_results,
                         turn=turn,
                     )
@@ -589,6 +728,10 @@ class Harness:
             ],
             "max_model_turns": self._definition.max_model_turns,
             "max_tool_calls_per_turn": (self._definition.max_tool_calls_per_turn),
+            "max_tool_observation_bytes": (
+                self._definition.max_tool_observation_bytes
+            ),
+            "max_run_observation_bytes": self._definition.max_run_observation_bytes,
             "context_policy": self._context_policy_name,
             "context_budget": {
                 "context_window_tokens": self._context_budget.context_window_tokens,
@@ -601,6 +744,15 @@ class Harness:
             "memory_write_enabled": self._memory_write_enabled,
             "memory_recall_limit": self._memory_recall_limit,
             "memory_recall_timeout_seconds": self._memory_recall_timeout_seconds,
+            "artifact_store": type(self._artifact_store).__name__,
+            "resources": [
+                {
+                    "name": spec.name,
+                    "scope": spec.scope.value,
+                    "eager": spec.eager,
+                }
+                for spec in self._resources
+            ],
             "tool_specs": [
                 {
                     "description": spec.description,
@@ -629,6 +781,10 @@ class Harness:
             permissions=self._definition.permissions,
             max_model_turns=self._definition.max_model_turns,
             max_tool_calls_per_turn=(self._definition.max_tool_calls_per_turn),
+            max_tool_observation_bytes=(
+                self._definition.max_tool_observation_bytes
+            ),
+            max_run_observation_bytes=self._definition.max_run_observation_bytes,
             context_policy=self._context_policy_name,
             context_window_tokens=self._context_budget.context_window_tokens,
             context_reserved_output_tokens=self._context_budget.reserved_output_tokens,
@@ -639,6 +795,15 @@ class Harness:
             memory_writer=self._memory_writer_name,
             memory_recall_limit=self._memory_recall_limit,
             memory_recall_timeout_seconds=self._memory_recall_timeout_seconds,
+            artifact_store=type(self._artifact_store).__name__,
+            resources=tuple(
+                ResourceSnapshot(
+                    name=spec.name,
+                    scope=spec.scope.value,
+                    eager=spec.eager,
+                )
+                for spec in self._resources
+            ),
             fingerprint=fingerprint,
         )
 
@@ -769,6 +934,8 @@ class Harness:
         turn: int,
         tools_by_name: Mapping[str, Tool],
         emitter: EventEmitter,
+        artifact_manager: ArtifactManager,
+        resource_manager: ResourceManager,
     ) -> ToolResult:
         tool = tools_by_name.get(call.name)
         if tool is None:
@@ -897,6 +1064,8 @@ class Harness:
                         run_id=emitter.run_id,
                         agent_id=self._definition.id,
                         tool_call_id=call.id,
+                        artifacts=artifact_manager.for_tool(call.id),
+                        resources=resource_manager,
                     ),
                 ),
                 timeout=tool.timeout_seconds,
@@ -995,6 +1164,7 @@ class Harness:
                 code="run_failed",
                 message=error,
             ),
+            artifacts=await self._artifact_store.list(run_id=emitter.run_id),
         )
 
     async def cancelled_result(
@@ -1011,7 +1181,7 @@ class Harness:
             "run.failed",
             "run.cancelled",
         }:
-            return self._result_from_terminal_events(run_id, existing_events)
+            return await self._result_from_terminal_events(run_id, existing_events)
         turn = next(
             (event.turn for event in reversed(existing_events) if event.turn is not None),
             None,
@@ -1025,9 +1195,10 @@ class Harness:
             snapshot=self._create_snapshot(),
             events=await emitter.events(),
             error=reason,
+            artifacts=await self._artifact_store.list(run_id=run_id),
         )
 
-    def _result_from_terminal_events(
+    async def _result_from_terminal_events(
         self,
         run_id: str,
         events: tuple[Event, ...],
@@ -1059,6 +1230,7 @@ class Harness:
                 snapshot=snapshot,
                 events=events,
                 evidence=evidence,
+                artifacts=await self._artifact_store.list(run_id=run_id),
             )
         error = terminal.payload.get("error") or terminal.payload.get("reason")
         resolved_error = str(error or terminal.kind)
@@ -1080,6 +1252,7 @@ class Harness:
                 if status is RunStatus.FAILED
                 else None
             ),
+            artifacts=await self._artifact_store.list(run_id=run_id),
         )
 
 
@@ -1307,7 +1480,7 @@ def _tool_choice_for_turn(
     return definition.tool_choice
 
 
-def _tool_result_observation(result: ToolResult) -> str:
+def _tool_result_observation(result: ToolResult, *, max_bytes: int) -> str:
     payload = {
         "status": result.status.value,
         "data": result.data,
@@ -1315,20 +1488,26 @@ def _tool_result_observation(result: ToolResult) -> str:
     }
     text = json.dumps(payload, ensure_ascii=False, default=str)
     encoded = text.encode("utf-8")
-    if len(encoded) <= _MAX_OBSERVATION_BYTES:
+    if len(encoded) <= max_bytes:
         return text
-    preview_bytes = encoded[: _MAX_OBSERVATION_BYTES - 512]
-    preview = preview_bytes.decode("utf-8", errors="ignore")
-    return json.dumps(
-        {
-            "status": result.status.value,
-            "data": None,
-            "error": result.error,
-            "truncated": True,
-            "preview": preview,
-        },
-        ensure_ascii=False,
-    )
+    preview_bytes = encoded[: max_bytes - 512]
+    while True:
+        preview = preview_bytes.decode("utf-8", errors="ignore")
+        truncated = json.dumps(
+            {
+                "status": result.status.value,
+                "data": None,
+                "error": None,
+                "truncated": True,
+                "original_bytes": len(encoded),
+                "preview": preview,
+            },
+            ensure_ascii=False,
+        )
+        overflow = len(truncated.encode("utf-8")) - max_bytes
+        if overflow <= 0:
+            return truncated
+        preview_bytes = preview_bytes[: max(0, len(preview_bytes) - overflow - 64)]
 
 
 def _model_failure(exc: Exception) -> RunFailure:

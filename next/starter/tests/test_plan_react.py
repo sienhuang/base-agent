@@ -1,3 +1,4 @@
+from base_agent import InMemoryArtifactStore
 from base_agent.flows import (
     ChildRunRole,
     FlowStatus,
@@ -25,7 +26,8 @@ class CapturingOfflineProvider(OfflineProvider):
 
 
 def test_plan_react_composition_uses_fixed_structured_roles() -> None:
-    flow = build_plan_react_flow()
+    artifact_store = InMemoryArtifactStore()
+    flow = build_plan_react_flow(artifact_store=artifact_store)
 
     assert flow.planner.definition is PLAN_REACT_PLANNER_DEFINITION
     assert flow.executor.definition is PLAN_REACT_EXECUTOR_DEFINITION
@@ -35,6 +37,8 @@ def test_plan_react_composition_uses_fixed_structured_roles() -> None:
     assert flow.planner.definition.skills == ()
     assert flow.executor.definition.tools
     assert flow.executor.definition.skills
+    assert flow.planner.artifact_store is artifact_store
+    assert flow.executor.artifact_store is artifact_store
     assert OfflineProvider().info.capabilities.structured_output is True
 
 
@@ -45,6 +49,7 @@ async def test_plan_react_routes_planner_and_executor_models_independently() -> 
         model=provider,
         planner_model="planner-model",
         executor_model="executor-model",
+        artifact_store=InMemoryArtifactStore(),
     )
 
     assert result.status is FlowStatus.SUCCEEDED
@@ -63,6 +68,7 @@ async def test_plan_react_uses_independent_role_providers() -> None:
         "calculate 4 * 30",
         planner_provider=planner_provider,
         executor_provider=executor_provider,
+        artifact_store=InMemoryArtifactStore(),
     )
 
     assert result.status is FlowStatus.SUCCEEDED
@@ -71,7 +77,10 @@ async def test_plan_react_uses_independent_role_providers() -> None:
 
 
 async def test_offline_plan_react_runs_create_execute_review_to_completion() -> None:
-    result = await run_plan_react("calculate 4 * 30")
+    result = await run_plan_react(
+        "calculate 4 * 30",
+        artifact_store=InMemoryArtifactStore(),
+    )
 
     assert result.status is FlowStatus.SUCCEEDED
     assert result.error is None
@@ -124,6 +133,7 @@ async def test_plan_react_streams_child_json_only_as_internal_deltas() -> None:
         "calculate 4 * 30",
         stream=True,
         on_event=observed.append,
+        artifact_store=InMemoryArtifactStore(),
     )
 
     assert result.status is FlowStatus.SUCCEEDED
@@ -151,6 +161,7 @@ async def test_offline_plan_react_executor_can_use_starter_skill_tool() -> None:
         'tool=calculate_product calls=1 tool_args={"left":4,"right":30}',
         stream=True,
         on_event=observed.append,
+        artifact_store=InMemoryArtifactStore(),
     )
 
     assert result.status is FlowStatus.SUCCEEDED
@@ -169,3 +180,31 @@ async def test_offline_plan_react_executor_can_use_starter_skill_tool() -> None:
         if event.kind in {"model.tool_call.delta", "child.model.tool_call.delta"}
         or event.payload.get("child_kind") == "model.tool_call.delta"
     ]
+
+
+async def test_plan_react_grants_recorded_value_artifact_to_review_planner() -> None:
+    observed = []
+    artifact_store = InMemoryArtifactStore()
+
+    result = await run_plan_react(
+        'tool=record_value calls=1 tool_args={"value":42}',
+        stream=True,
+        on_event=observed.append,
+        artifact_store=artifact_store,
+    )
+
+    assert result.status is FlowStatus.SUCCEEDED
+    assert len(result.artifacts) == 1
+    artifact = result.artifacts[0]
+    assert artifact.name == "recorded_value"
+    assert artifact.media_type == "application/json"
+    assert await artifact_store.read(artifact.id) == b'{"value":42}'
+    executor_run = result.child_runs[1].run
+    review_run = result.child_runs[2].run
+    assert executor_run.artifacts == (artifact,)
+    assert review_run.artifact_inputs == (artifact,)
+    assert [
+        event.kind
+        for event in observed
+        if event.kind in {"artifact.created", "artifact.granted"}
+    ] == ["artifact.created", "artifact.granted"]

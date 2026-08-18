@@ -29,6 +29,8 @@ class Settings:
     cli_executable: str = "codex"
     cli_timeout_seconds: float = 300.0
     cli_max_output_bytes: int = 4 * 1024 * 1024
+    max_tool_observation_bytes: int = 32 * 1024
+    max_run_observation_bytes: int = 512 * 1024
     mtbi_cli_bin: str = "mtbi-cli"
     workspace: Path = _APPLICATION_ROOT / "workspace"
     mtbi_cli_timeout_seconds: float = 600.0
@@ -42,6 +44,13 @@ class Settings:
             raise ValueError("cli_timeout_seconds must be greater than zero")
         if self.cli_max_output_bytes < 1:
             raise ValueError("cli_max_output_bytes must be positive")
+        if self.max_tool_observation_bytes < 1_024:
+            raise ValueError("max_tool_observation_bytes must be at least 1024")
+        if self.max_run_observation_bytes < self.max_tool_observation_bytes:
+            raise ValueError(
+                "max_run_observation_bytes must be at least "
+                "max_tool_observation_bytes"
+            )
         if not self.mtbi_cli_bin.strip():
             raise ValueError("mtbi_cli_bin must not be blank")
         if self.mtbi_cli_timeout_seconds <= 0:
@@ -92,6 +101,14 @@ class Settings:
                 _env_value("AGENT_CLI_MAX_OUTPUT_BYTES", file_values)
                 or str(4 * 1024 * 1024)
             )
+            max_tool_observation = int(
+                _env_value("AGENT_MAX_TOOL_OBSERVATION_BYTES", file_values)
+                or str(32 * 1024)
+            )
+            max_run_observation = int(
+                _env_value("AGENT_MAX_RUN_OBSERVATION_BYTES", file_values)
+                or str(512 * 1024)
+            )
         except ValueError as exc:
             raise ValueError("CLI and MTBI numeric limits must contain valid numbers") from exc
 
@@ -113,6 +130,8 @@ class Settings:
             ).strip(),
             cli_timeout_seconds=cli_timeout,
             cli_max_output_bytes=cli_max_output,
+            max_tool_observation_bytes=max_tool_observation,
+            max_run_observation_bytes=max_run_observation,
             mtbi_cli_bin=(
                 _env_value("MTBI_CLI_BIN", file_values) or "mtbi-cli"
             ).strip(),

@@ -1,5 +1,6 @@
 """Request and response models for the optional Agent and Flow server."""
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -29,6 +30,27 @@ class StartRunResponse(BaseModel):
     status: RunStatus
 
 
+class ArtifactResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = None
+    name: str
+    location: str | None = None
+    media_type: str
+    size_bytes: int | None = None
+    sha256: str | None = None
+    created_at: datetime | None = None
+    producer_run_id: str | None = None
+    producer_agent_id: str | None = None
+    flow_run_id: str | None = None
+    stage: str | None = None
+    tool_call_id: str | None = None
+    source_artifact_ids: tuple[str, ...] = ()
+
+
+ArtifactRefResponse = ArtifactResponse
+
+
 class RunResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -38,6 +60,7 @@ class RunResponse(BaseModel):
     output: Any | None = None
     text: str | None = None
     error: str | None = None
+    artifacts: tuple[ArtifactResponse, ...] = ()
 
 
 class EventResponse(BaseModel):
@@ -86,14 +109,6 @@ class FlowChildRunResponse(BaseModel):
     attempt: int | None
 
 
-class ArtifactRefResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    location: str
-    media_type: str
-
-
 class FlowResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -105,4 +120,4 @@ class FlowResponse(BaseModel):
     error: str | None = None
     plan: dict[str, Any] | None = None
     child_runs: tuple[FlowChildRunResponse, ...] = ()
-    artifacts: tuple[ArtifactRefResponse, ...] = ()
+    artifacts: tuple[ArtifactResponse, ...] = ()

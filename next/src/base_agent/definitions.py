@@ -27,6 +27,8 @@ class AgentDefinition:
     response_model: type[BaseModel] | None = None
     max_model_turns: int = 10
     max_tool_calls_per_turn: int = 3
+    max_tool_observation_bytes: int = 16_384
+    max_run_observation_bytes: int = 65_536
 
     def __post_init__(self) -> None:
         if not self.id or not _ID_PATTERN.fullmatch(self.id):
@@ -39,6 +41,13 @@ class AgentDefinition:
             raise ValueError("max_model_turns must be at least 1")
         if self.max_tool_calls_per_turn < 1:
             raise ValueError("max_tool_calls_per_turn must be at least 1")
+        if self.max_tool_observation_bytes < 1_024:
+            raise ValueError("max_tool_observation_bytes must be at least 1024")
+        if self.max_run_observation_bytes < self.max_tool_observation_bytes:
+            raise ValueError(
+                "max_run_observation_bytes must be at least "
+                "max_tool_observation_bytes"
+            )
         if len(set(self.tools)) != len(self.tools):
             raise ValueError("agent tools must not contain duplicates")
         if len(set(self.skills)) != len(self.skills):

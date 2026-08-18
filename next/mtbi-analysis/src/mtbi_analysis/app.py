@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from base_agent import LocalArtifactStore, ResourceSpec
 from base_agent.providers import ModelProvider
 
 from mtbi_analysis.config import Settings
@@ -47,9 +48,20 @@ def build_application(
         timeout_seconds=resolved.mtbi_cli_timeout_seconds,
     )
     toolkit = build_mtbi_toolkit(workspace, resolved_runner)
+    artifact_store = LocalArtifactStore(workspace.root / ".artifacts")
     query_agent, analysis_agent = build_agents(
         provider or build_provider(resolved),
         toolkit,
+        artifact_store=artifact_store,
+        max_tool_observation_bytes=resolved.max_tool_observation_bytes,
+        max_run_observation_bytes=resolved.max_run_observation_bytes,
+        resources=(
+            ResourceSpec(
+                name="workspace",
+                factory=lambda _context: workspace,
+                eager=True,
+            ),
+        ),
     )
     return MTBIAnalysisApplication(
         MTBIAnalysisFlow(

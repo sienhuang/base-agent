@@ -39,7 +39,8 @@ _STRUCTURED_OUTPUT_MODES = frozenset(
     }
 )
 
-_DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+_APPLICATION_ROOT = Path(__file__).resolve().parents[2]
+_DOTENV_PATH = _APPLICATION_ROOT / ".env"
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,7 @@ class Settings:
     cli_executable: str | None = None
     cli_timeout_seconds: float = 300.0
     cli_max_output_bytes: int = 4 * 1024 * 1024
+    artifact_root: Path = _APPLICATION_ROOT / ".artifacts"
 
     @classmethod
     def from_env(
@@ -135,6 +137,10 @@ class Settings:
             "PLAN_REACT_EXECUTOR_STRUCTURED_OUTPUT_MODE",
             file_values,
         )
+        artifact_root_value = _env_value("AGENT_ARTIFACT_ROOT", file_values) or ".artifacts"
+        artifact_root = Path(artifact_root_value).expanduser()
+        if not artifact_root.is_absolute():
+            artifact_root = _APPLICATION_ROOT / artifact_root
 
         return cls(
             provider=resolved_provider,
@@ -156,6 +162,7 @@ class Settings:
             cli_executable=_optional_env("AGENT_CLI_EXECUTABLE", file_values),
             cli_timeout_seconds=timeout_seconds,
             cli_max_output_bytes=max_output_bytes,
+            artifact_root=artifact_root.resolve(),
         )
 
     def for_plan_react_role(self, role: PlanReactRole) -> Settings:

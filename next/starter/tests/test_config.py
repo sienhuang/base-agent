@@ -20,6 +20,7 @@ _CONFIG_NAMES = (
     "AGENT_CLI_EXECUTABLE",
     "AGENT_CLI_TIMEOUT_SECONDS",
     "AGENT_CLI_MAX_OUTPUT_BYTES",
+    "AGENT_ARTIFACT_ROOT",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_MODEL",
@@ -49,6 +50,7 @@ def test_settings_read_starter_dotenv_without_mutating_process_environment(
                 "OPENAI_API_KEY=dotenv-key",
                 "OPENAI_BASE_URL=http://localhost:8000/v1",
                 "AGENT_STRUCTURED_OUTPUT_MODE=json-object",
+                f"AGENT_ARTIFACT_ROOT={tmp_path / 'artifacts'}",
             )
         ),
         encoding="utf-8",
@@ -72,6 +74,7 @@ def test_settings_read_starter_dotenv_without_mutating_process_environment(
     assert settings.api_key == "dotenv-key"
     assert settings.base_url == "http://localhost:8000/v1"
     assert settings.structured_output_mode == "json-object"
+    assert settings.artifact_root == (tmp_path / "artifacts").resolve()
     assert os.getenv("AGENT_PROVIDER") is None
 
 

@@ -9,11 +9,18 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 from base_agent.agent import Agent
-from base_agent.artifacts import ArtifactRef
+from base_agent.artifacts import (
+    Artifact,
+    ArtifactBinding,
+    ArtifactBindingStatus,
+    ArtifactRef,
+    ArtifactSpec,
+    artifact_spec,
+)
 from base_agent.events import EventEmitter, EventStore, InMemoryEventStore
 from base_agent.flows.handle import FlowRunHandle
 from base_agent.flows.models import FlowStatus
-from base_agent.models import Event, RunResult, RunStatus
+from base_agent.models import Event, RunInvocation, RunResult, RunStatus
 from base_agent.observability import Observer
 from base_agent.run_handle import RunHandle, RunNotCancellableError
 from base_agent.verification import VerificationEvidence
@@ -48,12 +55,18 @@ class Stage:
     handoff: StageHandoff | None = None
     verify: StageVerifier | None = None
     retry: RetryPolicy = RetryPolicy()
+    artifacts: tuple[ArtifactSpec, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise ValueError("stage name must not be blank")
         if self.input_from is not None and not self.input_from.strip():
             raise ValueError("stage input_from must not be blank")
+        normalized = tuple(artifact_spec(item) for item in self.artifacts)
+        names = [item.name for item in normalized]
+        if len(set(names)) != len(names):
+            raise ValueError(f"Stage '{self.name}' ArtifactSpec names must be unique")
+        object.__setattr__(self, "artifacts", normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,8 +86,10 @@ class FlowResult:
     stages: tuple[StageResult, ...]
     events: tuple[Event, ...]
     stage_attempts: tuple[StageResult, ...] = ()
-    artifacts: tuple[ArtifactRef, ...] = ()
+    artifacts: tuple[Artifact, ...] = ()
     error: str | None = None
+    artifact_specs: tuple[ArtifactSpec, ...] = ()
+    artifact_bindings: tuple[ArtifactBinding, ...] = ()
 
 
 @dataclass(slots=True)
@@ -92,6 +107,8 @@ class _SequentialFlowState:
     cancelled_stage: Stage | None = None
     cancelled_run: RunResult | None = None
     cancelled_attempt: int | None = None
+    accepted_artifacts: list[Artifact] = field(default_factory=list)
+    artifact_bindings: list[ArtifactBinding] = field(default_factory=list)
 
 
 class SequentialFlow:
@@ -103,7 +120,8 @@ class SequentialFlow:
         observers: Sequence[Observer] = (),
         event_store: EventStore | None = None,
         forward_child_events: bool = False,
-        artifacts: Sequence[ArtifactRef] = (),
+        artifact_specs: Sequence[ArtifactSpec | ArtifactRef] = (),
+        artifacts: Sequence[ArtifactSpec | ArtifactRef] = (),
     ) -> None:
         if not id.strip():
             raise ValueError("flow id must not be blank")
@@ -125,7 +143,15 @@ class SequentialFlow:
         self.stages = tuple(stages)
         self.event_store = event_store if event_store is not None else InMemoryEventStore()
         self.forward_child_events = forward_child_events
-        self.artifacts = tuple(artifacts)
+        declared_specs = (
+            *(artifact_spec(item) for stage in stages for item in stage.artifacts),
+            *(artifact_spec(item) for item in artifact_specs),
+            *(artifact_spec(item) for item in artifacts),
+        )
+        spec_names = [item.name for item in declared_specs]
+        if len(set(spec_names)) != len(spec_names):
+            raise ValueError("Flow ArtifactSpec names must be unique")
+        self.artifact_specs = tuple(declared_specs)
         self._observers = tuple(observers)
 
     async def run(
@@ -186,9 +212,9 @@ class SequentialFlow:
         flow_run_id: str | None,
     ) -> _SequentialFlowState:
         observers = self._observers if on_event is None else (*self._observers, on_event)
-        resolved_flow_run_id = flow_run_id or str(uuid4())
-        if not resolved_flow_run_id.strip():
+        if flow_run_id is not None and not flow_run_id.strip():
             raise ValueError("flow_run_id must not be blank")
+        resolved_flow_run_id = flow_run_id if flow_run_id is not None else str(uuid4())
         return _SequentialFlowState(
             flow_run_id=resolved_flow_run_id,
             prompt=prompt,
@@ -214,7 +240,9 @@ class SequentialFlow:
             flow_id=self.id,
             stage_count=len(self.stages),
             stream=state.stream,
-            artifacts=[_artifact_payload(artifact) for artifact in self.artifacts],
+            artifact_specs=[
+                _artifact_spec_payload(artifact) for artifact in self.artifact_specs
+            ],
         )
         for index, stage in enumerate(self.stages):
             stage_input = _select_stage_input(
@@ -277,12 +305,23 @@ class SequentialFlow:
                         stage=stage.name,
                     )
 
+                contract_evidence, contract_error = _verify_artifact_contract(stage, run)
                 evidence, verification_error = await _verify_stage(stage, run)
-                handoff = stage.handoff(run) if stage.handoff is not None else run.text
+                evidence = (*contract_evidence, *evidence)
+                verification_error = contract_error or verification_error
+                state.artifact_bindings.extend(
+                    _artifact_bindings(
+                        stage,
+                        run,
+                        attempt=attempt,
+                        accepted=verification_error is None,
+                        detail=verification_error or "",
+                    )
+                )
                 result = StageResult(
                     name=stage.name,
                     run=run,
-                    handoff=handoff,
+                    handoff=run.text,
                     evidence=evidence,
                     attempt=attempt,
                 )
@@ -320,7 +359,26 @@ class SequentialFlow:
                         verification_error,
                         stage=stage.name,
                     )
+                handoff = stage.handoff(run) if stage.handoff is not None else run.text
+                result = StageResult(
+                    name=stage.name,
+                    run=run,
+                    handoff=handoff,
+                    evidence=evidence,
+                    attempt=attempt,
+                )
+                state.stage_attempts[-1] = result
                 state.stage_results.append(result)
+                accepted_ids = {
+                    binding.artifact_id
+                    for binding in state.artifact_bindings
+                    if binding.run_id == run.run_id
+                    and binding.status is ArtifactBindingStatus.ACCEPTED
+                    and binding.artifact_id is not None
+                }
+                state.accepted_artifacts.extend(
+                    artifact for artifact in run.artifacts if artifact.id in accepted_ids
+                )
                 state.handoffs[stage.name] = handoff
                 await state.emitter.emit(
                     "stage.succeeded",
@@ -365,10 +423,31 @@ class SequentialFlow:
                 **payload,
             )
 
+        artifact_ids = _artifact_input_ids(state, stage)
+        if artifact_ids:
+            source_name = (
+                stage.input_from
+                if stage.input_from not in {None, "user"}
+                else state.stage_results[-1].name
+            )
+            source_stage = next(item for item in self.stages if item.name == source_name)
+            if source_stage.agent.artifact_store is not stage.agent.artifact_store:
+                raise RuntimeError(
+                    f"Stages '{source_stage.name}' and '{stage.name}' must share one "
+                    "ArtifactStore to grant Artifact inputs"
+                )
+
         handle = stage.agent.start(
             prompt,
             stream=state.stream,
             on_event=(forward_child_event if self.forward_child_events else None),
+            invocation=RunInvocation(
+                flow_run_id=state.flow_run_id,
+                invocation_id=f"{state.flow_run_id}:{stage.name}:{attempt}",
+                stage=stage.name,
+                attempt=attempt,
+                artifact_ids=artifact_ids,
+            ),
         )
         state.active_stage = stage
         state.active_handle = handle
@@ -440,8 +519,10 @@ class SequentialFlow:
             stages=tuple(state.stage_results),
             events=await state.emitter.events(),
             stage_attempts=tuple(state.stage_attempts),
-            artifacts=self.artifacts,
+            artifacts=_unique_artifacts(state.accepted_artifacts),
             error=error,
+            artifact_specs=self.artifact_specs,
+            artifact_bindings=tuple(state.artifact_bindings),
         )
 
 
@@ -501,12 +582,120 @@ def _evidence_payload(evidence: VerificationEvidence) -> dict[str, str]:
     }
 
 
-def _artifact_payload(artifact: ArtifactRef) -> dict[str, str]:
+def _artifact_spec_payload(artifact: ArtifactSpec) -> dict[str, object]:
     return {
         "name": artifact.name,
         "location": artifact.location,
         "media_type": artifact.media_type,
+        "required": artifact.required,
+        "max_bytes": artifact.max_bytes,
     }
+
+
+def _verify_artifact_contract(
+    stage: Stage,
+    run: RunResult,
+) -> tuple[tuple[VerificationEvidence, ...], str | None]:
+    if not stage.artifacts:
+        return (), None
+    produced = {artifact.name: artifact for artifact in run.artifacts}
+    evidence: list[VerificationEvidence] = []
+    errors: list[str] = []
+    for spec in stage.artifacts:
+        artifact = produced.get(spec.name)
+        error: str | None = None
+        if artifact is None:
+            if spec.required:
+                error = "required Artifact was not produced"
+        elif artifact.media_type != spec.media_type:
+            error = (
+                f"media_type is '{artifact.media_type}', expected '{spec.media_type}'"
+            )
+        elif spec.location is not None and artifact.location != spec.location:
+            error = (
+                f"location is '{artifact.location}', expected '{spec.location}'"
+            )
+        elif spec.max_bytes is not None and artifact.size_bytes > spec.max_bytes:
+            error = (
+                f"size {artifact.size_bytes} exceeds max_bytes={spec.max_bytes}"
+            )
+        if error is not None:
+            errors.append(f"{spec.name}: {error}")
+        evidence.append(
+            VerificationEvidence(
+                verifier="artifact_contract",
+                scope=spec.name,
+                status="failed" if error is not None else "passed",
+                detail=error or "",
+            )
+        )
+    if errors:
+        return tuple(evidence), (
+            f"Stage '{stage.name}' failed Artifact contract: {'; '.join(errors)}"
+        )
+    return tuple(evidence), None
+
+
+def _artifact_input_ids(
+    state: _SequentialFlowState,
+    stage: Stage,
+) -> tuple[str, ...]:
+    if not state.stage_results or stage.input_from == "user":
+        return ()
+    if stage.input_from is None:
+        source = state.stage_results[-1]
+    else:
+        source = next(
+            result for result in state.stage_results if result.name == stage.input_from
+        )
+    accepted_ids = {
+        binding.artifact_id
+        for binding in state.artifact_bindings
+        if binding.run_id == source.run.run_id
+        and binding.status is ArtifactBindingStatus.ACCEPTED
+        and binding.artifact_id is not None
+    }
+    return tuple(
+        artifact.id for artifact in source.run.artifacts if artifact.id in accepted_ids
+    )
+
+
+def _unique_artifacts(artifacts: Sequence[Artifact]) -> tuple[Artifact, ...]:
+    by_id: dict[str, Artifact] = {}
+    for artifact in artifacts:
+        by_id[artifact.id] = artifact
+    return tuple(by_id.values())
+
+
+def _artifact_bindings(
+    stage: Stage,
+    run: RunResult,
+    *,
+    attempt: int,
+    accepted: bool,
+    detail: str,
+) -> tuple[ArtifactBinding, ...]:
+    produced = {artifact.name: artifact for artifact in run.artifacts}
+    bindings: list[ArtifactBinding] = []
+    for spec in stage.artifacts:
+        artifact = produced.get(spec.name)
+        binding_accepted = accepted and artifact is not None
+        bindings.append(
+            ArtifactBinding(
+                spec=spec,
+                artifact_id=artifact.id if artifact is not None else None,
+                status=(
+                    ArtifactBindingStatus.ACCEPTED
+                    if binding_accepted
+                    else ArtifactBindingStatus.REJECTED
+                ),
+                stage=stage.name,
+                run_id=run.run_id,
+                attempt=attempt,
+                detail=detail,
+            )
+        )
+    return tuple(bindings)
 
 
 async def _verify_stage(

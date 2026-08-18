@@ -142,6 +142,9 @@ async def test_mtbi_analysis_runs_two_verified_agent_stages(
         runner=runner,
     )
 
+    assert application.flow.query_agent.definition.max_tool_observation_bytes == 32 * 1024
+    assert application.flow.query_agent.definition.max_run_observation_bytes == 512 * 1024
+
     result = await application.run("Analyze daily active users")
 
     assert result.status is FlowStatus.SUCCEEDED
@@ -279,6 +282,16 @@ async def test_empty_query_result_is_repaired_with_verifier_feedback(
         ("query", 2),
         ("analysis", 1),
     ]
+    assert [binding.status for binding in result.flow.artifact_bindings] == [
+        "rejected",
+        "rejected",
+        "accepted",
+        "accepted",
+        "accepted",
+    ]
+    assert {
+        artifact.run_id for artifact in result.flow.artifacts[:2]
+    } == {result.flow.stage_attempts[1].run.run_id}
     assert "CSV must contain at least one data row" in (
         model.requests[3].messages[0].content
     )
@@ -311,7 +324,7 @@ async def test_fastapi_exposes_query_and_analysis_child_run_streams(
                 response = await client.get(f"/v1/flows/{flow_run_id}")
                 if response.json()["status"] != "running":
                     break
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
             events = await client.get(f"/v1/flows/{flow_run_id}/events")
             stream = await client.get(f"/v1/flows/{flow_run_id}/events/stream")
 
@@ -388,7 +401,7 @@ async def test_query_artifact_verification_blocks_analysis_stage(
     assert len(result.flow.stages) == 1
     assert result.flow.stages[0].evidence[0].status == "failed"
     assert [attempt.attempt for attempt in result.flow.stage_attempts] == [1, 2, 3]
-    assert "failed verification" in (result.error or "")
+    assert "failed Artifact contract" in (result.error or "")
     assert len(model.requests) == 6
     assert "Host verification rejected the previous attempt" in (
         model.requests[2].messages[0].content

@@ -6,9 +6,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from base_agent.verification import VerificationEvidence
+
+if TYPE_CHECKING:
+    from base_agent.artifacts import Artifact
 
 
 class ToolChoice(StrEnum):
@@ -236,6 +239,13 @@ class SkillSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ResourceSnapshot:
+    name: str
+    scope: str
+    eager: bool
+
+
+@dataclass(frozen=True, slots=True)
 class HarnessSnapshot:
     agent_id: str
     agent_version: str
@@ -247,6 +257,8 @@ class HarnessSnapshot:
     permissions: frozenset[str]
     max_model_turns: int
     max_tool_calls_per_turn: int
+    max_tool_observation_bytes: int
+    max_run_observation_bytes: int
     context_policy: str
     context_window_tokens: int | None
     context_reserved_output_tokens: int
@@ -257,6 +269,8 @@ class HarnessSnapshot:
     memory_writer: str
     memory_recall_limit: int
     memory_recall_timeout_seconds: float
+    artifact_store: str
+    resources: tuple[ResourceSnapshot, ...]
     fingerprint: str
 
     @property
@@ -287,3 +301,29 @@ class RunResult:
     evidence: tuple[VerificationEvidence, ...] = ()
     error: str | None = None
     failure: RunFailure | None = None
+    artifacts: tuple[Artifact, ...] = ()
+    artifact_inputs: tuple[Artifact, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RunInvocation:
+    """Parent-owned correlation and Artifact grants for one child Run."""
+
+    flow_run_id: str | None = None
+    invocation_id: str | None = None
+    stage: str | None = None
+    step_id: str | None = None
+    attempt: int | None = None
+    artifact_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.flow_run_id, "flow_run_id"),
+            (self.invocation_id, "invocation_id"),
+            (self.stage, "stage"),
+            (self.step_id, "step_id"),
+        ):
+            if value is not None and not value.strip():
+                raise ValueError(f"{name} must not be blank when provided")
+        if self.attempt is not None and self.attempt < 1:
+            raise ValueError("attempt must be positive when provided")

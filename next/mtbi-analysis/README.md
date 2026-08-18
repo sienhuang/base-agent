@@ -33,11 +33,17 @@ AGENT_PROVIDER=codex-cli
 AGENT_CLI_EXECUTABLE=codex
 AGENT_CLI_TIMEOUT_SECONDS=300
 AGENT_CLI_MAX_OUTPUT_BYTES=4194304
+AGENT_MAX_TOOL_OBSERVATION_BYTES=32768
+AGENT_MAX_RUN_OBSERVATION_BYTES=524288
 MTBI_STRUCTURED_OUTPUT_MODE=prompt
 ```
 
 省略 `AGENT_MODEL` 时使用本地 Codex CLI 的默认模型；需要固定模型时设置
 `AGENT_MODEL=...`。运行前先确认 `codex --version` 和本地登录状态正常。
+
+其中 `AGENT_CLI_MAX_OUTPUT_BYTES` 限制 Codex CLI 进程输出；另外两个 observation 配置限制
+应用 Tool 返回给模型的单次大小和整个 Run 的累计大小。MTBI metadata 通常比普通 Tool 输出
+更大，因此这里使用 32 KiB/512 KiB；最终解析值会进入 HarnessSnapshot 和 fingerprint。
 
 如需切换 OpenAI-compatible Provider，再设置：
 
@@ -96,9 +102,11 @@ workspace/runs/<flow-run-id>/
 └── report.md
 ```
 
-这三个位置由 Host 创建为 `ArtifactRef`，模型只使用它们调用 Tool，不再负责在结构化输出中
-复述路径。`flow_run_id` 同时作为 workspace 目录名，因此 HTTP、Event 和本地产物不需要额外
-的 artifact token 映射。CLI 打印 Host 校验后的绝对路径。
+这三个位置由 Host 声明为 `ArtifactSpec`，模型只使用它们调用 Tool，不再负责在结构化输出中
+复述路径。Tool 写入后会把同一份字节提交到 `workspace/.artifacts` 下的
+`LocalArtifactStore`；SQL、CSV 和报告都带 SHA-256、producer Run/Stage/attempt 和 Tool call
+来源，报告还记录源 CSV Artifact ID。workspace 是运行 Resource，不再被当作持久 Artifact
+本身。CLI 打印 Host 校验后的绝对路径。
 
 ## FastAPI 与完整 Run Event Stream
 
@@ -133,7 +141,7 @@ Flow Event Stream 同时包含 `flow.*`、`stage.*`，以及转发后的 `child.
 `child_sequence`，可区分 query 与 analysis。
 
 这是纯 Flow 服务，不注册 `/v1/runs`。`GET /v1/flows/{flow_run_id}` 的 `artifacts` 字段返回
-Host-owned SQL、CSV 和报告引用；发生验证重试时，`child_runs` 会列出同一 Stage 的多次
+已验证 SQL、CSV 和报告的不可变引用及 hash/provenance；发生验证重试时，`child_runs` 会列出同一 Stage 的多次
 attempt，Event Stream 会出现 `stage.verification_failed` 和 `stage.retrying`。
 
 ## 测试
@@ -155,4 +163,5 @@ uv run mypy src
 - `mtbi_cli` 不允许 `config set` 等配置修改命令。
 - CSV 分析使用有界行数、文件大小、样本和数值摘要；不是无限制的数据处理引擎。
 - 文件存在并不代表成功，最终以 Host verifier 的确定性检查为准。
-- ArtifactRef 当前是 Host-owned 逻辑引用，尚未扩展为可替换的 ArtifactStore。
+- 当前使用单机 `LocalArtifactStore`；跨 Pod 元数据、对象存储、租户授权、保留策略和垃圾回收
+  仍需要生产 Adapter。

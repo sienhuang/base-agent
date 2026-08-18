@@ -1,6 +1,13 @@
 from pathlib import Path
 
 import pytest
+from base_agent import (
+    ArtifactManager,
+    InMemoryArtifactStore,
+    ResourceContext,
+    ResourceManager,
+    ResourceSpec,
+)
 from base_agent.tools.core import ToolContext
 
 from mtbi_analysis.runner import CommandResult
@@ -34,8 +41,23 @@ class ExpiredAuthRunner(RecordingRunner):
         return CommandResult(returncode=0, stdout="ok", stderr="")
 
 
-def _tool_context() -> ToolContext:
-    return ToolContext(run_id="run-1", agent_id="agent-1", tool_call_id="call-1")
+def _tool_context(workspace: ArtifactWorkspace) -> ToolContext:
+    run_id = "run-1"
+    agent_id = "agent-1"
+    return ToolContext(
+        run_id=run_id,
+        agent_id=agent_id,
+        tool_call_id="call-1",
+        artifacts=ArtifactManager(
+            InMemoryArtifactStore(),
+            run_id=run_id,
+            agent_id=agent_id,
+        ),
+        resources=ResourceManager(
+            (ResourceSpec("workspace", lambda _context: workspace),),
+            context=ResourceContext(run_id=run_id, agent_id=agent_id),
+        ),
+    )
 
 
 async def test_mtbi_cli_rejects_configuration_mutation(tmp_path: Path) -> None:
@@ -51,7 +73,7 @@ async def test_mtbi_cli_rejects_configuration_mutation(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="subcommand"):
         await mtbi_cli.invoke(
             {"args": ["config", "set", "onesql.endpoint", "unsafe"]},
-            _tool_context(),
+            _tool_context(workspace),
         )
     assert runner.calls == []
 
@@ -71,7 +93,7 @@ async def test_preflight_rejects_expired_auth_even_with_zero_exit_code(
     )
 
     with pytest.raises(RuntimeError, match="auth login --project 12"):
-        await preflight.invoke({}, _tool_context())
+        await preflight.invoke({}, _tool_context(workspace))
 
 
 async def test_mtbi_cli_rejects_output_outside_workspace(tmp_path: Path) -> None:
@@ -94,7 +116,7 @@ async def test_mtbi_cli_rejects_output_outside_workspace(tmp_path: Path) -> None
                     "/tmp/outside.csv",
                 ]
             },
-            _tool_context(),
+            _tool_context(workspace),
         )
     assert runner.calls == []
 
@@ -107,6 +129,6 @@ async def test_mtbi_cli_rejects_output_outside_workspace(tmp_path: Path) -> None
                     "--output=/tmp/outside.csv",
                 ]
             },
-            _tool_context(),
+            _tool_context(workspace),
         )
     assert runner.calls == []

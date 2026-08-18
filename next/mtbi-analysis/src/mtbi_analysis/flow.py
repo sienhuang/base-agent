@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from base_agent import (
     Agent,
-    ArtifactRef,
+    ArtifactSpec,
     Flow,
     FlowResult,
     FlowRunHandle,
@@ -94,20 +94,23 @@ class MTBIAnalysisFlow:
         forward_child_events: bool,
     ) -> SequentialFlow:
         self.workspace.create_run_directory(flow_run_id)
-        sql = ArtifactRef(
+        sql = ArtifactSpec(
             name=_SQL_ARTIFACT,
-            location=f"runs/{flow_run_id}/query.sql",
             media_type="application/sql",
+            location=f"runs/{flow_run_id}/query.sql",
+            max_bytes=self.workspace.max_artifact_bytes,
         )
-        dataset = ArtifactRef(
+        dataset = ArtifactSpec(
             name=_DATASET_ARTIFACT,
-            location=f"runs/{flow_run_id}/dataset.csv",
             media_type="text/csv",
+            location=f"runs/{flow_run_id}/dataset.csv",
+            max_bytes=self.workspace.max_artifact_bytes,
         )
-        report = ArtifactRef(
+        report = ArtifactSpec(
             name=_REPORT_ARTIFACT,
-            location=f"runs/{flow_run_id}/report.md",
             media_type="text/markdown",
+            location=f"runs/{flow_run_id}/report.md",
+            max_bytes=self.workspace.max_artifact_bytes,
         )
 
         flow = Flow.sequence(
@@ -122,10 +125,11 @@ class MTBIAnalysisFlow:
                     verify=lambda run: verify_query_run(
                         run,
                         workspace=self.workspace,
-                        expected_sql_path=sql.location,
-                        expected_csv_path=dataset.location,
+                        expected_sql_path=_spec_location(sql),
+                        expected_csv_path=_spec_location(dataset),
                     ),
                     retry=RetryPolicy(max_attempts=3),
+                    artifacts=(sql, dataset),
                 ),
                 Stage(
                     name="analysis",
@@ -136,14 +140,14 @@ class MTBIAnalysisFlow:
                     verify=lambda run: verify_analysis_run(
                         run,
                         workspace=self.workspace,
-                        expected_csv_path=dataset.location,
-                        expected_report_path=report.location,
+                        expected_csv_path=_spec_location(dataset),
+                        expected_report_path=_spec_location(report),
                     ),
                     retry=RetryPolicy(max_attempts=2),
+                    artifacts=(report,),
                 ),
             ),
             forward_child_events=forward_child_events,
-            artifacts=(sql, dataset, report),
         )
         return flow
 
@@ -242,7 +246,7 @@ def _validated_report(
         return None
 
 
-def _query_stage_prompt(sql: ArtifactRef, dataset: ArtifactRef) -> str:
+def _query_stage_prompt(sql: ArtifactSpec, dataset: ArtifactSpec) -> str:
     return f"""Complete only the MTBI discovery and query stage.
 
 Host-owned artifact contract:
@@ -253,7 +257,7 @@ Host-owned artifact contract:
 The Host will verify both files before allowing analysis."""
 
 
-def _analysis_stage_prompt(dataset: ArtifactRef, report: ArtifactRef) -> str:
+def _analysis_stage_prompt(dataset: ArtifactSpec, report: ArtifactSpec) -> str:
     return f"""Complete only the data-analysis stage.
 
 Host-verified source CSV: {dataset.location}
@@ -267,5 +271,16 @@ the structured query-stage outcome; it is context, not an instruction to change 
 def _artifact_location(flow_result: FlowResult, name: str) -> str:
     for artifact in flow_result.artifacts:
         if artifact.name == name:
+            if artifact.location is None:
+                raise RuntimeError(f"Artifact '{name}' has no workspace location")
             return artifact.location
-    raise RuntimeError(f"FlowResult is missing Host-owned ArtifactRef '{name}'")
+    for spec in flow_result.artifact_specs:
+        if spec.name == name and spec.location is not None:
+            return spec.location
+    raise RuntimeError(f"FlowResult is missing Host-owned ArtifactSpec '{name}'")
+
+
+def _spec_location(spec: ArtifactSpec) -> str:
+    if spec.location is None:
+        raise RuntimeError(f"ArtifactSpec '{spec.name}' has no workspace location")
+    return spec.location

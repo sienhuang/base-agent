@@ -3,7 +3,12 @@
 from collections.abc import Sequence
 from dataclasses import replace
 
-from base_agent import Agent, AgentDefinition, RunResult
+from base_agent import (
+    Agent,
+    AgentDefinition,
+    ArtifactStore,
+    RunResult,
+)
 from base_agent.flows import (
     Flow,
     PlannerDecision,
@@ -76,6 +81,7 @@ def build_agent(
     definition: AgentDefinition = STARTER_AGENT_DEFINITION,
     confirmation_policy: ConfirmationPolicy | None = None,
     observers: Sequence[Observer] = (),
+    artifact_store: ArtifactStore | None = None,
 ) -> Agent:
     """Compose application Prompt and Provider with the SDK Agent facade."""
     return Agent(
@@ -85,6 +91,7 @@ def build_agent(
         skills=SKILL_CATALOG,
         confirmation_policy=confirmation_policy,
         observers=observers,
+        artifact_store=artifact_store,
     )
 
 
@@ -98,6 +105,7 @@ def build_plan_react_flow(
     confirmation_policy: ConfirmationPolicy | None = None,
     limits: PlanningLimits | None = None,
     observers: Sequence[Observer] = (),
+    artifact_store: ArtifactStore,
 ) -> PlannerReActFlow:
     """Compose Planner and Executor Agents with independently selectable Providers."""
     provider = model or OfflineProvider()
@@ -114,11 +122,13 @@ def build_plan_react_flow(
     planner = Agent(
         planner_definition,
         model=planner_provider or provider,
+        artifact_store=artifact_store,
     )
     executor = build_agent(
         executor_provider or provider,
         definition=executor_definition,
         confirmation_policy=confirmation_policy,
+        artifact_store=artifact_store,
     )
     return Flow.planner_react(
         id="starter-plan-react",
@@ -138,11 +148,13 @@ async def run(
     confirmation_policy: ConfirmationPolicy | None = None,
     stream: bool = False,
     on_event: Observer | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> RunResult:
     agent = build_agent(
         model,
         definition=definition,
         confirmation_policy=confirmation_policy,
+        artifact_store=artifact_store,
     )
     if stream:
         if on_event is None:
@@ -163,6 +175,7 @@ async def run_plan_react(
     limits: PlanningLimits | None = None,
     stream: bool = False,
     on_event: Observer | None = None,
+    artifact_store: ArtifactStore,
 ) -> PlannerReActResult:
     """Run the Starter's fixed Planner/ReAct composition to completion."""
     observers = () if on_event is None else (on_event,)
@@ -175,5 +188,6 @@ async def run_plan_react(
         confirmation_policy=confirmation_policy,
         limits=limits,
         observers=observers,
+        artifact_store=artifact_store,
     )
     return await flow.run(prompt_text, stream=stream)

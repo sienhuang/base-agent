@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import FastAPI, Header, HTTPException, Query, status
@@ -304,19 +305,23 @@ async def _sse_events(events: AsyncIterator[Event]) -> AsyncIterator[ServerSentE
 async def _run_response(handle: RunHandle) -> RunResponse:
     current_status = handle.status
     if current_status is RunStatus.RUNNING:
+        events = await handle.events()
         return RunResponse(
             run_id=handle.run_id,
             status=current_status,
-            event_count=len(await handle.events()),
+            event_count=len(events),
+            artifacts=_artifact_responses(events),
         )
     try:
         result = await handle.wait()
     except Exception as exc:
+        events = await handle.events()
         return RunResponse(
             run_id=handle.run_id,
             status=RunStatus.FAILED,
-            event_count=len(await handle.events()),
+            event_count=len(events),
             error=f"{type(exc).__name__}: {exc}",
+            artifacts=_artifact_responses(events),
         )
     return RunResponse(
         run_id=handle.run_id,
@@ -325,6 +330,7 @@ async def _run_response(handle: RunHandle) -> RunResponse:
         output=result.output,
         text=result.text,
         error=result.error,
+        artifacts=tuple(_artifact_response(artifact) for artifact in result.artifacts),
     )
 
 
@@ -381,6 +387,9 @@ async def _flow_response(
                 )
                 for child in result.child_runs
             ),
+            artifacts=tuple(
+                _artifact_response(artifact) for artifact in result.artifacts
+            ),
         )
     if isinstance(result, FlowResult):
         return FlowResponse(
@@ -390,11 +399,7 @@ async def _flow_response(
             output=result.output,
             error=result.error,
             artifacts=tuple(
-                ArtifactRefResponse(
-                    name=artifact.name,
-                    location=artifact.location,
-                    media_type=artifact.media_type,
-                )
+                _artifact_response(artifact)
                 for artifact in result.artifacts
             ),
             child_runs=tuple(
@@ -429,14 +434,67 @@ def _plan_id(events: tuple[Event, ...]) -> str | None:
 
 
 def _artifact_responses(events: tuple[Event, ...]) -> tuple[ArtifactRefResponse, ...]:
+    responses: dict[str, ArtifactRefResponse] = {}
     for event in events:
-        if event.kind != "flow.started":
+        if event.kind != "artifact.created":
             continue
-        artifacts = event.payload.get("artifacts")
-        if not isinstance(artifacts, list):
-            return ()
-        return tuple(
-            ArtifactRefResponse.model_validate(artifact)
-            for artifact in artifacts
+        artifact = ArtifactRefResponse(
+            id=_optional_string(event.payload.get("artifact_id")),
+            name=str(event.payload.get("name", "")),
+            location=_optional_string(event.payload.get("location")),
+            media_type=str(event.payload.get("media_type", "application/octet-stream")),
+            size_bytes=_optional_int(event.payload.get("size_bytes")),
+            sha256=_optional_string(event.payload.get("sha256")),
+            created_at=_optional_datetime(event.payload.get("created_at")),
+            producer_run_id=_optional_string(event.payload.get("producer_run_id")),
+            producer_agent_id=_optional_string(event.payload.get("producer_agent_id")),
+            flow_run_id=_optional_string(event.payload.get("flow_run_id")),
+            stage=_optional_string(event.payload.get("stage")),
+            tool_call_id=_optional_string(event.payload.get("tool_call_id")),
+            source_artifact_ids=_string_tuple(
+                event.payload.get("source_artifact_ids")
+            ),
         )
-    return ()
+        responses[artifact.id or artifact.name] = artifact
+    return tuple(responses.values())
+
+
+def _artifact_response(artifact: Any) -> ArtifactRefResponse:
+    return ArtifactRefResponse(
+        id=artifact.id,
+        name=artifact.name,
+        location=artifact.location,
+        media_type=artifact.media_type,
+        size_bytes=artifact.size_bytes,
+        sha256=artifact.sha256,
+        created_at=artifact.created_at,
+        producer_run_id=artifact.run_id,
+        producer_agent_id=artifact.agent_id,
+        flow_run_id=artifact.flow_run_id,
+        stage=artifact.stage,
+        tool_call_id=artifact.tool_call_id,
+        source_artifact_ids=artifact.source_artifact_ids,
+    )
+
+
+def _optional_string(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _optional_int(value: Any) -> int | None:
+    return value if isinstance(value, int) else None
+
+
+def _optional_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, str))

@@ -6,6 +6,7 @@ import sys
 from dataclasses import replace
 from typing import Literal, cast
 
+from base_agent import LocalArtifactStore
 from base_agent.models import Event
 
 from agent_app.app import run, run_plan_react
@@ -55,6 +56,7 @@ async def _run(
                 streamed_text = True
 
     observer = observe_event if stream or show_execution_trace else None
+    artifact_store = LocalArtifactStore(settings.artifact_root)
     try:
         if flow == "plan-react":
             flow_result = await run_plan_react(
@@ -66,6 +68,7 @@ async def _run(
                 executor_model=settings.plan_react_executor_model,
                 stream=stream,
                 on_event=observer,
+                artifact_store=artifact_store,
             )
             if flow_result.output:
                 print(flow_result.output)
@@ -89,6 +92,7 @@ async def _run(
             model=provider,
             stream=stream,
             on_event=observer,
+            artifact_store=artifact_store,
         )
     except ValueError as exc:
         print(f"configuration error: {exc}")
@@ -162,6 +166,17 @@ def _execution_trace_line(
             f"{prefix} tool={event.payload['tool_name']} "
             f"call={event.payload['tool_call_id']} "
             f"status={event.payload['status']}"
+        )
+    if event.kind == "artifact.created":
+        return (
+            f"{prefix} artifact={event.payload['name']} "
+            f"id={event.payload['artifact_id']}"
+        )
+    if event.kind == "artifact.granted":
+        return (
+            f"{prefix} artifact={event.payload['name']} "
+            f"id={event.payload['artifact_id']} "
+            f"producer={event.payload['producer_run_id']}"
         )
     if event.kind == "run.succeeded":
         return f"{prefix} turn={event.turn}"

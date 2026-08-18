@@ -1,7 +1,17 @@
 """The intentionally small public surface of base-agent next."""
 
 from base_agent.agent import Agent
-from base_agent.artifacts import ArtifactRef
+from base_agent.artifacts import (
+    Artifact,
+    ArtifactBinding,
+    ArtifactBindingStatus,
+    ArtifactManager,
+    ArtifactRef,
+    ArtifactSpec,
+    ArtifactStore,
+    InMemoryArtifactStore,
+    LocalArtifactStore,
+)
 from base_agent.definitions import AgentDefinition
 from base_agent.flows import (
     Flow,
@@ -26,21 +36,35 @@ from base_agent.models import (
     ToolChoice,
 )
 from base_agent.prompts import load_prompt
+from base_agent.resources import (
+    ResourceContext,
+    ResourceManager,
+    ResourceScope,
+    ResourceSpec,
+)
 from base_agent.run_handle import RunHandle
 from base_agent.skills import Skill, SkillCatalog, SkillDescriptor, SkillPackage
-from base_agent.tools import Toolkit, ToolReadiness, tool
+from base_agent.tools import ToolContext, Toolkit, ToolReadiness, tool
 from base_agent.verification import VerificationEvidence
 
 __all__ = [
     "Agent",
     "AgentDefinition",
+    "Artifact",
+    "ArtifactBinding",
+    "ArtifactBindingStatus",
+    "ArtifactManager",
     "ArtifactRef",
+    "ArtifactSpec",
+    "ArtifactStore",
     "Confirmation",
     "Event",
     "Flow",
     "FlowResult",
     "FlowRunHandle",
     "FlowStatus",
+    "InMemoryArtifactStore",
+    "LocalArtifactStore",
     "PlannerDecision",
     "PlannerReActResult",
     "PlanningLimits",
@@ -49,6 +73,10 @@ __all__ = [
     "RunFailure",
     "RunHandle",
     "RunStatus",
+    "ResourceContext",
+    "ResourceManager",
+    "ResourceScope",
+    "ResourceSpec",
     "SideEffect",
     "Skill",
     "SkillCatalog",
@@ -60,6 +88,7 @@ __all__ = [
     "StepOutcome",
     "ToolChoice",
     "Toolkit",
+    "ToolContext",
     "ToolReadiness",
     "VerificationEvidence",
     "load_prompt",

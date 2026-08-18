@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 
 from base_agent.agent import Agent
-from base_agent.artifacts import ArtifactRef
+from base_agent.artifacts import ArtifactRef, ArtifactSpec
 from base_agent.events import EventStore
 from base_agent.flows.planning import PlannerReActFlow, PlanningLimits
 from base_agent.flows.sequential import SequentialFlow, Stage
@@ -21,7 +21,8 @@ class Flow:
         observers: Sequence[Observer] = (),
         event_store: EventStore | None = None,
         forward_child_events: bool = False,
-        artifacts: Sequence[ArtifactRef] = (),
+        artifact_specs: Sequence[ArtifactSpec | ArtifactRef] = (),
+        artifacts: Sequence[ArtifactSpec | ArtifactRef] = (),
     ) -> SequentialFlow:
         return SequentialFlow(
             id=id,
@@ -29,6 +30,7 @@ class Flow:
             observers=observers,
             event_store=event_store,
             forward_child_events=forward_child_events,
+            artifact_specs=artifact_specs,
             artifacts=artifacts,
         )
 

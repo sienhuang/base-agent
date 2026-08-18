@@ -11,8 +11,10 @@ from typing import Any, Protocol, cast, get_type_hints, overload, runtime_checka
 
 from pydantic import BaseModel, ConfigDict, create_model
 
+from base_agent.artifacts import ArtifactManager
 from base_agent.governance import Confirmation, SideEffect
 from base_agent.models import ToolSpec
+from base_agent.resources import ResourceManager
 
 _TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -28,6 +30,8 @@ class ToolContext:
     run_id: str
     agent_id: str
     tool_call_id: str
+    artifacts: ArtifactManager | None = None
+    resources: ResourceManager | None = None
 
     @property
     def idempotency_key(self) -> str:
@@ -90,7 +94,7 @@ class FunctionTool:
             raise ValueError("read-only tools must not require side-effect confirmation")
 
         self._function = function
-        self._arguments_model = _create_arguments_model(function)
+        self._arguments_model, self._context_parameter = _create_arguments_model(function)
         self._spec = ToolSpec(
             name=tool_name,
             description=description or inspect.getdoc(function) or f"Execute {tool_name}.",
@@ -146,6 +150,8 @@ class FunctionTool:
         context: ToolContext,
     ) -> Any:
         keyword_arguments = dict(self.validate_arguments(arguments))
+        if self._context_parameter is not None:
+            keyword_arguments[self._context_parameter] = context
         if inspect.iscoroutinefunction(self._function):
             value = self._function(**keyword_arguments)
             return await value
@@ -182,8 +188,11 @@ def flatten_tools(items: Iterable[Tool | Toolkit]) -> tuple[Tool, ...]:
     return tuple(resolved)
 
 
-def _create_arguments_model(function: Callable[..., Any]) -> type[BaseModel]:
+def _create_arguments_model(
+    function: Callable[..., Any],
+) -> tuple[type[BaseModel], str | None]:
     fields: dict[str, tuple[Any, Any]] = {}
+    context_parameter: str | None = None
     annotations = get_type_hints(function)
     for parameter in inspect.signature(function).parameters.values():
         if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
@@ -192,22 +201,28 @@ def _create_arguments_model(function: Callable[..., Any]) -> type[BaseModel]:
             raise TypeError("tool functions cannot declare positional-only parameters")
         annotation = annotations.get(parameter.name, parameter.annotation)
         if annotation is ToolContext:
-            raise TypeError(
-                "ToolContext is runtime-owned and cannot be declared by @tool functions"
-            )
+            if context_parameter is not None:
+                raise TypeError("tool functions can declare at most one ToolContext")
+            if parameter.default is not inspect.Parameter.empty:
+                raise TypeError("ToolContext parameters cannot declare a default")
+            context_parameter = parameter.name
+            continue
         if annotation is inspect.Parameter.empty:
             raise TypeError(f"tool parameter '{parameter.name}' requires a type annotation")
         default = ... if parameter.default is inspect.Parameter.empty else parameter.default
         fields[parameter.name] = (annotation, default)
 
     model_name = f"{function.__name__.title().replace('_', '')}Arguments"
-    return cast(
-        type[BaseModel],
-        create_model(  # type: ignore[call-overload]
-            model_name,
-            __config__=ConfigDict(extra="forbid"),
-            **fields,
+    return (
+        cast(
+            type[BaseModel],
+            create_model(  # type: ignore[call-overload]
+                model_name,
+                __config__=ConfigDict(extra="forbid"),
+                **fields,
+            ),
         ),
+        context_parameter,
     )
 
 
