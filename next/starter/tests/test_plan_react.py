@@ -182,7 +182,7 @@ async def test_offline_plan_react_executor_can_use_starter_skill_tool() -> None:
     ]
 
 
-async def test_plan_react_grants_recorded_value_artifact_to_review_planner() -> None:
+async def test_plan_react_selects_recorded_value_artifact() -> None:
     observed = []
     artifact_store = InMemoryArtifactStore()
 
@@ -202,9 +202,9 @@ async def test_plan_react_grants_recorded_value_artifact_to_review_planner() -> 
     executor_run = result.child_runs[1].run
     review_run = result.child_runs[2].run
     assert executor_run.artifacts == (artifact,)
-    assert review_run.artifact_inputs == (artifact,)
+    assert review_run.artifact_inputs == ()
     assert [
         event.kind
         for event in observed
-        if event.kind in {"artifact.created", "artifact.granted"}
-    ] == ["artifact.created", "artifact.granted"]
+        if event.kind in {"artifact.created", "artifact.selected", "artifact.granted"}
+    ] == ["artifact.created", "artifact.selected"]

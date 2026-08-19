@@ -372,25 +372,31 @@ async def test_observations_are_json_and_match_tool_calls() -> None:
 
     assert result.status is RunStatus.SUCCEEDED
     tool_messages = [message for message in model.requests[1].messages if message.role == "tool"]
-    assert [
-        (
-            message.tool_call_id,
-            message.name,
-            json.loads(message.content),
-        )
-        for message in tool_messages
-    ] == [
-        (
-            "first-call",
-            "record_value",
-            {"status": "success", "data": 11, "error": None},
-        ),
-        (
-            "second-call",
-            "record_value",
-            {"status": "success", "data": 22, "error": None},
-        ),
+    assert [message.tool_call_id for message in tool_messages] == [
+        "first-call",
+        "second-call",
     ]
+    assert [message.name for message in tool_messages] == [
+        "record_value",
+        "record_value",
+    ]
+    observations = [json.loads(message.content) for message in tool_messages]
+    assert [observation["status"] for observation in observations] == [
+        "success",
+        "success",
+    ]
+    assert [observation["data"] for observation in observations] == [11, 22]
+    assert [observation["error"] for observation in observations] == [None, None]
+    for observation, artifact in zip(observations, result.artifacts, strict=True):
+        receipt = observation["artifacts_created"][0]
+        assert receipt == {
+            "artifact_id": artifact.id,
+            "name": artifact.name,
+            "media_type": artifact.media_type,
+            "size_bytes": artifact.size_bytes,
+            "sha256": artifact.sha256,
+            "source_artifact_ids": [],
+        }
 
 
 async def test_offline_provider_can_show_observation_contract() -> None:
@@ -399,28 +405,18 @@ async def test_offline_provider_can_show_observation_contract() -> None:
     )
 
     assert result.status is RunStatus.SUCCEEDED
-    assert json.loads(result.text) == {
-        "observations": [
-            {
-                "tool_call_id": "call-1",
-                "name": "record_value",
-                "content": {
-                    "status": "success",
-                    "data": 1,
-                    "error": None,
-                },
-            },
-            {
-                "tool_call_id": "call-2",
-                "name": "record_value",
-                "content": {
-                    "status": "success",
-                    "data": 2,
-                    "error": None,
-                },
-            },
-        ]
-    }
+    observations = json.loads(result.text)["observations"]
+    assert [item["tool_call_id"] for item in observations] == ["call-1", "call-2"]
+    assert [item["name"] for item in observations] == [
+        "record_value",
+        "record_value",
+    ]
+    assert [item["content"]["data"] for item in observations] == [1, 2]
+    for item, artifact in zip(observations, result.artifacts, strict=True):
+        content = item["content"]
+        assert content["status"] == "success"
+        assert content["error"] is None
+        assert content["artifacts_created"][0]["artifact_id"] == artifact.id
 
 
 async def test_agent_app_denies_tool_without_permission() -> None:

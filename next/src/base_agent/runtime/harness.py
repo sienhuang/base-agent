@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from base_agent.artifacts import ArtifactManager, ArtifactStore
+from base_agent.artifacts import Artifact, ArtifactManager, ArtifactStore
 from base_agent.context import (
     ContextBudget,
     ContextInput,
@@ -559,8 +559,14 @@ class Harness:
 
             for result in turn_results:
                 tool_results.append(result)
+                created_artifacts = tuple(
+                    artifact
+                    for artifact in await artifact_manager.list_outputs()
+                    if artifact.tool_call_id == result.call.id
+                )
                 observation = _tool_result_observation(
                     result,
+                    artifacts_created=created_artifacts,
                     max_bytes=self._definition.max_tool_observation_bytes,
                 )
                 observation_bytes += len(observation.encode("utf-8"))
@@ -1480,34 +1486,62 @@ def _tool_choice_for_turn(
     return definition.tool_choice
 
 
-def _tool_result_observation(result: ToolResult, *, max_bytes: int) -> str:
+def _tool_result_observation(
+    result: ToolResult,
+    *,
+    artifacts_created: Sequence[Artifact] = (),
+    max_bytes: int,
+) -> str:
+    artifact_receipts = [
+        {
+            "artifact_id": artifact.id,
+            "name": artifact.name,
+            "media_type": artifact.media_type,
+            "size_bytes": artifact.size_bytes,
+            "sha256": artifact.sha256,
+            "source_artifact_ids": list(artifact.source_artifact_ids),
+        }
+        for artifact in artifacts_created
+    ]
     payload = {
         "status": result.status.value,
         "data": result.data,
         "error": result.error,
+        "artifacts_created": artifact_receipts,
     }
     text = json.dumps(payload, ensure_ascii=False, default=str)
     encoded = text.encode("utf-8")
     if len(encoded) <= max_bytes:
         return text
-    preview_bytes = encoded[: max_bytes - 512]
+
+    visible_receipts = list(artifact_receipts)
+    omitted_receipts = 0
+    preview_bytes = encoded[: max(0, max_bytes - 512)]
     while True:
         preview = preview_bytes.decode("utf-8", errors="ignore")
-        truncated = json.dumps(
-            {
-                "status": result.status.value,
-                "data": None,
-                "error": None,
-                "truncated": True,
-                "original_bytes": len(encoded),
-                "preview": preview,
-            },
-            ensure_ascii=False,
-        )
+        truncated_payload = {
+            "status": result.status.value,
+            "data": None,
+            "error": None,
+            "artifacts_created": visible_receipts,
+            "truncated": True,
+            "original_bytes": len(encoded),
+            "preview": preview,
+        }
+        if omitted_receipts:
+            truncated_payload["artifacts_created_omitted"] = omitted_receipts
+        truncated = json.dumps(truncated_payload, ensure_ascii=False)
         overflow = len(truncated.encode("utf-8")) - max_bytes
         if overflow <= 0:
             return truncated
-        preview_bytes = preview_bytes[: max(0, len(preview_bytes) - overflow - 64)]
+        if preview_bytes:
+            preview_bytes = preview_bytes[: max(0, len(preview_bytes) - overflow - 64)]
+            continue
+        if visible_receipts:
+            visible_receipts.pop()
+            omitted_receipts += 1
+            continue
+        raise RuntimeError("max_tool_observation_bytes is too small for observation metadata")
 
 
 def _model_failure(exc: Exception) -> RunFailure:

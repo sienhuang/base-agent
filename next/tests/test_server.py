@@ -151,7 +151,7 @@ def _planner_react_flow(
                 ModelResponse(
                     content=(
                         '{"success":true,"summary":"Step completed",'
-                        '"output":"checked","error":null}'
+                        '"output":"checked","error":null,"artifact_ids":[]}'
                     )
                 )
             ]

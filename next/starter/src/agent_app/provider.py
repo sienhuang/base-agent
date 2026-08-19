@@ -298,7 +298,23 @@ def _offline_step_outcome(
         "summary": summary,
         "output": output,
         "error": None,
+        "artifact_ids": _created_artifact_ids(tool_messages),
     }
+
+
+def _created_artifact_ids(tool_messages: list[Message]) -> list[str]:
+    artifact_ids: list[str] = []
+    for message in tool_messages:
+        receipts = _observation_payload(message.content).get("artifacts_created")
+        if not isinstance(receipts, list):
+            continue
+        for receipt in receipts:
+            if not isinstance(receipt, dict):
+                continue
+            artifact_id = receipt.get("artifact_id")
+            if isinstance(artifact_id, str) and artifact_id not in artifact_ids:
+                artifact_ids.append(artifact_id)
+    return artifact_ids
 
 
 def _prompt_section(

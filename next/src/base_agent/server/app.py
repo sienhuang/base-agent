@@ -346,7 +346,7 @@ async def _flow_response(
                 plan_id=_plan_id(running_events),
                 status=current_status,
                 event_count=len(running_events),
-                artifacts=_artifact_responses(running_events),
+                artifacts=_flow_artifact_responses(running_events),
             )
     try:
         result = await handle.wait()
@@ -358,7 +358,7 @@ async def _flow_response(
             status=FlowStatus.FAILED,
             event_count=len(failed_events),
             error=f"{type(exc).__name__}: {exc}",
-            artifacts=_artifact_responses(failed_events),
+            artifacts=_flow_artifact_responses(failed_events),
         )
     events = await handle.events()
     if isinstance(result, PlannerReActResult):
@@ -433,10 +433,21 @@ def _plan_id(events: tuple[Event, ...]) -> str | None:
     return None
 
 
-def _artifact_responses(events: tuple[Event, ...]) -> tuple[ArtifactRefResponse, ...]:
+def _flow_artifact_responses(
+    events: tuple[Event, ...],
+) -> tuple[ArtifactRefResponse, ...]:
+    event_kind = "artifact.selected" if _plan_id(events) is not None else "artifact.created"
+    return _artifact_responses(events, event_kind=event_kind)
+
+
+def _artifact_responses(
+    events: tuple[Event, ...],
+    *,
+    event_kind: str = "artifact.created",
+) -> tuple[ArtifactRefResponse, ...]:
     responses: dict[str, ArtifactRefResponse] = {}
     for event in events:
-        if event.kind != "artifact.created":
+        if event.kind != event_kind:
             continue
         artifact = ArtifactRefResponse(
             id=_optional_string(event.payload.get("artifact_id")),

@@ -309,8 +309,18 @@ media type 和大小，再运行领域 verifier；只有全部通过的 Artifact
 下游 Stage。`FlowResult.artifact_bindings` 同时保留成功和失败 attempt 的绑定结果，
 `FlowResult.artifacts` 只聚合已接受的不可变引用。完整边界见
 [`docs/adr/0001-artifact-resource-boundary.md`](docs/adr/0001-artifact-resource-boundary.md)。
-需要跨 Stage 或 Planner/Executor 读取 Artifact 时，相关 Agent 必须显式使用同一个
-ArtifactStore；框架在第一次跨 Store 授权时会直接失败，避免产生看似有效但无法读取的引用。
+
+Planner-ReAct 使用动态选择语义：Tool 创建 Artifact 后，Harness 会把紧凑的
+`artifacts_created` receipt 放进对应 Tool observation；Executor 在结构化
+`StepOutcome.artifact_ids` 中选择正式 Step 输出。Host 只接受由当前 Executor Run、当前 Flow
+和当前 Step attempt 创建的 ID，并发出 `artifact.selected`。未选择的候选 Artifact 仍保留在
+producer `RunResult` 和 Store 中用于审计，但不会进入 `PlannerReActResult.artifacts`，也不会被
+授权给后续 Run。Review Planner 只在 prompt 中看到所选 Artifact 的元数据；后续 Executor Run
+才获得读取授权。当前实现会把此前所有已选择输出授权给后续 Executor，精确到 Step 的输入选择器
+属于后续扩展。
+
+需要跨 Stage 或 Executor Run 读取 Artifact 时，相关 Agent 必须显式使用同一个 ArtifactStore；
+框架在第一次跨 Store 授权时会直接失败，避免产生看似有效但无法读取的引用。
 
 Tool observation 预算由 `AgentDefinition.max_tool_observation_bytes` 和
 `max_run_observation_bytes` 控制，默认分别为 16 KiB 和 64 KiB。应用可以针对大型 metadata

@@ -210,6 +210,7 @@ async def test_planner_react_correlates_every_plan_phase_with_an_agent_run() -> 
                     "summary": "Collected revenue values",
                     "output": "revenue=1240000,growth=12.4%",
                     "error": None,
+                    "artifact_ids": [],
                 }
             ),
             _json_response(
@@ -218,6 +219,7 @@ async def test_planner_react_correlates_every_plan_phase_with_an_agent_run() -> 
                     "summary": "Explained the growth",
                     "output": "Revenue grew 12.4%.",
                     "error": None,
+                    "artifact_ids": [],
                 }
             ),
         ],
@@ -302,13 +304,38 @@ async def test_planner_react_correlates_every_plan_phase_with_an_agent_run() -> 
         "summary",
         "output",
         "error",
+        "artifact_ids",
     }
     assert StepOutcome.model_json_schema()["properties"]["output"] == {
         "anyOf": [{"type": "string"}, {"type": "null"}],
         "title": "Output",
     }
+    assert StepOutcome.model_json_schema()["properties"]["artifact_ids"] == {
+        "items": {"type": "string"},
+        "title": "Artifact Ids",
+        "type": "array",
+    }
     assert "Fixed Executor capabilities" in planner_model.requests[0].messages[0].content
     assert "Current Step id:" in executor_model.requests[0].messages[0].content
+
+
+def test_step_outcome_rejects_invalid_artifact_selections() -> None:
+    with pytest.raises(ValueError, match="blank ids"):
+        StepOutcome(
+            success=True,
+            summary="done",
+            output=None,
+            error=None,
+            artifact_ids=("",),
+        )
+    with pytest.raises(ValueError, match="duplicates"):
+        StepOutcome(
+            success=True,
+            summary="done",
+            output=None,
+            error=None,
+            artifact_ids=("artifact-1", "artifact-1"),
+        )
 
 
 async def test_planner_react_rejects_review_that_changes_plan_goal() -> None:
@@ -340,6 +367,7 @@ async def test_planner_react_rejects_review_that_changes_plan_goal() -> None:
                     "summary": "Calculated the product",
                     "output": "120",
                     "error": None,
+                    "artifact_ids": [],
                 }
             )
         ],
@@ -401,6 +429,7 @@ async def test_planner_react_preserves_terminal_prefix_when_revising_plan() -> N
                     "summary": "Primary source was unavailable",
                     "output": None,
                     "error": "source unavailable",
+                    "artifact_ids": [],
                 }
             ),
             _json_response(
@@ -409,6 +438,7 @@ async def test_planner_react_preserves_terminal_prefix_when_revising_plan() -> N
                     "summary": "Fallback source succeeded",
                     "output": "recovered",
                     "error": None,
+                    "artifact_ids": [],
                 }
             ),
         ],
@@ -528,6 +558,7 @@ class GatedStructuredModel:
                 "summary": "Completed after release",
                 "output": None,
                 "error": None,
+                "artifact_ids": [],
             }
         )
 
@@ -701,5 +732,6 @@ def test_planning_response_models_reject_invalid_action_payloads() -> None:
             summary="Failed without an error",
             output=None,
             error=None,
+            artifact_ids=(),
         )
     assert PlanStepDraft(description=" Execute one Step ").description == "Execute one Step"

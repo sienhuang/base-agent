@@ -161,6 +161,23 @@ uv run --project next/starter agent-app \
 `plan.completed` 和 `flow.succeeded`。OfflineProvider 现在声明并模拟严格结构化输出，因此这条
 命令会经过与真实 Provider 相同的 `PlannerDecision`/`StepOutcome` 校验路径。
 
+手动测试 Planner-ReAct 的动态 Artifact 选择：
+
+```bash
+uv run --project next/starter agent-app \
+  --provider offline \
+  --flow plan-react \
+  --show-execution-trace \
+  --show-tool-results \
+  'tool=record_value calls=1 tool_args={"value":42}'
+```
+
+Trace 应先出现 `artifact.created artifact=recorded_value`，再出现
+`artifact.selected artifact=recorded_value`。前者表示 Tool 创建了候选产物，后者表示 Executor
+从 Tool observation 的 `artifacts_created` receipt 中选中了正式 Step 输出。只有 selected
+Artifact 会进入 Flow 结果并授权给后续 Executor；单 Step 的 Review Planner 只接收元数据，
+所以这里不应出现 `artifact.granted`。
+
 Planner-ReAct 同样接受 `--stream`，它会让 Planner 和 Executor 的 Provider 都使用
 streaming。由于两者返回的是内部结构化 JSON，分片只作为 `child.message.delta` Event 发布，
 不会直接写到 stdout；CLI 最终只打印完整校验后的 Flow output。`--show-execution-trace` 可实时
@@ -233,7 +250,7 @@ curl -N -H 'Last-Event-ID: 3' \
 ### 通过 FastAPI 测试 Planner-ReAct
 
 Starter 在组装 Planner-ReAct 时会让 Planner 和 Executor 共享同一个
-`LocalArtifactStore`，因此一个子 Run 产生的 Artifact 可以经 Flow 授权给后续子 Run。
+`LocalArtifactStore`，因此 Executor 选中的 Artifact 可以经 Flow 授权给后续 Executor Run。
 Store 默认位于 `next/starter/.artifacts`，可通过 `AGENT_ARTIFACT_ROOT` 修改。
 `ArtifactManager` 仍然按 Run 隔离：共享的是 Store，不是 Run 的访问权限。
 
@@ -447,7 +464,17 @@ uv run --project next/starter agent-app \
 {
   "status": "success",
   "data": 1,
-  "error": null
+  "error": null,
+  "artifacts_created": [
+    {
+      "artifact_id": "<uuid>",
+      "name": "recorded_value",
+      "media_type": "application/json",
+      "size_bytes": 11,
+      "sha256": "<sha256>",
+      "source_artifact_ids": []
+    }
+  ]
 }
 ```
 
@@ -459,12 +486,8 @@ uv run --project next/starter agent-app \
   'tool=record_value calls=2 show_observations=true'
 ```
 
-预期：
-
-```json
-{"observations":[{"content":{"data":1,"error":null,"status":"success"},"name":"record_value","tool_call_id":"call-1"},{"content":{"data":2,"error":null,"status":"success"},"name":"record_value","tool_call_id":"call-2"}]}
-```
-
+预期每条 observation 都包含 `status`、`data`、`error` 和该次 ToolCall 创建的
+`artifacts_created` receipt；两条记录的 ToolCall ID 依次为 `call-1`、`call-2`。
 这里验证 JSON 字段、Tool 名称、ToolCall ID 和顺序。`show_observations=true` 只属于
 OfflineProvider 的确定性测试输入，不进入 Harness，也不适用于真实 Provider。
 

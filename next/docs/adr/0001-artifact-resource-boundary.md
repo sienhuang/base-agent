@@ -35,6 +35,16 @@ auditable but are not granted to downstream Stages.
 
 - Agent Runs own live Resources and produced Artifacts.
 - SequentialFlow grants only accepted upstream Artifacts to a dependent child Run.
-- PlannerReAct aggregates child Artifact references without copying content.
+- A Tool-created Artifact is a candidate output. The Harness exposes compact
+  `artifacts_created` receipts in that Tool's observation; the model never invents a
+  path or discovers the Store directly.
+- A PlannerReAct Executor selects official Step outputs with
+  `StepOutcome.artifact_ids`. The Host accepts only IDs created by that same Executor
+  Run for the current Flow and Step attempt, and emits `artifact.selected`.
+- PlannerReAct aggregates only selected Artifact references without copying content.
+  Review Planners receive selected metadata in their prompt, not raw read grants.
+  Later Executor Runs are granted the selected outputs from earlier Steps.
+- Created but unselected Artifacts remain in the producer `RunResult` and Store for
+  audit, but are not Flow outputs and are not granted downstream.
 - Applications remain responsible for domain verification (for example SQL safety,
   CSV shape and report/source consistency).

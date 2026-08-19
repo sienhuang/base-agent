@@ -107,6 +107,7 @@ class StepOutcome(_StrictFrozenModel):
     summary: str = Field(min_length=1)
     output: str | None
     error: str | None
+    artifact_ids: tuple[str, ...]
 
     @model_validator(mode="after")
     def validate_failure(self) -> StepOutcome:
@@ -114,6 +115,10 @@ class StepOutcome(_StrictFrozenModel):
             raise ValueError("an unsuccessful Step requires a non-blank error")
         if self.success and self.error is not None:
             raise ValueError("a successful Step must not include an error")
+        if any(not artifact_id.strip() for artifact_id in self.artifact_ids):
+            raise ValueError("artifact_ids must not contain blank ids")
+        if len(set(self.artifact_ids)) != len(self.artifact_ids):
+            raise ValueError("artifact_ids must not contain duplicates")
         return self
 
 
@@ -218,6 +223,7 @@ class _FlowRunState:
     output: str = ""
     error: str | None = None
     child_runs: list[FlowChildRun] = field(default_factory=list)
+    selected_artifacts: list[Artifact] = field(default_factory=list)
     active_child: _ActiveChild | None = None
     cancelled_child: _ActiveChild | None = None
 
@@ -390,7 +396,7 @@ class PlannerReActFlow:
                         f"Flow exceeded max_steps={self.limits.max_steps}"
                     )
 
-                outcome, executor_run_id = await self._execute_step(
+                outcome, executor_run_id, selected_artifacts = await self._execute_step(
                     state,
                     step_index=step_index,
                 )
@@ -402,6 +408,7 @@ class PlannerReActFlow:
                         _require_plan(state),
                         step_index,
                         outcome,
+                        selected_artifacts,
                     ),
                     source_revision=_require_plan(state).revision,
                 )
@@ -532,7 +539,7 @@ class PlannerReActFlow:
         state: _FlowRunState,
         *,
         step_index: int,
-    ) -> tuple[StepOutcome, str]:
+    ) -> tuple[StepOutcome, str, tuple[Artifact, ...]]:
         plan = _require_plan(state)
         step = plan.steps[step_index]
         attempt = step.attempt_count + 1
@@ -541,7 +548,12 @@ class PlannerReActFlow:
             agent=self.executor,
             role=ChildRunRole.EXECUTOR,
             phase="execute",
-            prompt=_executor_prompt(state.prompt, plan, step_index),
+            prompt=_executor_prompt(
+                state.prompt,
+                plan,
+                step_index,
+                state.selected_artifacts,
+            ),
             memory_scope=state.executor_memory_scope,
             source_revision=plan.revision,
             step_id=step.id,
@@ -592,6 +604,61 @@ class PlannerReActFlow:
             )
 
         outcome = run.output
+        try:
+            selected_artifacts = _selected_step_artifacts(
+                state,
+                run,
+                outcome,
+                step_id=step.id,
+                attempt=attempt,
+            )
+        except _FlowExecutionError as exc:
+            state.plan = _replace_step(
+                _require_plan(state),
+                step_index,
+                _require_plan(state).steps[step_index].model_copy(
+                    update={
+                        "status": PlanStepStatus.FAILED,
+                        "outcome": outcome,
+                    }
+                ),
+            )
+            await state.emitter.emit(
+                "step.failed",
+                plan_id=plan.id,
+                plan_revision=plan.revision,
+                step_id=step.id,
+                attempt=attempt,
+                agent_run_id=run.run_id,
+                error=str(exc),
+                failure_kind="artifact_selection",
+            )
+            raise
+
+        state.selected_artifacts.extend(selected_artifacts)
+        for artifact in selected_artifacts:
+            await state.emitter.emit(
+                "artifact.selected",
+                artifact_id=artifact.id,
+                name=artifact.name,
+                media_type=artifact.media_type,
+                size_bytes=artifact.size_bytes,
+                sha256=artifact.sha256,
+                created_at=artifact.created_at.isoformat(),
+                producer_run_id=artifact.run_id,
+                producer_agent_id=artifact.agent_id,
+                flow_run_id=artifact.flow_run_id,
+                stage=artifact.stage,
+                location=artifact.location,
+                tool_call_id=artifact.tool_call_id,
+                source_artifact_ids=artifact.source_artifact_ids,
+                plan_id=plan.id,
+                plan_revision=plan.revision,
+                step_id=step.id,
+                attempt=attempt,
+                selected_by_run_id=run.run_id,
+                event_scope="flow",
+            )
         terminal_status = (
             PlanStepStatus.SUCCEEDED if outcome.success else PlanStepStatus.FAILED
         )
@@ -618,7 +685,7 @@ class PlannerReActFlow:
             error=outcome.error,
             failure_kind=None if outcome.success else "business_outcome",
         )
-        return outcome, run.run_id
+        return outcome, run.run_id, selected_artifacts
 
     def _start_child(
         self,
@@ -701,22 +768,11 @@ class PlannerReActFlow:
         state: _FlowRunState,
         target_agent: Agent,
     ) -> tuple[str, ...]:
-        artifact_ids: list[str] = []
-        for child in state.child_runs:
-            if child.run.status is not RunStatus.SUCCEEDED or not child.run.artifacts:
-                continue
-            producer = (
-                self.planner
-                if child.role is ChildRunRole.PLANNER
-                else self.executor
-            )
-            if producer.artifact_store is not target_agent.artifact_store:
-                raise _FlowExecutionError(
-                    "Planner and Executor must share one ArtifactStore to grant "
-                    "Artifact inputs across child Runs"
-                )
-            artifact_ids.extend(artifact.id for artifact in child.run.artifacts)
-        return tuple(artifact_ids)
+        if target_agent is self.planner or not state.selected_artifacts:
+            return ()
+        if target_agent is not self.executor:
+            raise _FlowExecutionError("unknown child Agent cannot receive Artifact inputs")
+        return tuple(artifact.id for artifact in state.selected_artifacts)
 
     async def _wait_for_active_child(self, state: _FlowRunState) -> RunResult:
         active = state.active_child
@@ -818,18 +874,48 @@ class PlannerReActFlow:
             child_runs=tuple(state.child_runs),
             events=await state.emitter.events(),
             error=state.error,
-            artifacts=_child_artifacts(state),
+            artifacts=_unique_artifacts(state.selected_artifacts),
         )
 
 
-def _child_artifacts(state: _FlowRunState) -> tuple[Artifact, ...]:
+def _unique_artifacts(artifacts: Sequence[Artifact]) -> tuple[Artifact, ...]:
     by_id: dict[str, Artifact] = {}
-    for child in state.child_runs:
-        if child.run.status is not RunStatus.SUCCEEDED:
-            continue
-        for artifact in child.run.artifacts:
-            by_id[artifact.id] = artifact
+    for artifact in artifacts:
+        by_id[artifact.id] = artifact
     return tuple(by_id.values())
+
+
+def _selected_step_artifacts(
+    state: _FlowRunState,
+    run: RunResult,
+    outcome: StepOutcome,
+    *,
+    step_id: str,
+    attempt: int,
+) -> tuple[Artifact, ...]:
+    produced_by_id = {artifact.id: artifact for artifact in run.artifacts}
+    selected: list[Artifact] = []
+    for artifact_id in outcome.artifact_ids:
+        artifact = produced_by_id.get(artifact_id)
+        if artifact is None:
+            raise _FlowExecutionError(
+                f"Executor Run '{run.run_id}' selected Artifact '{artifact_id}' "
+                "that it did not create"
+            )
+        if artifact.run_id != run.run_id:
+            raise _FlowExecutionError(
+                f"selected Artifact '{artifact_id}' has the wrong producer Run"
+            )
+        if artifact.flow_run_id != state.flow_run_id:
+            raise _FlowExecutionError(
+                f"selected Artifact '{artifact_id}' does not belong to this Flow"
+            )
+        if artifact.step_id != step_id or artifact.attempt != attempt:
+            raise _FlowExecutionError(
+                f"selected Artifact '{artifact_id}' does not belong to the current Step attempt"
+            )
+        selected.append(artifact)
+    return tuple(selected)
 
 
 def _create_plan(
@@ -969,8 +1055,18 @@ def _create_planner_prompt(user_prompt: str, executor: Agent) -> str:
     )
 
 
-def _executor_prompt(user_prompt: str, plan: Plan, step_index: int) -> str:
+def _executor_prompt(
+    user_prompt: str,
+    plan: Plan,
+    step_index: int,
+    available_artifacts: Sequence[Artifact],
+) -> str:
     step = plan.steps[step_index]
+    available_metadata = json.dumps(
+        _artifact_prompt_metadata(available_artifacts),
+        ensure_ascii=False,
+        indent=2,
+    )
     previous = [
         {
             "id": item.id,
@@ -984,11 +1080,17 @@ def _executor_prompt(user_prompt: str, plan: Plan, step_index: int) -> str:
     return (
         "Execute only the current Plan Step using your configured Tools and Skills. "
         "Return every StepOutcome field; use error=null on success and a non-blank error "
-        "on failure. output is a string or null. Do not return a new Plan.\n\n"
+        "on failure. output is a string or null. Tool observations may contain an "
+        "artifacts_created list. Put the artifact_id of each newly created Artifact that "
+        "should become an official Step output in artifact_ids; otherwise use "
+        "artifact_ids=[]. Do not select an Artifact inherited from an earlier Run as a "
+        "new output. Do not return a new Plan.\n\n"
         f"Original user request:\n{user_prompt}\n\n"
         f"Plan id: {plan.id}\nPlan revision: {plan.revision}\nPlan goal: {plan.goal}\n\n"
         "Previous terminal Steps:\n"
         f"{json.dumps(previous, ensure_ascii=False, indent=2)}\n\n"
+        "Selected Artifacts from earlier Steps (readable inputs):\n"
+        f"{available_metadata}\n\n"
         f"Current Step id: {step.id}\nCurrent Step:\n{step.description}"
     )
 
@@ -998,8 +1100,10 @@ def _review_planner_prompt(
     plan: Plan,
     step_index: int,
     outcome: StepOutcome,
+    selected_artifacts: Sequence[Artifact],
 ) -> str:
     step = plan.steps[step_index]
+    selected_metadata = _artifact_prompt_metadata(selected_artifacts)
     return (
         "Review the latest Step outcome against the original request and current Plan. "
         "Return exactly one action: continue to retain the remaining suffix, revise to "
@@ -1012,4 +1116,20 @@ def _review_planner_prompt(
         "Current Plan:\n"
         f"{plan.model_dump_json(indent=2)}\n\n"
         f"Latest Step id: {step.id}\nLatest outcome:\n{outcome.model_dump_json(indent=2)}"
+        "\n\nSelected Artifact outputs (metadata only):\n"
+        f"{json.dumps(selected_metadata, ensure_ascii=False, indent=2)}"
     )
+
+
+def _artifact_prompt_metadata(artifacts: Sequence[Artifact]) -> list[dict[str, object]]:
+    return [
+        {
+            "artifact_id": artifact.id,
+            "name": artifact.name,
+            "media_type": artifact.media_type,
+            "size_bytes": artifact.size_bytes,
+            "sha256": artifact.sha256,
+            "source_artifact_ids": artifact.source_artifact_ids,
+        }
+        for artifact in artifacts
+    ]

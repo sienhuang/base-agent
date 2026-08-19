@@ -172,6 +172,12 @@ def _execution_trace_line(
             f"{prefix} artifact={event.payload['name']} "
             f"id={event.payload['artifact_id']}"
         )
+    if event.kind == "artifact.selected":
+        return (
+            f"{prefix} artifact={event.payload['name']} "
+            f"id={event.payload['artifact_id']} "
+            f"step={event.payload['step_id']}"
+        )
     if event.kind == "artifact.granted":
         return (
             f"{prefix} artifact={event.payload['name']} "

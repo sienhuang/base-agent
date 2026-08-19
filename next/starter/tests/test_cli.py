@@ -108,7 +108,8 @@ async def test_cli_plan_react_persists_and_traces_artifact(capsys, tmp_path) -> 
     assert exit_code == 0
     captured = capsys.readouterr()
     assert "artifact.created artifact=recorded_value" in captured.err
-    assert "artifact.granted artifact=recorded_value" in captured.err
+    assert "artifact.selected artifact=recorded_value" in captured.err
+    assert "artifact.granted artifact=recorded_value" not in captured.err
     assert "status=success, data=42" in captured.out
     assert len(tuple((tmp_path / "artifacts" / "metadata").glob("*.json"))) == 1
     assert len(tuple((tmp_path / "artifacts" / "objects").glob("*.bin"))) == 1
