@@ -1,6 +1,7 @@
 import asyncio
 
 import httpx
+from base_agent.events import InMemoryEventStore
 
 from agent_app import asgi
 from agent_app.app import STARTER_AGENT_DEFINITION
@@ -31,6 +32,7 @@ def test_starter_composes_sdk_http_adapter(monkeypatch) -> None:
     }
     assert callable(built.state.run_registry.get)
     assert built.state.flow_registry.names == ("plan-react",)
+    assert isinstance(built.state.event_store, InMemoryEventStore)
     openapi_paths = built.openapi()["paths"]
     assert "post" in openapi_paths["/v1/flows/plan-react"]
     assert "get" in openapi_paths["/v1/flows/{flow_run_id}"]
@@ -58,13 +60,9 @@ async def test_http_uses_the_shared_starter_definition(monkeypatch) -> None:
             },
         )
         run_id = started.json()["run_id"]
-        for _ in range(100):
-            result = await client.get(f"/v1/runs/{run_id}")
-            if result.json()["status"] != "running":
-                break
-            await asyncio.sleep(0)
-        events = await client.get(f"/v1/runs/{run_id}/events")
         run_result = await built.state.run_registry.get(run_id).wait()
+        result = await client.get(f"/v1/runs/{run_id}")
+        events = await client.get(f"/v1/runs/{run_id}/events")
 
     assert started.status_code == 202
     assert result.json()["status"] == "succeeded"

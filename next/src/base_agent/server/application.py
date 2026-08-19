@@ -9,10 +9,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from base_agent.agent import Agent
+from base_agent.events import EventStore
 from base_agent.server.app import create_http_app
 from base_agent.server.registry import RegisteredFlow
 
-Preflight = Callable[[], None | Awaitable[None]]
+LifecycleCallback = Callable[[], None | Awaitable[None]]
+Preflight = LifecycleCallback
+Shutdown = LifecycleCallback
 
 
 class AgentApplication:
@@ -24,6 +27,8 @@ class AgentApplication:
         agent: Agent | None = None,
         flows: Mapping[str, RegisteredFlow] | None = None,
         preflight: Sequence[Preflight] = (),
+        shutdown: Sequence[Shutdown] = (),
+        event_store: EventStore | None = None,
         title: str = "base-agent Application",
         prefix: str = "/v1",
         sse_ping_seconds: int = 15,
@@ -34,20 +39,28 @@ class AgentApplication:
         self.agent = agent
         self.flows = resolved_flows
         self.preflight = tuple(preflight)
+        self.shutdown = tuple(shutdown)
+        self.event_store = event_store
         self.title = title
         self.prefix = prefix
         self.sse_ping_seconds = sse_ping_seconds
 
     def fastapi(self) -> FastAPI:
-        """Create the process-local HTTP adapter for this composition."""
+        """Create local execution routes with optional persistent read recovery."""
 
         @asynccontextmanager
         async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-            for check in self.preflight:
-                result = check()
-                if inspect.isawaitable(result):
-                    await result
-            yield
+            try:
+                for check in self.preflight:
+                    result = check()
+                    if inspect.isawaitable(result):
+                        await result
+                yield
+            finally:
+                for cleanup in reversed(self.shutdown):
+                    result = cleanup()
+                    if inspect.isawaitable(result):
+                        await result
 
         return create_http_app(
             self.agent,
@@ -56,4 +69,5 @@ class AgentApplication:
             sse_ping_seconds=self.sse_ping_seconds,
             flows=self.flows,
             lifespan=lifespan,
+            event_store=self.event_store,
         )

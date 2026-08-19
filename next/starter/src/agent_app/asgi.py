@@ -11,32 +11,43 @@ from fastapi import FastAPI
 
 from agent_app.app import build_agent, build_plan_react_flow
 from agent_app.config import Settings
+from agent_app.events import build_event_store_runtime
 from agent_app.provider import build_plan_react_providers, build_provider
 
 
-def create_app() -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the Starter Agent and host it with ``base_agent.server``."""
-    settings = Settings.from_env()
-    provider = build_provider(settings)
+    resolved_settings = settings or Settings.from_env()
+    provider = build_provider(resolved_settings)
     planner_provider, executor_provider = build_plan_react_providers(
-        settings,
+        resolved_settings,
         default_provider=provider,
     )
-    artifact_store = LocalArtifactStore(settings.artifact_root)
-    agent = build_agent(provider, artifact_store=artifact_store)
+    artifact_store = LocalArtifactStore(resolved_settings.artifact_root)
+    event_runtime = build_event_store_runtime(resolved_settings)
+    agent = build_agent(
+        provider,
+        artifact_store=artifact_store,
+        event_store=event_runtime.store,
+    )
     plan_react = build_plan_react_flow(
         provider,
         planner_provider=planner_provider,
         executor_provider=executor_provider,
-        planner_model=settings.plan_react_planner_model,
-        executor_model=settings.plan_react_executor_model,
+        planner_model=resolved_settings.plan_react_planner_model,
+        executor_model=resolved_settings.plan_react_executor_model,
         artifact_store=artifact_store,
+        event_store=event_runtime.store,
     )
-    return AgentApplication(
+    application = AgentApplication(
         agent=agent,
         title="base-agent Starter",
         flows={"plan-react": plan_react},
+        preflight=(event_runtime.start,),
+        shutdown=(event_runtime.close,),
+        event_store=event_runtime.store,
     ).fastapi()
+    return application
 
 
 app = create_app()

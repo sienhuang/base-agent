@@ -16,7 +16,7 @@ from base_agent import (
     Stage,
     StepOutcome,
 )
-from base_agent.events import InMemoryEventStore
+from base_agent.events import EventStore, InMemoryEventStore
 from base_agent.flows import PlannerReActFlow
 from base_agent.models import Event, ModelRequest, ModelResponse
 from base_agent.providers import ModelProvider, ProviderCapabilities, ProviderInfo
@@ -49,7 +49,11 @@ class GatedModel:
         return ModelResponse(content="HTTP done")
 
 
-def _agent(model: ModelProvider) -> Agent:
+def _agent(
+    model: ModelProvider,
+    *,
+    event_store: EventStore | None = None,
+) -> Agent:
     return Agent(
         AgentDefinition(
             id="http-assistant",
@@ -57,6 +61,7 @@ def _agent(model: ModelProvider) -> Agent:
             instructions="Answer.",
         ),
         model=model,
+        event_store=event_store,
     )
 
 
@@ -111,6 +116,7 @@ def _planner_react_flow(
     *,
     planner_model: ModelProvider | None = None,
     executor_model: ModelProvider | None = None,
+    event_store: EventStore | None = None,
 ) -> PlannerReActFlow:
     planner = Agent(
         AgentDefinition(
@@ -137,6 +143,7 @@ def _planner_react_flow(
                 ),
             ]
         ),
+        event_store=event_store,
     )
     executor = Agent(
         AgentDefinition(
@@ -156,12 +163,14 @@ def _planner_react_flow(
                 )
             ]
         ),
+        event_store=event_store,
     )
     return Flow.planner_react(
         id="http-plan-react",
         planner=planner,
         executor=executor,
         forward_child_events=True,
+        event_store=event_store,
     )
 
 
@@ -259,6 +268,147 @@ async def test_http_starts_plan_react_and_exposes_result_events_and_sse() -> Non
     assert "event: flow.succeeded" in stream_text
 
 
+async def test_http_recovers_run_and_flow_reads_after_registry_restart() -> None:
+    event_store = InMemoryEventStore()
+    agent = _agent(FakeModel.text("persisted Run output"), event_store=event_store)
+    flow = _planner_react_flow(event_store=event_store)
+    first_app = create_http_app(
+        agent,
+        flows={"plan-react": flow},
+        event_store=event_store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=first_app),
+        base_url="http://testserver",
+    ) as first_client:
+        started_run = await first_client.post("/v1/runs", json={"prompt": "persist"})
+        run_id = started_run.json()["run_id"]
+        completed_run = await _wait_for_status(first_client, run_id, "succeeded")
+        started_flow = await first_client.post(
+            "/v1/flows/plan-react",
+            json={"prompt": "persist Flow"},
+        )
+        flow_run_id = started_flow.json()["flow_run_id"]
+        completed_flow = await _wait_for_flow_status(
+            first_client,
+            flow_run_id,
+            "succeeded",
+        )
+
+    restarted_app = create_http_app(
+        agent,
+        flows={"plan-react": flow},
+        event_store=event_store,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=restarted_app),
+        base_url="http://testserver",
+    ) as restarted_client:
+        recovered_run = await restarted_client.get(f"/v1/runs/{run_id}")
+        recovered_flow = await restarted_client.get(f"/v1/flows/{flow_run_id}")
+        run_events = await restarted_client.get(f"/v1/runs/{run_id}/events")
+        flow_events = await restarted_client.get(
+            f"/v1/flows/{flow_run_id}/events"
+        )
+        run_stream = await restarted_client.get(
+            f"/v1/runs/{run_id}/events/stream"
+        )
+        flow_stream = await restarted_client.get(
+            f"/v1/flows/{flow_run_id}/events/stream"
+        )
+        run_as_flow = await restarted_client.get(f"/v1/flows/{run_id}")
+        flow_as_run = await restarted_client.get(f"/v1/runs/{flow_run_id}")
+        cancel_recovered = await restarted_client.post(f"/v1/runs/{run_id}/cancel")
+
+    assert recovered_run.status_code == recovered_flow.status_code == 200
+    assert recovered_run.json() == completed_run
+    assert recovered_flow.json() == completed_flow
+    assert run_events.json()[-1]["kind"] == "run.succeeded"
+    assert flow_events.json()[-1]["kind"] == "flow.succeeded"
+    assert "event: run.succeeded" in run_stream.text
+    assert "event: flow.succeeded" in flow_stream.text
+    assert run_as_flow.status_code == flow_as_run.status_code == 404
+    assert cancel_recovered.status_code == 409
+    assert "not owned by this server process" in cancel_recovered.json()["detail"]
+
+
+async def test_http_recovers_legacy_terminal_events_without_result_payloads() -> None:
+    event_store = InMemoryEventStore()
+    await event_store.emit("legacy-run", "run.started")
+    await event_store.emit(
+        "legacy-run",
+        "message.completed",
+        {"role": "assistant", "content": "legacy Run output"},
+        turn=1,
+    )
+    await event_store.emit("legacy-run", "run.succeeded", turn=1)
+    await event_store.emit(
+        "legacy-flow",
+        "flow.started",
+        {"plan_id": "legacy-plan"},
+    )
+    await event_store.emit(
+        "legacy-flow",
+        "plan.created",
+        {
+            "plan_id": "legacy-plan",
+            "plan": {
+                "id": "legacy-plan",
+                "revision": 1,
+                "goal": "recover",
+                "status": "running",
+                "steps": [],
+            },
+        },
+    )
+    await event_store.emit(
+        "legacy-flow",
+        "message.completed",
+        {
+            "role": "assistant",
+            "content": "legacy Flow output",
+            "event_scope": "flow",
+        },
+    )
+    await event_store.emit("legacy-flow", "flow.succeeded")
+    await event_store.emit("failed-run", "run.started")
+    await event_store.emit("failed-run", "run.failed", {"error": "persisted failure"})
+    await event_store.emit("cancelled-flow", "flow.started")
+    await event_store.emit(
+        "cancelled-flow",
+        "flow.cancelled",
+        {"reason": "persisted cancellation"},
+    )
+    await event_store.emit("running-run", "run.started")
+    app = create_http_app(
+        _agent(FakeModel.text("unused"), event_store=event_store),
+        flows={"plan-react": _planner_react_flow(event_store=event_store)},
+        event_store=event_store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        run = await client.get("/v1/runs/legacy-run")
+        flow = await client.get("/v1/flows/legacy-flow")
+        failed_run = await client.get("/v1/runs/failed-run")
+        cancelled_flow = await client.get("/v1/flows/cancelled-flow")
+        running_run = await client.get("/v1/runs/running-run")
+
+    assert run.json()["status"] == "succeeded"
+    assert run.json()["output"] == run.json()["text"] == "legacy Run output"
+    assert flow.json()["status"] == "succeeded"
+    assert flow.json()["output"] == "legacy Flow output"
+    assert flow.json()["plan"]["status"] == "succeeded"
+    assert failed_run.json()["status"] == "failed"
+    assert failed_run.json()["error"] == "persisted failure"
+    assert cancelled_flow.json()["status"] == "cancelled"
+    assert cancelled_flow.json()["error"] == "persisted cancellation"
+    assert running_run.json()["status"] == "running"
+
+
 async def test_http_starts_sequential_flow_and_forwards_every_child_run_event() -> None:
     query = Agent(
         AgentDefinition(
@@ -334,6 +484,9 @@ async def test_agent_application_hosts_a_flow_without_dummy_run_routes() -> None
     async def preflight() -> None:
         checks.append("ready")
 
+    async def shutdown() -> None:
+        checks.append("closed")
+
     flow = Flow.sequence(
         id="flow-only",
         stages=(
@@ -353,6 +506,7 @@ async def test_agent_application_hosts_a_flow_without_dummy_run_routes() -> None
     app = AgentApplication(
         flows={"analysis": flow},
         preflight=(preflight,),
+        shutdown=(shutdown,),
         title="Flow-only application",
     ).fastapi()
 
@@ -369,7 +523,7 @@ async def test_agent_application_hosts_a_flow_without_dummy_run_routes() -> None
             flow_run_id = started.json()["flow_run_id"]
             completed = await _wait_for_flow_status(client, flow_run_id, "succeeded")
 
-    assert checks == ["ready"]
+    assert checks == ["ready", "closed"]
     assert run_route.status_code == 404
     assert completed["artifacts"] == []
     assert completed["child_runs"][0]["attempt"] == 1
@@ -688,6 +842,8 @@ def test_http_rejects_invalid_prefixes() -> None:
         create_http_app(agent, prefix="/v1/")
     with pytest.raises(ValueError, match="sse_ping_seconds must be at least 1"):
         create_http_app(agent, sse_ping_seconds=0)
+    with pytest.raises(ValueError, match="must be the Agent's EventStore"):
+        create_http_app(agent, event_store=InMemoryEventStore())
 
 
 async def test_http_reports_when_event_store_cannot_stream() -> None:

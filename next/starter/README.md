@@ -209,6 +209,70 @@ uv run --project next/starter \
   uvicorn agent_app.asgi:app --host 127.0.0.1 --port 8000
 ```
 
+### 使用 PostgreSQL EventStore
+
+默认的 `AGENT_EVENT_STORE=memory` 适合本地快速测试，进程退出后 Event 会消失。要让普通
+Agent、Planner、Executor 和外层 Flow 的 Event 都写入同一个 PostgreSQL EventStore，先安装
+可选依赖：
+
+```bash
+uv sync --project next/starter --extra postgres
+```
+
+然后在 `next/starter/.env` 中配置：
+
+```dotenv
+AGENT_PROVIDER=offline
+AGENT_EVENT_STORE=postgres
+AGENT_POSTGRES_DSN=postgresql://agent:password@127.0.0.1:5432/agent
+AGENT_POSTGRES_SCHEMA=base_agent
+AGENT_EVENT_POLL_INTERVAL_SECONDS=0.1
+```
+
+`AGENT_POSTGRES_SCHEMA` 是 PostgreSQL namespace，不是另一份配置文件。FastAPI 启动时会在该
+schema 中创建 `base_agent_event_sequences` 和 `base_agent_events`，关闭时释放 Starter 自己
+创建的连接池。DSN、schema 和轮询间隔由 Starter 读取，再把构造出的同一个 Store 实例注入
+普通 Agent、Planner、Executor 和 Flow。
+
+启动服务并分别提交普通 Run 和 Planner-ReAct Flow：
+
+```bash
+uv run --project next/starter --extra postgres \
+  agent-server --host 127.0.0.1 --port 8000
+
+curl http://127.0.0.1:8000/v1/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"hello"}'
+
+curl http://127.0.0.1:8000/v1/flows/plan-react \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"计算 4 * 30"}'
+```
+
+用返回的 `run_id` 或 `flow_run_id` 查询数据库；每个 ID 都拥有独立且从 1 开始的 sequence：
+
+```sql
+SELECT sequence, kind, turn, payload
+FROM base_agent.base_agent_events
+WHERE run_id = '<run_id-or-flow_run_id>'
+ORDER BY sequence;
+```
+
+也可以运行真实 PostgreSQL 集成测试。测试会经 FastAPI 创建一个普通 Run 和一个
+Planner-ReAct Flow，关闭第一个应用连接池，再创建一个 Registry 为空的新 FastAPI 应用，验证
+状态接口、历史 JSON、终态 SSE、外层 Flow 及三个子 Run，最后删除测试专用 schema：
+
+```bash
+BASE_AGENT_NEXT_TEST_POSTGRES_DSN='postgresql://agent:password@127.0.0.1:5432/agent' \
+  uv run --project next/starter --group dev \
+  pytest tests/test_postgres_events.py -q
+```
+
+`RunRegistry` 和 `FlowRunRegistry` 仍是进程内执行所有者，但读路由在 Registry miss 时会从
+PostgreSQL Event 投影状态、输出、Plan、子 Run 和 Artifact。因此服务重启后，旧 ID 的状态、
+历史与终态 SSE 仍可访问；把 Run ID 用在 Flow 路由（或反过来）会返回 404。重启后的进程不能
+取消旧进程拥有的执行，接口会返回 409；若旧进程在执行中崩溃，也不会仅凭 Event 自动续跑。
+
 提交并查询 Run：
 
 ```bash

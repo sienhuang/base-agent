@@ -1,7 +1,7 @@
-"""Optional FastAPI adapter for process-local background Runs."""
+"""FastAPI adapter for local execution and persistent Event read recovery."""
 
 from base_agent.server.app import create_http_app
-from base_agent.server.application import AgentApplication, Preflight
+from base_agent.server.application import AgentApplication, Preflight, Shutdown
 from base_agent.server.registry import (
     FlowNotRegisteredError,
     FlowRunNotFoundError,
@@ -38,6 +38,7 @@ __all__ = [
     "FlowRunNotFoundError",
     "RunNotFoundError",
     "RunResponse",
+    "Shutdown",
     "StartRunRequest",
     "StartRunResponse",
     "StartFlowRequest",

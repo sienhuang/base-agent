@@ -11,7 +11,7 @@ from time import monotonic
 from typing import Any
 from uuid import uuid4
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from base_agent.artifacts import Artifact, ArtifactManager, ArtifactStore
 from base_agent.context import (
@@ -484,7 +484,12 @@ class Harness:
                     turn=turn,
                     emitter=emitter,
                 )
-                await emitter.emit("run.succeeded", turn=turn)
+                await emitter.emit(
+                    "run.succeeded",
+                    turn=turn,
+                    output=_event_output(output),
+                    text=response_content,
+                )
                 return RunResult(
                     run_id=resolved_run_id,
                     status=RunStatus.SUCCEEDED,
@@ -1260,6 +1265,12 @@ class Harness:
             ),
             artifacts=await self._artifact_store.list(run_id=run_id),
         )
+
+
+def _event_output(output: Any) -> Any:
+    if isinstance(output, BaseModel):
+        return output.model_dump(mode="json")
+    return output
 
 
 def _skill_snapshot(skill: Skill) -> SkillSnapshot:

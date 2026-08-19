@@ -22,6 +22,7 @@ StructuredOutputMode = Literal[
     "prompt",
 ]
 PlanReactRole = Literal["planner", "executor"]
+EventStoreName = Literal["memory", "postgres"]
 
 _PROVIDER_NAMES = frozenset(
     {
@@ -38,6 +39,7 @@ _STRUCTURED_OUTPUT_MODES = frozenset(
         "prompt",
     }
 )
+_EVENT_STORE_NAMES = frozenset({"memory", "postgres"})
 
 _APPLICATION_ROOT = Path(__file__).resolve().parents[2]
 _DOTENV_PATH = _APPLICATION_ROOT / ".env"
@@ -62,6 +64,10 @@ class Settings:
     cli_timeout_seconds: float = 300.0
     cli_max_output_bytes: int = 4 * 1024 * 1024
     artifact_root: Path = _APPLICATION_ROOT / ".artifacts"
+    event_store: EventStoreName = "memory"
+    postgres_dsn: str | None = None
+    postgres_schema: str = "base_agent"
+    event_poll_interval_seconds: float = 0.1
 
     @classmethod
     def from_env(
@@ -117,10 +123,35 @@ class Settings:
             )
         except ValueError as exc:
             raise ValueError("CLI timeout and output limit settings must be numeric") from exc
+        try:
+            event_poll_interval_seconds = float(
+                _env_value("AGENT_EVENT_POLL_INTERVAL_SECONDS", file_values) or "0.1"
+            )
+        except ValueError as exc:
+            raise ValueError("AGENT_EVENT_POLL_INTERVAL_SECONDS must be numeric") from exc
         if timeout_seconds <= 0:
             raise ValueError("AGENT_CLI_TIMEOUT_SECONDS must be greater than zero")
         if max_output_bytes < 1:
             raise ValueError("AGENT_CLI_MAX_OUTPUT_BYTES must be greater than zero")
+        if event_poll_interval_seconds <= 0:
+            raise ValueError("AGENT_EVENT_POLL_INTERVAL_SECONDS must be greater than zero")
+
+        raw_event_store = (
+            _env_value("AGENT_EVENT_STORE", file_values) or "memory"
+        ).strip().lower()
+        if raw_event_store not in _EVENT_STORE_NAMES:
+            raise ValueError("AGENT_EVENT_STORE must be memory or postgres")
+        event_store = cast(EventStoreName, raw_event_store)
+        postgres_dsn = _optional_env("AGENT_POSTGRES_DSN", file_values)
+        if event_store == "postgres" and postgres_dsn is None:
+            raise ValueError(
+                "AGENT_POSTGRES_DSN is required when AGENT_EVENT_STORE=postgres"
+            )
+        postgres_schema = (
+            _env_value("AGENT_POSTGRES_SCHEMA", file_values) or "base_agent"
+        ).strip()
+        if not postgres_schema:
+            raise ValueError("AGENT_POSTGRES_SCHEMA must not be blank")
 
         raw_structured_output_mode = (
             _env_value("AGENT_STRUCTURED_OUTPUT_MODE", file_values) or "prompt"
@@ -163,6 +194,10 @@ class Settings:
             cli_timeout_seconds=timeout_seconds,
             cli_max_output_bytes=max_output_bytes,
             artifact_root=artifact_root.resolve(),
+            event_store=event_store,
+            postgres_dsn=postgres_dsn,
+            postgres_schema=postgres_schema,
+            event_poll_interval_seconds=event_poll_interval_seconds,
         )
 
     def for_plan_react_role(self, role: PlanReactRole) -> Settings:

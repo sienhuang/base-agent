@@ -11,6 +11,7 @@ from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.types import Lifespan
 
 from base_agent.agent import Agent
+from base_agent.events import EventStore, EventStream
 from base_agent.flows import (
     FlowResult,
     FlowRunHandle,
@@ -23,6 +24,12 @@ from base_agent.run_handle import (
     EventStreamingNotSupportedError,
     RunHandle,
     RunNotCancellableError,
+)
+from base_agent.server.recovery import (
+    ExecutionKind,
+    is_execution_history,
+    project_flow_response,
+    project_run_response,
 )
 from base_agent.server.registry import (
     FlowNotRegisteredError,
@@ -53,8 +60,9 @@ def create_http_app(
     sse_ping_seconds: int = 15,
     flows: Mapping[str, RegisteredFlow] | None = None,
     lifespan: Lifespan[FastAPI] | None = None,
+    event_store: EventStore | None = None,
 ) -> FastAPI:
-    """Create an HTTP adapter for process-local Agent and named Flow Runs."""
+    """Create HTTP routes with process-local execution and persistent read fallback."""
     if not prefix.startswith("/") or (len(prefix) > 1 and prefix.endswith("/")):
         raise ValueError("prefix must start with '/' and must not end with '/'")
     if sse_ping_seconds < 1:
@@ -62,17 +70,22 @@ def create_http_app(
     route_prefix = "" if prefix == "/" else prefix
     if agent is None and not flows:
         raise ValueError("create_http_app requires at least one Agent or Flow")
+    resolved_flows = dict(flows or {})
+    _validate_event_store_ownership(event_store, agent, resolved_flows)
     registry = InMemoryRunRegistry(agent) if agent is not None else None
-    flow_registry = InMemoryFlowRegistry(flows or {})
+    flow_registry = InMemoryFlowRegistry(resolved_flows)
+    recovery_store = event_store or _common_event_store(agent, resolved_flows)
     app = FastAPI(title=title, lifespan=lifespan)
     app.state.run_registry = registry
     app.state.flow_registry = flow_registry
+    app.state.event_store = recovery_store
     app.state.sse_ping_seconds = sse_ping_seconds
 
     if registry is not None:
         _register_run_routes(
             app,
             registry,
+            event_store=recovery_store,
             route_prefix=route_prefix,
             sse_ping_seconds=sse_ping_seconds,
         )
@@ -93,14 +106,35 @@ def create_http_app(
             response_model=FlowResponse,
         )
         async def get_flow(flow_run_id: str) -> FlowResponse:
-            return await _flow_response(_get_flow_handle(flow_registry, flow_run_id))
+            handle = _find_flow_handle(flow_registry, flow_run_id)
+            if handle is not None:
+                return await _flow_response(handle)
+            events = await _persisted_events(
+                recovery_store,
+                flow_run_id,
+                kind="flow",
+            )
+            return project_flow_response(flow_run_id, events)
 
         @app.post(
             f"{route_prefix}/flows/{{flow_run_id}}/cancel",
             response_model=FlowResponse,
         )
         async def cancel_flow(flow_run_id: str) -> FlowResponse:
-            handle = _get_flow_handle(flow_registry, flow_run_id)
+            handle = _find_flow_handle(flow_registry, flow_run_id)
+            if handle is None:
+                await _persisted_events(
+                    recovery_store,
+                    flow_run_id,
+                    kind="flow",
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Flow Run '{flow_run_id}' is not owned by this server process "
+                        "and cannot be cancelled"
+                    ),
+                )
             try:
                 await handle.cancel()
             except FlowRunNotCancellableError as exc:
@@ -115,7 +149,18 @@ def create_http_app(
             flow_run_id: str,
             after_sequence: Annotated[int, Query(ge=0)] = 0,
         ) -> tuple[EventResponse, ...]:
-            handle = _get_flow_handle(flow_registry, flow_run_id)
+            handle = _find_flow_handle(flow_registry, flow_run_id)
+            if handle is None:
+                events = await _persisted_events(
+                    recovery_store,
+                    flow_run_id,
+                    kind="flow",
+                )
+                return tuple(
+                    _event_response(event)
+                    for event in events
+                    if event.sequence > after_sequence
+                )
             return tuple(
                 _event_response(event)
                 for event in await handle.events(after_sequence=after_sequence)
@@ -134,15 +179,27 @@ def create_http_app(
                 Query(alias="last_event_id"),
             ] = None,
         ) -> EventSourceResponse:
-            handle = _get_flow_handle(flow_registry, flow_run_id)
             cursor = _event_cursor(
                 after_sequence,
                 last_event_id_header or last_event_id_query,
             )
-            try:
-                events = handle.stream(after_sequence=cursor)
-            except EventStreamingNotSupportedError as exc:
-                raise HTTPException(status_code=501, detail=str(exc)) from exc
+            handle = _find_flow_handle(flow_registry, flow_run_id)
+            if handle is not None:
+                try:
+                    events = handle.stream(after_sequence=cursor)
+                except EventStreamingNotSupportedError as exc:
+                    raise HTTPException(status_code=501, detail=str(exc)) from exc
+            else:
+                await _persisted_events(
+                    recovery_store,
+                    flow_run_id,
+                    kind="flow",
+                )
+                events = _persisted_stream(
+                    recovery_store,
+                    flow_run_id,
+                    after_sequence=cursor,
+                )
             return EventSourceResponse(
                 _sse_events(events),
                 ping=sse_ping_seconds,
@@ -156,6 +213,7 @@ def _register_run_routes(
     app: FastAPI,
     registry: InMemoryRunRegistry,
     *,
+    event_store: EventStore | None,
     route_prefix: str,
     sse_ping_seconds: int,
 ) -> None:
@@ -173,15 +231,27 @@ def _register_run_routes(
         response_model=RunResponse,
     )
     async def get_run(run_id: str) -> RunResponse:
-        handle = _get_handle(registry, run_id)
-        return await _run_response(handle)
+        handle = _find_handle(registry, run_id)
+        if handle is not None:
+            return await _run_response(handle)
+        events = await _persisted_events(event_store, run_id, kind="run")
+        return project_run_response(run_id, events)
 
     @app.post(
         f"{route_prefix}/runs/{{run_id}}/cancel",
         response_model=RunResponse,
     )
     async def cancel_run(run_id: str) -> RunResponse:
-        handle = _get_handle(registry, run_id)
+        handle = _find_handle(registry, run_id)
+        if handle is None:
+            await _persisted_events(event_store, run_id, kind="run")
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Run '{run_id}' is not owned by this server process "
+                    "and cannot be cancelled"
+                ),
+            )
         try:
             await handle.cancel()
         except RunNotCancellableError as exc:
@@ -197,7 +267,14 @@ def _register_run_routes(
         after_sequence: Annotated[int, Query(ge=0)] = 0,
     ) -> tuple[EventResponse, ...]:
         """Replay the persisted Event history strictly after one cursor."""
-        handle = _get_handle(registry, run_id)
+        handle = _find_handle(registry, run_id)
+        if handle is None:
+            events = await _persisted_events(event_store, run_id, kind="run")
+            return tuple(
+                _event_response(event)
+                for event in events
+                if event.sequence > after_sequence
+            )
         return tuple(
             _event_response(event)
             for event in await handle.events(after_sequence=after_sequence)
@@ -217,15 +294,23 @@ def _register_run_routes(
         ] = None,
     ) -> EventSourceResponse:
         """Replay and follow Events over SSE until the Run reaches a terminal state."""
-        handle = _get_handle(registry, run_id)
         cursor = _event_cursor(
             after_sequence,
             last_event_id_header or last_event_id_query,
         )
-        try:
-            events = handle.stream(after_sequence=cursor)
-        except EventStreamingNotSupportedError as exc:
-            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        handle = _find_handle(registry, run_id)
+        if handle is not None:
+            try:
+                events = handle.stream(after_sequence=cursor)
+            except EventStreamingNotSupportedError as exc:
+                raise HTTPException(status_code=501, detail=str(exc)) from exc
+        else:
+            await _persisted_events(event_store, run_id, kind="run")
+            events = _persisted_stream(
+                event_store,
+                run_id,
+                after_sequence=cursor,
+            )
         return EventSourceResponse(
             _sse_events(events),
             ping=sse_ping_seconds,
@@ -233,21 +318,82 @@ def _register_run_routes(
         )
 
 
-def _get_handle(registry: InMemoryRunRegistry, run_id: str) -> RunHandle:
+def _find_handle(registry: InMemoryRunRegistry, run_id: str) -> RunHandle | None:
     try:
         return registry.get(run_id)
-    except RunNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RunNotFoundError:
+        return None
 
 
-def _get_flow_handle(
+def _find_flow_handle(
     registry: InMemoryFlowRegistry,
     flow_run_id: str,
-) -> FlowRunHandle[Any]:
+) -> FlowRunHandle[Any] | None:
     try:
         return registry.get(flow_run_id)
-    except FlowRunNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FlowRunNotFoundError:
+        return None
+
+
+async def _persisted_events(
+    event_store: EventStore | None,
+    execution_id: str,
+    *,
+    kind: ExecutionKind,
+) -> tuple[Event, ...]:
+    events = () if event_store is None else await event_store.list(execution_id)
+    if events and is_execution_history(events, kind):
+        return events
+    label = "Run" if kind == "run" else "Flow Run"
+    raise HTTPException(status_code=404, detail=f"{label} '{execution_id}' was not found")
+
+
+def _persisted_stream(
+    event_store: EventStore | None,
+    execution_id: str,
+    *,
+    after_sequence: int,
+) -> AsyncIterator[Event]:
+    if not isinstance(event_store, EventStream):
+        raise HTTPException(
+            status_code=501,
+            detail="the configured EventStore does not support live subscriptions",
+        )
+    return event_store.subscribe(execution_id, after_sequence=after_sequence)
+
+
+def _common_event_store(
+    agent: Agent | None,
+    flows: Mapping[str, RegisteredFlow],
+) -> EventStore | None:
+    candidates: list[EventStore] = []
+    if agent is not None:
+        candidates.append(agent.event_store)
+    for flow in flows.values():
+        store = getattr(flow, "event_store", None)
+        if isinstance(store, EventStore):
+            candidates.append(store)
+    if not candidates:
+        return None
+    first = candidates[0]
+    return first if all(candidate is first for candidate in candidates) else None
+
+
+def _validate_event_store_ownership(
+    event_store: EventStore | None,
+    agent: Agent | None,
+    flows: Mapping[str, RegisteredFlow],
+) -> None:
+    if event_store is None:
+        return
+    if agent is not None and agent.event_store is not event_store:
+        raise ValueError("HTTP event_store must be the Agent's EventStore")
+    for name, flow in flows.items():
+        flow_store = getattr(flow, "event_store", None)
+        if flow_store is not None and flow_store is not event_store:
+            raise ValueError(
+                f"HTTP event_store must be Flow '{name}' EventStore"
+            )
 
 
 def _start_flow_endpoint(

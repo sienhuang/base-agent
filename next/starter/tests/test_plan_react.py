@@ -1,4 +1,5 @@
 from base_agent import InMemoryArtifactStore
+from base_agent.events import InMemoryEventStore
 from base_agent.flows import (
     ChildRunRole,
     FlowStatus,
@@ -27,7 +28,11 @@ class CapturingOfflineProvider(OfflineProvider):
 
 def test_plan_react_composition_uses_fixed_structured_roles() -> None:
     artifact_store = InMemoryArtifactStore()
-    flow = build_plan_react_flow(artifact_store=artifact_store)
+    event_store = InMemoryEventStore()
+    flow = build_plan_react_flow(
+        artifact_store=artifact_store,
+        event_store=event_store,
+    )
 
     assert flow.planner.definition is PLAN_REACT_PLANNER_DEFINITION
     assert flow.executor.definition is PLAN_REACT_EXECUTOR_DEFINITION
@@ -39,6 +44,9 @@ def test_plan_react_composition_uses_fixed_structured_roles() -> None:
     assert flow.executor.definition.skills
     assert flow.planner.artifact_store is artifact_store
     assert flow.executor.artifact_store is artifact_store
+    assert flow.event_store is event_store
+    assert flow.planner.event_store is event_store
+    assert flow.executor.event_store is event_store
     assert OfflineProvider().info.capabilities.structured_output is True
 
 

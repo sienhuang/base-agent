@@ -126,6 +126,12 @@ Redis、PostgreSQL、embedding 或摘要模型。
 - `run.succeeded`、`run.failed` 或 `run.cancelled` 发出后订阅自然结束，客户端断开不会取消
   Run。
 
+Server 的 Run/Flow Handle 仍在当前进程中，但配置共享 EventStore 后，读路由不再依赖 Handle：
+Registry miss 时会先校验持久历史属于 Agent Run 还是 Flow Run，再投影状态、输出、Plan、子 Run
+关联和 Artifact。JSON 历史与终态 SSE 因此可以跨服务重启访问。重启前由旧进程拥有的执行不能
+在新进程取消，取消接口返回 `409`；没有终态 Event 的历史只能投影为 `running`，EventStore
+本身不提供崩溃检测、租约或断点续跑。
+
 `RunHandle.cancel()` 取消后台 Task，并在清理完成后写入唯一的 `run.cancelled` 终态 Event。
 如果取消发生在 Tool 执行期间，Harness 会先写入 `tool.completed(status=cancelled)`，避免留下
 只有 `tool.started` 的悬空调用。对已取消 Run 重复取消不会新增 Event；成功或失败的 Run
@@ -137,11 +143,47 @@ Redis、PostgreSQL、embedding 或摘要模型。
 因此不需要额外的进程全局 StreamBridge。只实现历史读取的 EventStore 仍可使用 JSON 接口，
 SSE 接口会明确返回 `501`。
 
-## PostgreSQL 与 Redis 的演进方向
+## PostgreSQL EventStore
 
-PostgreSQL 实现应成为 durable EventStore：在事务内按 `(run_id, sequence)` 唯一约束原子
-分配 sequence，`list()` 使用 `sequence > cursor ORDER BY sequence`。它可以先用 polling
-实现 `EventStream`。
+可选的 `PostgresEventStore` 已经实现 durable EventStore：它在同一个事务内更新
+per-Run sequence 计数器并写入 Event，通过 `(run_id, sequence)` 主键保证顺序和唯一性；
+`list()` 使用 `sequence > cursor ORDER BY sequence`，`subscribe()` 先回放历史，再 polling
+新 Event，观察到 Run/Flow 终态后结束。
+
+安装可选依赖并初始化表：
+
+```bash
+uv sync --project next --extra postgres
+```
+
+```python
+from base_agent.events.postgres import PostgresEventStore
+
+events = PostgresEventStore.from_url(
+    "postgresql://agent:password@127.0.0.1:5432/agent",
+    schema="base_agent",
+)
+await events.create_schema()
+```
+
+应用需要把同一个 Store 显式传给 Agent 或 Flow：
+
+```python
+agent = Agent(definition, model=model, event_store=events)
+flow = Flow.sequence(id="analysis", stages=stages, event_store=events)
+```
+
+`postgresql://` 和 `postgres://` URL 会映射到 SQLAlchemy 的 asyncpg Driver。Adapter 自己创建
+的 Engine 通过 `await events.close()` 释放；注入已有 `AsyncEngine` 时，Engine 生命周期仍归应用。
+数据库集成测试通过 `BASE_AGENT_NEXT_TEST_POSTGRES_DSN` 显式启用。
+
+`AgentApplication(event_store=events)` 会把这个 Store 同时交给 HTTP 持久化读取层。服务重启
+后，`GET /runs/{id}`、`GET /flows/{id}`、历史 JSON 和 SSE 可以从 Event 重建；新的终态 Event
+会携带完整输出投影，旧 Event 则从最终 Message、Plan/Step 和 Artifact 事件尽力重建。这里恢复
+的是只读状态与事件访问，不是执行 Task：崩溃中的 Tool/Flow 要继续执行，仍需要 checkpoint、
+owner lease、幂等 Tool 和 resume 协议。
+
+## Redis 演进方向
 
 Redis 不作为 Event 事实数据库。Redis Adapter 应包装一个 durable EventStore：
 

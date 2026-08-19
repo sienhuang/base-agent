@@ -388,7 +388,11 @@ class SequentialFlow:
                 )
                 break
 
-        await state.emitter.emit("flow.succeeded")
+        await state.emitter.emit(
+            "flow.succeeded",
+            output=_sequential_output(state),
+            child_runs=_sequential_child_runs(state),
+        )
         return await self._result(state, FlowStatus.SUCCEEDED)
 
     def _start_child(
@@ -486,7 +490,13 @@ class SequentialFlow:
         *,
         stage: str | None = None,
     ) -> FlowResult:
-        await state.emitter.emit("flow.failed", stage=stage, error=error)
+        await state.emitter.emit(
+            "flow.failed",
+            stage=stage,
+            error=error,
+            output=_sequential_output(state),
+            child_runs=_sequential_child_runs(state),
+        )
         return await self._result(state, FlowStatus.FAILED, error=error)
 
     async def _cancelled_result(self, state: _SequentialFlowState) -> FlowResult:
@@ -502,6 +512,8 @@ class SequentialFlow:
             stage=(
                 state.cancelled_stage.name if state.cancelled_stage is not None else None
             ),
+            output=_sequential_output(state),
+            child_runs=_sequential_child_runs(state),
         )
         return await self._result(state, FlowStatus.CANCELLED)
 
@@ -524,6 +536,27 @@ class SequentialFlow:
             artifact_specs=self.artifact_specs,
             artifact_bindings=tuple(state.artifact_bindings),
         )
+
+
+def _sequential_output(state: _SequentialFlowState) -> str:
+    return state.stage_results[-1].handoff if state.stage_results else ""
+
+
+def _sequential_child_runs(state: _SequentialFlowState) -> tuple[dict[str, object], ...]:
+    stages = state.stage_attempts or state.stage_results
+    return tuple(
+        {
+            "role": "stage",
+            "phase": stage.name,
+            "agent_run_id": stage.run.run_id,
+            "status": stage.run.status.value,
+            "source_plan_revision": None,
+            "target_plan_revision": None,
+            "step_id": None,
+            "attempt": stage.attempt,
+        }
+        for stage in stages
+    )
 
 
 def _select_stage_input(

@@ -21,6 +21,10 @@ _CONFIG_NAMES = (
     "AGENT_CLI_TIMEOUT_SECONDS",
     "AGENT_CLI_MAX_OUTPUT_BYTES",
     "AGENT_ARTIFACT_ROOT",
+    "AGENT_EVENT_STORE",
+    "AGENT_POSTGRES_DSN",
+    "AGENT_POSTGRES_SCHEMA",
+    "AGENT_EVENT_POLL_INTERVAL_SECONDS",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_MODEL",
@@ -51,6 +55,10 @@ def test_settings_read_starter_dotenv_without_mutating_process_environment(
                 "OPENAI_BASE_URL=http://localhost:8000/v1",
                 "AGENT_STRUCTURED_OUTPUT_MODE=json-object",
                 f"AGENT_ARTIFACT_ROOT={tmp_path / 'artifacts'}",
+                "AGENT_EVENT_STORE=postgres",
+                "AGENT_POSTGRES_DSN=postgresql://agent:password@db/agent",
+                "AGENT_POSTGRES_SCHEMA=starter_events",
+                "AGENT_EVENT_POLL_INTERVAL_SECONDS=0.25",
             )
         ),
         encoding="utf-8",
@@ -75,6 +83,10 @@ def test_settings_read_starter_dotenv_without_mutating_process_environment(
     assert settings.base_url == "http://localhost:8000/v1"
     assert settings.structured_output_mode == "json-object"
     assert settings.artifact_root == (tmp_path / "artifacts").resolve()
+    assert settings.event_store == "postgres"
+    assert settings.postgres_dsn == "postgresql://agent:password@db/agent"
+    assert settings.postgres_schema == "starter_events"
+    assert settings.event_poll_interval_seconds == 0.25
     assert os.getenv("AGENT_PROVIDER") is None
 
 
@@ -165,3 +177,74 @@ def test_settings_reject_unknown_plan_react_structured_output_mode(
         )
     else:
         raise AssertionError("unknown Planner structured output mode must fail")
+
+
+def test_settings_default_to_process_local_event_store(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    for name in _CONFIG_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(config, "_DOTENV_PATH", tmp_path / ".env")
+
+    settings = Settings.from_env()
+
+    assert settings.event_store == "memory"
+    assert settings.postgres_dsn is None
+    assert settings.postgres_schema == "base_agent"
+    assert settings.event_poll_interval_seconds == 0.1
+
+
+def test_settings_require_postgres_dsn(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    for name in _CONFIG_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(config, "_DOTENV_PATH", tmp_path / ".env")
+    monkeypatch.setenv("AGENT_EVENT_STORE", "postgres")
+
+    try:
+        Settings.from_env()
+    except ValueError as exc:
+        assert str(exc) == (
+            "AGENT_POSTGRES_DSN is required when AGENT_EVENT_STORE=postgres"
+        )
+    else:
+        raise AssertionError("PostgreSQL EventStore without a DSN must fail")
+
+
+def test_settings_reject_unknown_event_store(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    for name in _CONFIG_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(config, "_DOTENV_PATH", tmp_path / ".env")
+    monkeypatch.setenv("AGENT_EVENT_STORE", "sqlite")
+
+    try:
+        Settings.from_env()
+    except ValueError as exc:
+        assert str(exc) == "AGENT_EVENT_STORE must be memory or postgres"
+    else:
+        raise AssertionError("unknown EventStore must fail")
+
+
+def test_settings_reject_invalid_event_poll_interval(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    for name in _CONFIG_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(config, "_DOTENV_PATH", tmp_path / ".env")
+    monkeypatch.setenv("AGENT_EVENT_POLL_INTERVAL_SECONDS", "0")
+
+    try:
+        Settings.from_env()
+    except ValueError as exc:
+        assert str(exc) == (
+            "AGENT_EVENT_POLL_INTERVAL_SECONDS must be greater than zero"
+        )
+    else:
+        raise AssertionError("non-positive EventStore poll interval must fail")

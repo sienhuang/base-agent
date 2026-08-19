@@ -468,6 +468,9 @@ class PlannerReActFlow:
                         "flow.succeeded",
                         plan_id=state.plan.id,
                         plan_revision=state.plan.revision,
+                        output=state.output,
+                        plan=state.plan.model_dump(mode="json"),
+                        child_runs=_planning_child_runs(state),
                     )
                     return await self._result(state, FlowStatus.SUCCEEDED)
                 if decision.action is PlannerAction.FAIL:
@@ -829,6 +832,13 @@ class PlannerReActFlow:
             "flow.failed",
             plan_id=state.plan_id,
             error=error,
+            output=state.output,
+            plan=(
+                state.plan.model_dump(mode="json")
+                if state.plan is not None
+                else None
+            ),
+            child_runs=_planning_child_runs(state),
         )
         return await self._result(state, FlowStatus.FAILED)
 
@@ -857,6 +867,13 @@ class PlannerReActFlow:
             "flow.cancelled",
             plan_id=state.plan_id,
             reason=state.error,
+            output=state.output,
+            plan=(
+                state.plan.model_dump(mode="json")
+                if state.plan is not None
+                else None
+            ),
+            child_runs=_planning_child_runs(state),
         )
         return await self._result(state, FlowStatus.CANCELLED)
 
@@ -876,6 +893,22 @@ class PlannerReActFlow:
             error=state.error,
             artifacts=_unique_artifacts(state.selected_artifacts),
         )
+
+
+def _planning_child_runs(state: _FlowRunState) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "role": child.role.value,
+            "phase": child.phase,
+            "agent_run_id": child.agent_run_id,
+            "status": child.run.status.value,
+            "source_plan_revision": child.source_plan_revision,
+            "target_plan_revision": child.target_plan_revision,
+            "step_id": child.step_id,
+            "attempt": child.attempt,
+        }
+        for child in state.child_runs
+    )
 
 
 def _unique_artifacts(artifacts: Sequence[Artifact]) -> tuple[Artifact, ...]:

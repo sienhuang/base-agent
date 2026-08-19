@@ -101,8 +101,9 @@ Run，只有显式调用 `handle.cancel()` 才会取消后台执行。对已取�
 `agent.start("Hi", stream=True)` 在后台执行。
 
 Harness、RunResult 和 RunHandle 共享同一个 `EventStore`，默认使用
-`InMemoryEventStore`，不会重复保存 Event。持久化与实时扩展契约以及 PostgreSQL/Redis
-方向见 [`EVENTS.md`](EVENTS.md)。
+`InMemoryEventStore`，不会重复保存 Event。需要跨进程持久化时可以安装 `postgres` extra 并
+显式使用 `base_agent.events.postgres.PostgresEventStore`；它提供原子 sequence、游标回放和
+polling 实时订阅。完整契约和当前 HTTP Registry 边界见 [`EVENTS.md`](EVENTS.md)。
 
 ## Planner–ReAct Flow
 
@@ -192,8 +193,9 @@ handle = flow.start("Research the topic", stream=True)
 
 Planner 与 Executor 的 Memory scope 必须分别通过 `planner_memory_scope` 和
 `executor_memory_scope` 显式传入。Plan 是 Flow 领域状态，不会作为 Memory 或 Message
-隐式共享。当前 `FlowRunHandle`、Plan 和 HTTP Flow registry 仍然只存在于进程内；多
-Worker/Kubernetes 部署需要后续由共享 FlowRunStore/RunStore 驱动。
+隐式共享。`FlowRunHandle` 和执行 Task 仍然属于启动它的进程；HTTP 读取层可以通过共享
+EventStore 在 Registry miss 时恢复 Plan、终态和事件访问，但跨进程取消、崩溃续跑和工作分配
+仍需要共享 FlowRunStore/RunStore、owner lease 与 checkpoint。
 
 ## ContextPolicy
 
@@ -391,9 +393,10 @@ data: {"sequence":8,"kind":"run.succeeded","run_id":"...","turn":1,"payload":{..
 客户端可用 `?after_sequence=5`、`?last_event_id=5` 或 `Last-Event-ID: 5` 只接收 sequence
 大于 5 的 Event；Header 优先于 `last_event_id`，再与 `after_sequence` 取较大值。连接空闲时
 默认每 15 秒发送一次 SSE comment 心跳，Run/Flow 终态事件发出后流自然关闭。Run 与 Flow
-registry 仍只存在于服务进程内，重启后原 id 不再可用，且目前不会自动清理已完成记录。当前
-Server 因此只适合单 Worker；部署到 Kubernetes 多副本或多 Worker 前，必须迁移为共享
-RunStore/FlowRunStore 驱动，不能依赖 sticky session 维持正确性。
+registry 仍只保存当前进程的活动 Handle；配置共享 EventStore 后，重启或请求落到另一 Worker
+时，状态、历史和 SSE 会从持久 Event 投影，不再因为 Registry miss 直接返回 404。只有拥有
+活动 Handle 的进程可以取消执行；崩溃检测、断点续跑、分布式执行所有权和自动保留期仍需要
+共享 RunStore/FlowRunStore 与 lease/checkpoint 机制。
 
 Planner-ReAct 使用与普通 Agent 相同的 `message.created` 表示原始用户消息，并在成功时发送
 `message.completed`（payload 含最终 `content`），随后发送 `flow.succeeded` 关闭 SSE。启用
