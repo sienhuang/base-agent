@@ -26,7 +26,12 @@ from agent_app.skills import (
     SKILL_CATALOG,
     VALUE_RECORDING_SKILL_NAME,
 )
-from agent_app.tools import DIAGNOSTIC_TOOLKIT, ENABLED_TOOL_NAMES, check_browser_readiness
+from agent_app.tools import (
+    DIAGNOSTIC_TOOLKIT,
+    ENABLED_TOOL_NAMES,
+    INTERACTION_TOOLS,
+    check_browser_readiness,
+)
 
 
 def test_application_groups_diagnostic_tools_in_a_toolkit() -> None:
@@ -35,6 +40,11 @@ def test_application_groups_diagnostic_tools_in_a_toolkit() -> None:
         "fail_operation",
         "slow_operation",
     ]
+
+
+def test_application_enables_the_standard_ask_user_tool() -> None:
+    assert [item.spec.name for item in INTERACTION_TOOLS] == ["ask_user"]
+    assert INTERACTION_TOOLS[0].permissions == frozenset({"interaction:ask"})
 
 
 def test_application_registers_lightweight_skill_descriptors() -> None:
@@ -72,6 +82,7 @@ async def test_default_offline_agent_runs_end_to_end() -> None:
     assert "# Available skills" in result.snapshot.system_prompt
     assert [spec.name for spec in result.snapshot.tool_specs] == [
         "skill_view",
+        "ask_user",
         "fail_operation",
         "slow_operation",
         "save_value",
@@ -133,6 +144,7 @@ async def test_recording_skill_composes_instructions_and_enables_tool() -> None:
     assert recording_skill.playbook not in result.snapshot.system_prompt
     assert [spec.name for spec in result.snapshot.tool_specs] == [
         "skill_view",
+        "ask_user",
         "fail_operation",
         "slow_operation",
         "save_value",
@@ -313,6 +325,10 @@ async def test_prompt_asset_is_frozen_into_the_run_snapshot() -> None:
 
     assert result.snapshot.system_prompt == (
         "Answer the user's request clearly and briefly.\n"
+        "Whenever more user input is required to continue, you MUST call ask_user "
+        "instead of asking in a normal assistant response, because a normal response "
+        "ends the Run. If an answer is incomplete, call ask_user again with one "
+        "focused question. Do not guess missing information.\n"
         "When asked to test a Tool failure, call fail_operation with the "
         "requested message.\n"
         "When asked to test a Tool timeout, call slow_operation with the "

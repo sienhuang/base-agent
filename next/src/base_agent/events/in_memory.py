@@ -14,11 +14,17 @@ _TERMINAL_EVENT_KINDS = frozenset(
         "flow.succeeded",
         "flow.failed",
         "flow.cancelled",
+        "flow.waiting",
         "run.succeeded",
         "run.failed",
         "run.cancelled",
+        "run.waiting",
     }
 )
+_PERMANENT_TERMINAL_EVENT_KINDS = _TERMINAL_EVENT_KINDS - {
+    "flow.waiting",
+    "run.waiting",
+}
 
 
 class InMemoryEventStore:
@@ -85,10 +91,16 @@ class InMemoryEventStore:
                         break
                     await self._changed.wait()
 
-            for event in events:
+            for index, event in enumerate(events):
                 cursor = event.sequence
                 yield event
-                if event.kind in _TERMINAL_EVENT_KINDS:
+                if event.kind in _PERMANENT_TERMINAL_EVENT_KINDS:
+                    return
+                if (
+                    event.kind in {"flow.waiting", "run.waiting"}
+                    and index == len(events) - 1
+                    and terminal
+                ):
                     return
             if terminal:
                 return

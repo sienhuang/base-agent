@@ -32,9 +32,11 @@ class FlowRunHandle[FlowResultT: _FlowResult]:
 
     __slots__ = (
         "_cancel_lock",
+        "_cancel_operation",
         "_cancel_requested",
         "_event_store",
         "_started",
+        "_settled_result",
         "_task",
         "flow_run_id",
     )
@@ -46,11 +48,14 @@ class FlowRunHandle[FlowResultT: _FlowResult]:
         task: asyncio.Task[FlowResultT],
         event_store: EventStore,
         started: asyncio.Event,
+        cancel_operation: _FlowOperation[FlowResultT],
     ) -> None:
         self.flow_run_id = flow_run_id
         self._task = task
         self._event_store = event_store
         self._started = started
+        self._cancel_operation = cancel_operation
+        self._settled_result: FlowResultT | None = None
         self._cancel_lock = asyncio.Lock()
         self._cancel_requested = False
 
@@ -81,10 +86,13 @@ class FlowRunHandle[FlowResultT: _FlowResult]:
             task=task,
             event_store=event_store,
             started=started,
+            cancel_operation=cancel_operation,
         )
 
     @property
     def status(self) -> FlowStatus:
+        if self._settled_result is not None:
+            return self._settled_result.status
         if not self._task.done():
             return FlowStatus.RUNNING
         if self._task.cancelled():
@@ -95,15 +103,24 @@ class FlowRunHandle[FlowResultT: _FlowResult]:
             return FlowStatus.FAILED
 
     async def wait(self) -> FlowResultT:
+        if self._settled_result is not None:
+            return self._settled_result
         return await asyncio.shield(self._task)
 
     async def cancel(self) -> FlowResultT:
         async with self._cancel_lock:
             if self._cancel_requested:
+                if self._settled_result is not None:
+                    return self._settled_result
                 return await asyncio.shield(self._task)
 
             await self._started.wait()
             if self._task.done():
+                result = self._task.result()
+                if result.status is FlowStatus.WAITING:
+                    self._cancel_requested = True
+                    self._settled_result = await self._cancel_operation()
+                    return self._settled_result
                 return self._cancelled_or_raise()
 
             terminal = _terminal_status(await self._event_store.list(self.flow_run_id))

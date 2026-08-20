@@ -26,9 +26,11 @@ class RunHandle:
 
     __slots__ = (
         "_cancel_lock",
+        "_cancel_operation",
         "_cancel_requested",
         "_event_store",
         "_started",
+        "_settled_result",
         "_task",
         "run_id",
     )
@@ -40,11 +42,14 @@ class RunHandle:
         task: asyncio.Task[RunResult],
         event_store: EventStore,
         started: asyncio.Event,
+        cancel_operation: _CancelOperation,
     ) -> None:
         self.run_id = run_id
         self._task = task
         self._event_store = event_store
         self._started = started
+        self._cancel_operation = cancel_operation
+        self._settled_result: RunResult | None = None
         self._cancel_lock = asyncio.Lock()
         self._cancel_requested = False
 
@@ -72,11 +77,14 @@ class RunHandle:
             task=task,
             event_store=event_store,
             started=started,
+            cancel_operation=cancel_operation,
         )
 
     @property
     def status(self) -> RunStatus:
         """Return RUNNING until the background task reaches a terminal result."""
+        if self._settled_result is not None:
+            return self._settled_result.status
         if not self._task.done():
             return RunStatus.RUNNING
         if self._task.cancelled():
@@ -88,6 +96,8 @@ class RunHandle:
 
     async def wait(self) -> RunResult:
         """Wait for completion without letting waiter cancellation stop the Run."""
+        if self._settled_result is not None:
+            return self._settled_result
         return await asyncio.shield(self._task)
 
     async def cancel(self) -> RunResult:
@@ -98,10 +108,17 @@ class RunHandle:
         """
         async with self._cancel_lock:
             if self._cancel_requested:
+                if self._settled_result is not None:
+                    return self._settled_result
                 return await asyncio.shield(self._task)
 
             await self._started.wait()
             if self._task.done():
+                result = self._task.result()
+                if result.status is RunStatus.WAITING:
+                    self._cancel_requested = True
+                    self._settled_result = await self._cancel_operation()
+                    return self._settled_result
                 return self._cancelled_or_raise()
 
             terminal_status = _terminal_status(await self._event_store.list(self.run_id))

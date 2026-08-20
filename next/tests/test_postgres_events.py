@@ -5,13 +5,23 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.schema import DropSchema
 
-from base_agent import Agent, AgentDefinition, Flow, Stage
+from base_agent import (
+    Agent,
+    AgentDefinition,
+    CheckpointNotFoundError,
+    Flow,
+    Stage,
+    WaitForInput,
+    tool,
+)
 from base_agent.events import EventStore, EventStream
 from base_agent.events.postgres import (
     EventPayloadSerializationError,
+    PostgresCheckpointStore,
     PostgresEventStore,
     build_postgres_event_tables,
 )
+from base_agent.models import ModelResponse, ToolCall
 from base_agent.testing import FakeModel
 
 POSTGRES_DSN = os.getenv("BASE_AGENT_NEXT_TEST_POSTGRES_DSN")
@@ -27,12 +37,71 @@ def test_postgres_event_schema_and_configuration_are_validated() -> None:
     assert tables.metadata.schema == "agent_events"
     assert tables.sequences.name == "base_agent_event_sequences"
     assert tables.events.name == "base_agent_events"
+    assert tables.checkpoints.name == "base_agent_checkpoints"
     assert {column.name for column in tables.events.primary_key} == {
         "run_id",
         "sequence",
     }
     with pytest.raises(ValueError, match="invalid PostgreSQL schema"):
         build_postgres_event_tables("agent-events;drop schema public")
+
+
+@requires_postgres
+async def test_postgres_checkpoint_resumes_after_adapter_recreation() -> None:
+    assert POSTGRES_DSN is not None
+    schema = f"base_agent_next_{uuid4().hex}"
+    events = PostgresEventStore.from_url(POSTGRES_DSN, schema=schema, poll_interval=0.01)
+    checkpoints = PostgresCheckpointStore.from_event_store(events)
+    await events.create_schema()
+
+    @tool
+    async def ask() -> WaitForInput:
+        return WaitForInput("Continue?")
+
+    definition = AgentDefinition(
+        id="postgres-waiting",
+        version="1.0.0",
+        instructions="Ask and continue.",
+        tools=("ask",),
+        max_model_turns=2,
+    )
+    try:
+        first = Agent(
+            definition,
+            model=FakeModel(
+                [ModelResponse(tool_calls=(ToolCall(id="ask-1", name="ask", arguments={}),))]
+            ),
+            tools=(ask,),
+            event_store=events,
+            checkpoint_store=checkpoints,
+        )
+        waiting = await first.run("Begin")
+
+        reopened_events = PostgresEventStore.from_url(
+            POSTGRES_DSN,
+            schema=schema,
+            poll_interval=0.01,
+        )
+        reopened_checkpoints = PostgresCheckpointStore.from_event_store(reopened_events)
+        try:
+            recreated = Agent(
+                definition,
+                model=FakeModel([ModelResponse(content="continued")]),
+                tools=(ask,),
+                event_store=reopened_events,
+                checkpoint_store=reopened_checkpoints,
+            )
+            completed = await recreated.resume(waiting.run_id, "yes")
+
+            assert completed.text == "continued"
+            with pytest.raises(CheckpointNotFoundError):
+                await reopened_checkpoints.load(waiting.run_id)
+        finally:
+            await reopened_events.close()
+    finally:
+        async with events.engine.begin() as connection:
+            await connection.execute(DropSchema(schema, cascade=True, if_exists=True))
+        await events.close()
 
 
 @requires_postgres

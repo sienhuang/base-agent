@@ -12,6 +12,14 @@ from base_agent.artifacts import (
     InMemoryArtifactStore,
     LocalArtifactStore,
 )
+from base_agent.checkpoints import (
+    CheckpointClaimError,
+    CheckpointConflictError,
+    CheckpointNotFoundError,
+    CheckpointStore,
+    InMemoryCheckpointStore,
+    RuntimeCheckpoint,
+)
 from base_agent.definitions import AgentDefinition
 from base_agent.flows import (
     Flow,
@@ -27,13 +35,22 @@ from base_agent.flows import (
     StageResult,
     StepOutcome,
 )
-from base_agent.governance import Confirmation, SideEffect
+from base_agent.governance import (
+    AwaitHumanConfirmations,
+    Confirmation,
+    SideEffect,
+    ToolConfirmation,
+    ToolConfirmationDecision,
+)
 from base_agent.models import (
     Event,
+    PendingInput,
+    PendingInputKind,
     RunFailure,
     RunResult,
     RunStatus,
     ToolChoice,
+    WaitForInput,
 )
 from base_agent.prompts import load_prompt
 from base_agent.resources import (
@@ -44,12 +61,14 @@ from base_agent.resources import (
 )
 from base_agent.run_handle import RunHandle
 from base_agent.skills import Skill, SkillCatalog, SkillDescriptor, SkillPackage
+from base_agent.toolkits import interaction_tools
 from base_agent.tools import ToolContext, Toolkit, ToolReadiness, tool
 from base_agent.verification import VerificationEvidence
 
 __all__ = [
     "Agent",
     "AgentDefinition",
+    "AwaitHumanConfirmations",
     "Artifact",
     "ArtifactBinding",
     "ArtifactBindingStatus",
@@ -57,6 +76,10 @@ __all__ = [
     "ArtifactRef",
     "ArtifactSpec",
     "ArtifactStore",
+    "CheckpointClaimError",
+    "CheckpointConflictError",
+    "CheckpointNotFoundError",
+    "CheckpointStore",
     "Confirmation",
     "Event",
     "Flow",
@@ -64,15 +87,20 @@ __all__ = [
     "FlowRunHandle",
     "FlowStatus",
     "InMemoryArtifactStore",
+    "InMemoryCheckpointStore",
+    "interaction_tools",
     "LocalArtifactStore",
     "PlannerDecision",
     "PlannerReActResult",
     "PlanningLimits",
     "PlanStepDraft",
+    "PendingInput",
+    "PendingInputKind",
     "RunResult",
     "RunFailure",
     "RunHandle",
     "RunStatus",
+    "RuntimeCheckpoint",
     "ResourceContext",
     "ResourceManager",
     "ResourceScope",
@@ -87,10 +115,13 @@ __all__ = [
     "RetryPolicy",
     "StepOutcome",
     "ToolChoice",
+    "ToolConfirmation",
+    "ToolConfirmationDecision",
     "Toolkit",
     "ToolContext",
     "ToolReadiness",
     "VerificationEvidence",
+    "WaitForInput",
     "load_prompt",
     "tool",
 ]

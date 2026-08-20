@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 
 import uvicorn
-from base_agent import LocalArtifactStore
+from base_agent import AwaitHumanConfirmations, LocalArtifactStore
 from base_agent.server import AgentApplication
 from fastapi import FastAPI
 
@@ -29,6 +29,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         provider,
         artifact_store=artifact_store,
         event_store=event_runtime.store,
+        checkpoint_store=event_runtime.checkpoints,
+        confirmation_policy=AwaitHumanConfirmations(),
     )
     plan_react = build_plan_react_flow(
         provider,
@@ -38,6 +40,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         executor_model=resolved_settings.plan_react_executor_model,
         artifact_store=artifact_store,
         event_store=event_runtime.store,
+        checkpoint_store=event_runtime.checkpoints,
+        confirmation_policy=AwaitHumanConfirmations(),
     )
     application = AgentApplication(
         agent=agent,

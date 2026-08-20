@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from time import monotonic
 from typing import Any
@@ -14,6 +14,12 @@ from uuid import uuid4
 from pydantic import BaseModel, ValidationError
 
 from base_agent.artifacts import Artifact, ArtifactManager, ArtifactStore
+from base_agent.checkpoints import (
+    CheckpointClaim,
+    CheckpointStore,
+    PendingInputCheckpoint,
+    RuntimeCheckpoint,
+)
 from base_agent.context import (
     ContextBudget,
     ContextInput,
@@ -27,16 +33,21 @@ from base_agent.events import EventEmitter, EventStore
 from base_agent.governance import (
     Confirmation,
     ConfirmationPolicy,
+    ConfirmationPolicyDecision,
     ConfirmationRequest,
     DenyConfirmations,
+    ToolConfirmation,
+    ToolConfirmationDecision,
 )
 from base_agent.memory import (
+    MemoryKind,
     MemoryObservation,
     MemoryProvider,
     MemoryRecallRequest,
     MemoryRecord,
     MemoryScope,
     MemorySnapshot,
+    MemoryTrust,
     MemoryWriter,
 )
 from base_agent.models import (
@@ -48,6 +59,7 @@ from base_agent.models import (
     ModelStreamCompleted,
     ModelTextDelta,
     ModelToolCallDelta,
+    PendingInputKind,
     ResourceSnapshot,
     RunFailure,
     RunInvocation,
@@ -58,6 +70,7 @@ from base_agent.models import (
     ToolChoice,
     ToolResult,
     ToolResultStatus,
+    WaitForInput,
 )
 from base_agent.observability import Observer
 from base_agent.providers import ModelProvider, StreamingModelProvider
@@ -80,6 +93,28 @@ class _SkillResourceSource:
     resource_type: str
 
 
+@dataclass(slots=True)
+class _ExecutionState:
+    run_id: str
+    prompt: str
+    stream: bool
+    invocation: RunInvocation
+    memory_scope: MemoryScope | None
+    snapshot: HarnessSnapshot
+    memory: MemorySnapshot
+    messages: list[Message]
+    tool_results: list[ToolResult]
+    observation_bytes: int
+    called_any_tool: bool
+    next_turn: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingTool:
+    input: PendingInputCheckpoint
+    call: ToolCall
+
+
 class Harness:
     """Bounded model/tool runtime hidden behind ``Agent.run``."""
 
@@ -100,6 +135,8 @@ class Harness:
         memory_recall_timeout_seconds: float,
         observers: Sequence[Observer],
         event_store: EventStore,
+        checkpoint_store: CheckpointStore,
+        checkpoint_lease_seconds: float,
         artifact_store: ArtifactStore,
         resources: tuple[ResourceSpec, ...],
     ) -> None:
@@ -123,8 +160,164 @@ class Harness:
         self._memory_recall_timeout_seconds = memory_recall_timeout_seconds
         self._observers = tuple(observers)
         self._event_store = event_store
+        self._checkpoint_store = checkpoint_store
+        self._checkpoint_lease_seconds = checkpoint_lease_seconds
         self._artifact_store = artifact_store
         self._resources = resources
+
+    async def resume(
+        self,
+        run_id: str,
+        user_input: str,
+        *,
+        on_event: Observer | None = None,
+    ) -> RunResult:
+        """Complete a pending input Tool call and continue the same Run."""
+        if not user_input.strip():
+            raise ValueError("resume input must not be blank")
+        return await self._continue_waiting(
+            run_id,
+            user_input=user_input,
+            confirmation=None,
+            on_event=on_event,
+        )
+
+    async def confirm(
+        self,
+        run_id: str,
+        confirmation: ToolConfirmation,
+        *,
+        on_event: Observer | None = None,
+    ) -> RunResult:
+        """Resolve one exact pending Tool confirmation and continue the Run."""
+        return await self._continue_waiting(
+            run_id,
+            user_input=None,
+            confirmation=confirmation,
+            on_event=on_event,
+        )
+
+    async def _continue_waiting(
+        self,
+        run_id: str,
+        *,
+        user_input: str | None,
+        confirmation: ToolConfirmation | None,
+        on_event: Observer | None,
+    ) -> RunResult:
+        checkpoint = await self._checkpoint_store.load(run_id)
+        snapshot = self._create_snapshot()
+        if checkpoint.agent_id != self._definition.id:
+            raise ValueError(
+                f"run '{run_id}' belongs to Agent '{checkpoint.agent_id}', "
+                f"not '{self._definition.id}'"
+            )
+        if checkpoint.snapshot_fingerprint != snapshot.fingerprint:
+            raise ValueError(
+                f"run '{run_id}' cannot resume because the Agent snapshot changed"
+            )
+        _validate_continuation(checkpoint, user_input, confirmation)
+        claim = await self._checkpoint_store.claim(
+            run_id,
+            owner_id=f"agent:{self._definition.id}:{uuid4()}",
+            lease_seconds=self._checkpoint_lease_seconds,
+        )
+        invocation = _invocation_from_payload(checkpoint.invocation)
+        memory_scope = (
+            MemoryScope(checkpoint.memory_scope)
+            if checkpoint.memory_scope is not None
+            else None
+        )
+        run_observers = self._observers if on_event is None else (*self._observers, on_event)
+        emitter = EventEmitter(run_id, self._event_store, run_observers)
+        artifact_manager, resource_manager = self._managers(
+            run_id,
+            invocation,
+            emitter,
+        )
+        lease_stop = asyncio.Event()
+        try:
+            result = await self._run_with_lease(
+                claim,
+                lease_stop,
+                self._run(
+                    checkpoint.prompt,
+                    stream=checkpoint.stream,
+                    memory_scope=memory_scope,
+                    emitter=emitter,
+                    artifact_manager=artifact_manager,
+                    resource_manager=resource_manager,
+                    invocation=invocation,
+                    checkpoint=checkpoint,
+                    claim=claim,
+                    lease_stop=lease_stop,
+                    user_input=user_input,
+                    confirmation=confirmation,
+                ),
+            )
+        except BaseException:
+            try:
+                await resource_manager.close()
+            except Exception:
+                pass
+            raise
+        try:
+            await resource_manager.close()
+        except Exception:
+            if result.status is RunStatus.SUCCEEDED:
+                raise
+        if result.status is not RunStatus.WAITING:
+            await self._checkpoint_store.complete(claim)
+        return result
+
+    async def _run_with_lease(
+        self,
+        claim: CheckpointClaim,
+        stop: asyncio.Event,
+        operation: Coroutine[Any, Any, RunResult],
+    ) -> RunResult:
+        operation_task = asyncio.create_task(operation)
+
+        async def heartbeat() -> None:
+            interval = min(30.0, self._checkpoint_lease_seconds / 3)
+            current = claim
+            while True:
+                await asyncio.sleep(interval)
+                if stop.is_set():
+                    return
+                try:
+                    current = await self._checkpoint_store.renew(
+                        current,
+                        lease_seconds=self._checkpoint_lease_seconds,
+                    )
+                except Exception:
+                    if stop.is_set():
+                        return
+                    raise
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        try:
+            completed, _ = await asyncio.wait(
+                (operation_task, heartbeat_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if operation_task in completed:
+                return await operation_task
+            if stop.is_set() and heartbeat_task.exception() is None:
+                return await operation_task
+            heartbeat_task.result()
+            raise RuntimeError("checkpoint heartbeat exited before continuation")
+        finally:
+            stop.set()
+            if not heartbeat_task.done():
+                heartbeat_task.cancel()
+            if not operation_task.done():
+                operation_task.cancel()
+            for task in (heartbeat_task, operation_task):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     async def run(
         self,
@@ -140,30 +333,10 @@ class Harness:
         resolved_invocation = invocation or RunInvocation()
         run_observers = self._observers if on_event is None else (*self._observers, on_event)
         emitter = EventEmitter(resolved_run_id, self._event_store, run_observers)
-        artifact_manager = ArtifactManager(
-            self._artifact_store,
-            run_id=resolved_run_id,
-            agent_id=self._definition.id,
-            emitter=emitter,
-            flow_run_id=resolved_invocation.flow_run_id,
-            invocation_id=resolved_invocation.invocation_id,
-            stage=resolved_invocation.stage,
-            step_id=resolved_invocation.step_id,
-            attempt=resolved_invocation.attempt,
-            granted_artifact_ids=resolved_invocation.artifact_ids,
-        )
-        resource_manager = ResourceManager(
-            self._resources,
-            context=ResourceContext(
-                run_id=resolved_run_id,
-                agent_id=self._definition.id,
-                flow_run_id=resolved_invocation.flow_run_id,
-                invocation_id=resolved_invocation.invocation_id,
-                stage=resolved_invocation.stage,
-                step_id=resolved_invocation.step_id,
-                attempt=resolved_invocation.attempt,
-            ),
-            emitter=emitter,
+        artifact_manager, resource_manager = self._managers(
+            resolved_run_id,
+            resolved_invocation,
+            emitter,
         )
         try:
             result = await self._run(
@@ -173,6 +346,7 @@ class Harness:
                 emitter=emitter,
                 artifact_manager=artifact_manager,
                 resource_manager=resource_manager,
+                invocation=resolved_invocation,
             )
         except BaseException:
             try:
@@ -189,6 +363,39 @@ class Harness:
                 raise
         return result
 
+    def _managers(
+        self,
+        run_id: str,
+        invocation: RunInvocation,
+        emitter: EventEmitter,
+    ) -> tuple[ArtifactManager, ResourceManager]:
+        artifact_manager = ArtifactManager(
+            self._artifact_store,
+            run_id=run_id,
+            agent_id=self._definition.id,
+            emitter=emitter,
+            flow_run_id=invocation.flow_run_id,
+            invocation_id=invocation.invocation_id,
+            stage=invocation.stage,
+            step_id=invocation.step_id,
+            attempt=invocation.attempt,
+            granted_artifact_ids=invocation.artifact_ids,
+        )
+        resource_manager = ResourceManager(
+            self._resources,
+            context=ResourceContext(
+                run_id=run_id,
+                agent_id=self._definition.id,
+                flow_run_id=invocation.flow_run_id,
+                invocation_id=invocation.invocation_id,
+                stage=invocation.stage,
+                step_id=invocation.step_id,
+                attempt=invocation.attempt,
+            ),
+            emitter=emitter,
+        )
+        return artifact_manager, resource_manager
+
     async def _run(
         self,
         prompt: str,
@@ -198,6 +405,12 @@ class Harness:
         emitter: EventEmitter,
         artifact_manager: ArtifactManager,
         resource_manager: ResourceManager,
+        invocation: RunInvocation,
+        checkpoint: RuntimeCheckpoint | None = None,
+        claim: CheckpointClaim | None = None,
+        user_input: str | None = None,
+        confirmation: ToolConfirmation | None = None,
+        lease_stop: asyncio.Event | None = None,
     ) -> RunResult:
         if not prompt.strip():
             raise ValueError("run prompt must not be blank")
@@ -215,27 +428,35 @@ class Harness:
 
         resolved_run_id = emitter.run_id
         snapshot = self._create_snapshot()
-        await emitter.emit(
-            "run.started",
-            agent_id=snapshot.agent_id,
-            agent_version=snapshot.agent_version,
-            snapshot_fingerprint=snapshot.fingerprint,
-            artifact_store=snapshot.artifact_store,
-            resources=tuple(resource.name for resource in snapshot.resources),
-        )
-        user_message = Message.user(prompt, message_id=str(uuid4()))
-        await emitter.emit(
-            "message.created",
-            message_id=user_message.message_id,
-            role="user",
-            content=prompt,
-        )
-        for skill in snapshot.skills:
+        if checkpoint is None:
             await emitter.emit(
-                "skill.selected",
-                skill_name=skill.name,
-                skill_version=skill.version,
-                package_fingerprint=skill.package_fingerprint,
+                "run.started",
+                agent_id=snapshot.agent_id,
+                agent_version=snapshot.agent_version,
+                snapshot_fingerprint=snapshot.fingerprint,
+                artifact_store=snapshot.artifact_store,
+                resources=tuple(resource.name for resource in snapshot.resources),
+            )
+            user_message = Message.user(prompt, message_id=str(uuid4()))
+            await emitter.emit(
+                "message.created",
+                message_id=user_message.message_id,
+                role="user",
+                content=prompt,
+            )
+            for skill in snapshot.skills:
+                await emitter.emit(
+                    "skill.selected",
+                    skill_name=skill.name,
+                    skill_version=skill.version,
+                    package_fingerprint=skill.package_fingerprint,
+                )
+        else:
+            await emitter.emit(
+                "run.resumed",
+                request_id=checkpoint.pending_input.request_id,
+                input_kind=checkpoint.pending_input.kind.value,
+                checkpoint_revision=checkpoint.revision,
             )
 
         try:
@@ -264,6 +485,31 @@ class Harness:
                 ),
             )
 
+        if checkpoint is not None:
+            available_artifact_ids = {
+                artifact.id
+                for artifact in await self._artifact_store.list(run_id=resolved_run_id)
+            }
+            missing_checkpoint_artifacts = (
+                set(checkpoint.artifact_ids) - available_artifact_ids
+            )
+            if missing_checkpoint_artifacts:
+                return await self._failed(
+                    emitter,
+                    snapshot,
+                    error=(
+                        "checkpoint Artifact outputs are unavailable: "
+                        f"{', '.join(sorted(missing_checkpoint_artifacts))}"
+                    ),
+                    failure=RunFailure(
+                        code="checkpoint_artifact_missing",
+                        message="one or more checkpoint Artifacts are unavailable",
+                        details={
+                            "artifact_ids": sorted(missing_checkpoint_artifacts),
+                        },
+                    ),
+                )
+
         readiness_error = await self._check_readiness(emitter)
         if readiness_error is not None:
             return await self._failed(
@@ -272,19 +518,126 @@ class Harness:
                 error=readiness_error,
             )
 
-        memory = await self._recall_memory(
-            prompt,
-            scope=memory_scope,
-            run_id=resolved_run_id,
-            emitter=emitter,
-        )
-        messages: list[Message] = [user_message]
-        tool_results: list[ToolResult] = []
-        observation_bytes = 0
-        called_any_tool = False
+        if checkpoint is None:
+            memory = await self._recall_memory(
+                prompt,
+                scope=memory_scope,
+                run_id=resolved_run_id,
+                emitter=emitter,
+            )
+            state = _ExecutionState(
+                run_id=resolved_run_id,
+                prompt=prompt,
+                stream=stream,
+                invocation=invocation,
+                memory_scope=memory_scope,
+                snapshot=snapshot,
+                memory=memory,
+                messages=[user_message],
+                tool_results=[],
+                observation_bytes=0,
+                called_any_tool=False,
+                next_turn=1,
+            )
+        else:
+            state = _state_from_checkpoint(checkpoint, snapshot, invocation, memory_scope)
+
+        messages = state.messages
+        tool_results = state.tool_results
+        memory = state.memory
+        called_any_tool = state.called_any_tool
         tools_by_name = {tool.spec.name: tool for tool in self._tools}
 
-        for turn in range(1, self._definition.max_model_turns + 1):
+        if checkpoint is not None:
+            pending_result: ToolResult | _PendingTool
+            pending_call = _tool_call_from_payload(checkpoint.pending_call)
+            if checkpoint.pending_input.kind is PendingInputKind.TOOL_INPUT:
+                if user_input is None:
+                    raise ValueError("pending Tool input requires resume()")
+                await emitter.emit(
+                    "input.received",
+                    turn=state.next_turn - 1,
+                    request_id=checkpoint.pending_input.request_id,
+                    tool_name=pending_call.name,
+                    tool_call_id=pending_call.id,
+                )
+                pending_result = ToolResult(
+                    call=pending_call,
+                    status=ToolResultStatus.SUCCESS,
+                    data={"input": user_input},
+                )
+                await emitter.emit(
+                    "tool.completed",
+                    turn=state.next_turn - 1,
+                    tool_name=pending_call.name,
+                    tool_call_id=pending_call.id,
+                    status=pending_result.status.value,
+                )
+            else:
+                if confirmation is None:
+                    raise ValueError("pending Tool confirmation requires confirm()")
+                approved = confirmation.decision is ToolConfirmationDecision.APPROVE
+                await emitter.emit(
+                    "tool.confirmation",
+                    turn=state.next_turn - 1,
+                    request_id=confirmation.request_id,
+                    tool_name=pending_call.name,
+                    tool_call_id=pending_call.id,
+                    approved=approved,
+                    subject_id=confirmation.subject_id,
+                    reason_code=confirmation.reason_code,
+                    decided_at=confirmation.decided_at.isoformat(),
+                )
+                if approved:
+                    pending_result = await self._execute_tool(
+                        pending_call,
+                        turn=state.next_turn - 1,
+                        tools_by_name=tools_by_name,
+                        emitter=emitter,
+                        artifact_manager=artifact_manager,
+                        resource_manager=resource_manager,
+                        confirmation_granted=True,
+                    )
+                else:
+                    pending_result = ToolResult(
+                        call=pending_call,
+                        status=ToolResultStatus.CONFIRMATION_DENIED,
+                        error="Tool execution was rejected",
+                    )
+                    await emitter.emit(
+                        "tool.completed",
+                        turn=state.next_turn - 1,
+                        tool_name=pending_call.name,
+                        tool_call_id=pending_call.id,
+                        status=pending_result.status.value,
+                    )
+            if isinstance(pending_result, _PendingTool):
+                raise RuntimeError("a confirmed Tool call cannot request the same confirmation")
+            failed = await self._record_tool_result(
+                pending_result,
+                state=state,
+                turn=state.next_turn - 1,
+                emitter=emitter,
+                artifact_manager=artifact_manager,
+            )
+            if failed is not None:
+                return failed
+            batch_result = await self._execute_tool_batch(
+                tuple(_tool_call_from_payload(item) for item in checkpoint.remaining_calls),
+                tuple(_tool_call_from_payload(item) for item in checkpoint.overflow_calls),
+                state=state,
+                turn=state.next_turn - 1,
+                tools_by_name=tools_by_name,
+                emitter=emitter,
+                artifact_manager=artifact_manager,
+                resource_manager=resource_manager,
+                claim=claim,
+                lease_stop=lease_stop,
+            )
+            if batch_result is not None:
+                return batch_result
+
+        for turn in range(state.next_turn, self._definition.max_model_turns + 1):
             assistant_message_id = str(uuid4())
             is_final_turn = turn == self._definition.max_model_turns or not snapshot.tool_specs
             request_tools = () if is_final_turn else snapshot.tool_specs
@@ -513,6 +866,7 @@ class Harness:
                 )
 
             called_any_tool = True
+            state.called_any_tool = True
             messages.append(
                 Message.assistant(
                     response.content or "",
@@ -532,90 +886,21 @@ class Harness:
                     limit=self._definition.max_tool_calls_per_turn,
                 )
 
-            turn_results: list[ToolResult] = []
-            for call in accepted_calls:
-                result = await self._execute_tool(
-                    call,
-                    turn=turn,
-                    tools_by_name=tools_by_name,
-                    emitter=emitter,
-                    artifact_manager=artifact_manager,
-                    resource_manager=resource_manager,
-                )
-                turn_results.append(result)
-            for call in overflow_calls:
-                result = ToolResult(
-                    call=call,
-                    status=ToolResultStatus.LIMIT_EXCEEDED,
-                    error=(
-                        "Tool call was not executed because the model turn "
-                        f"exceeded max_tool_calls_per_turn="
-                        f"{self._definition.max_tool_calls_per_turn}"
-                    ),
-                )
-                await emitter.emit(
-                    "tool.completed",
-                    turn=turn,
-                    tool_name=call.name,
-                    tool_call_id=call.id,
-                    status=result.status.value,
-                )
-                turn_results.append(result)
-
-            for result in turn_results:
-                tool_results.append(result)
-                created_artifacts = tuple(
-                    artifact
-                    for artifact in await artifact_manager.list_outputs()
-                    if artifact.tool_call_id == result.call.id
-                )
-                observation = _tool_result_observation(
-                    result,
-                    artifacts_created=created_artifacts,
-                    max_bytes=self._definition.max_tool_observation_bytes,
-                )
-                observation_bytes += len(observation.encode("utf-8"))
-                if observation_bytes > self._definition.max_run_observation_bytes:
-                    return await self._failed(
-                        emitter,
-                        snapshot,
-                        error=(
-                            "Tool observations exceeded the per-Run context budget "
-                            f"({observation_bytes} > "
-                            f"{self._definition.max_run_observation_bytes} bytes)"
-                        ),
-                        failure=RunFailure(
-                            code="tool_observation_budget_exceeded",
-                            message="Tool observations exceeded the per-Run context budget",
-                            details={
-                                "observed_bytes": observation_bytes,
-                                "max_run_observation_bytes": (
-                                    self._definition.max_run_observation_bytes
-                                ),
-                                "max_tool_observation_bytes": (
-                                    self._definition.max_tool_observation_bytes
-                                ),
-                            },
-                        ),
-                        tool_results=tool_results,
-                        turn=turn,
-                    )
-                messages.append(
-                    Message.tool_result(
-                        result.call,
-                        observation,
-                        message_id=str(uuid4()),
-                    )
-                )
-                if (
-                    result.status is ToolResultStatus.SUCCESS
-                    and result.call.name == SKILL_VIEW_TOOL_NAME
-                ):
-                    await _emit_skill_view_event(
-                        result,
-                        turn=turn,
-                        emitter=emitter,
-                    )
+            state.next_turn = turn + 1
+            batch_result = await self._execute_tool_batch(
+                accepted_calls,
+                overflow_calls,
+                state=state,
+                turn=turn,
+                tools_by_name=tools_by_name,
+                emitter=emitter,
+                artifact_manager=artifact_manager,
+                resource_manager=resource_manager,
+                claim=claim,
+                lease_stop=lease_stop,
+            )
+            if batch_result is not None:
+                return batch_result
 
         return await self._failed(
             emitter,
@@ -623,6 +908,202 @@ class Harness:
             error="Agent exhausted max_model_turns without a final answer",
             tool_results=tool_results,
             turn=self._definition.max_model_turns,
+        )
+
+    async def _execute_tool_batch(
+        self,
+        calls: tuple[ToolCall, ...],
+        overflow_calls: tuple[ToolCall, ...],
+        *,
+        state: _ExecutionState,
+        turn: int,
+        tools_by_name: Mapping[str, Tool],
+        emitter: EventEmitter,
+        artifact_manager: ArtifactManager,
+        resource_manager: ResourceManager,
+        claim: CheckpointClaim | None,
+        lease_stop: asyncio.Event | None,
+    ) -> RunResult | None:
+        for index, call in enumerate(calls):
+            outcome = await self._execute_tool(
+                call,
+                turn=turn,
+                tools_by_name=tools_by_name,
+                emitter=emitter,
+                artifact_manager=artifact_manager,
+                resource_manager=resource_manager,
+            )
+            if isinstance(outcome, _PendingTool):
+                return await self._waiting(
+                    outcome,
+                    state=state,
+                    remaining_calls=calls[index + 1 :],
+                    overflow_calls=overflow_calls,
+                    turn=turn,
+                    emitter=emitter,
+                    artifact_manager=artifact_manager,
+                    claim=claim,
+                    lease_stop=lease_stop,
+                )
+            failed = await self._record_tool_result(
+                outcome,
+                state=state,
+                turn=turn,
+                emitter=emitter,
+                artifact_manager=artifact_manager,
+            )
+            if failed is not None:
+                return failed
+
+        for call in overflow_calls:
+            result = ToolResult(
+                call=call,
+                status=ToolResultStatus.LIMIT_EXCEEDED,
+                error=(
+                    "Tool call was not executed because the model turn "
+                    f"exceeded max_tool_calls_per_turn="
+                    f"{self._definition.max_tool_calls_per_turn}"
+                ),
+            )
+            await emitter.emit(
+                "tool.completed",
+                turn=turn,
+                tool_name=call.name,
+                tool_call_id=call.id,
+                status=result.status.value,
+            )
+            failed = await self._record_tool_result(
+                result,
+                state=state,
+                turn=turn,
+                emitter=emitter,
+                artifact_manager=artifact_manager,
+            )
+            if failed is not None:
+                return failed
+        return None
+
+    async def _record_tool_result(
+        self,
+        result: ToolResult,
+        *,
+        state: _ExecutionState,
+        turn: int,
+        emitter: EventEmitter,
+        artifact_manager: ArtifactManager,
+    ) -> RunResult | None:
+        state.tool_results.append(result)
+        created_artifacts = tuple(
+            artifact
+            for artifact in await artifact_manager.list_outputs()
+            if artifact.tool_call_id == result.call.id
+        )
+        observation = _tool_result_observation(
+            result,
+            artifacts_created=created_artifacts,
+            max_bytes=self._definition.max_tool_observation_bytes,
+        )
+        state.observation_bytes += len(observation.encode("utf-8"))
+        if state.observation_bytes > self._definition.max_run_observation_bytes:
+            return await self._failed(
+                emitter,
+                state.snapshot,
+                error=(
+                    "Tool observations exceeded the per-Run context budget "
+                    f"({state.observation_bytes} > "
+                    f"{self._definition.max_run_observation_bytes} bytes)"
+                ),
+                failure=RunFailure(
+                    code="tool_observation_budget_exceeded",
+                    message="Tool observations exceeded the per-Run context budget",
+                    details={
+                        "observed_bytes": state.observation_bytes,
+                        "max_run_observation_bytes": (
+                            self._definition.max_run_observation_bytes
+                        ),
+                        "max_tool_observation_bytes": (
+                            self._definition.max_tool_observation_bytes
+                        ),
+                    },
+                ),
+                tool_results=state.tool_results,
+                turn=turn,
+            )
+        state.messages.append(
+            Message.tool_result(
+                result.call,
+                observation,
+                message_id=str(uuid4()),
+            )
+        )
+        if (
+            result.status is ToolResultStatus.SUCCESS
+            and result.call.name == SKILL_VIEW_TOOL_NAME
+        ):
+            await _emit_skill_view_event(result, turn=turn, emitter=emitter)
+        return None
+
+    async def _waiting(
+        self,
+        pending: _PendingTool,
+        *,
+        state: _ExecutionState,
+        remaining_calls: tuple[ToolCall, ...],
+        overflow_calls: tuple[ToolCall, ...],
+        turn: int,
+        emitter: EventEmitter,
+        artifact_manager: ArtifactManager,
+        claim: CheckpointClaim | None,
+        lease_stop: asyncio.Event | None,
+    ) -> RunResult:
+        checkpoint = _checkpoint_from_state(
+            state,
+            pending,
+            remaining_calls=remaining_calls,
+            overflow_calls=overflow_calls,
+            artifact_ids=tuple(
+                artifact.id for artifact in await artifact_manager.list_outputs()
+            ),
+            revision=(1 if claim is None else claim.checkpoint.revision + 1),
+        )
+        if claim is None:
+            await self._checkpoint_store.save(checkpoint)
+        else:
+            if lease_stop is None:
+                raise RuntimeError("resumed checkpoint has no lease heartbeat")
+            lease_stop.set()
+            await self._checkpoint_store.release(claim, checkpoint)
+        await emitter.emit(
+            "input.requested",
+            turn=turn,
+            request_id=pending.input.request_id,
+            input_kind=pending.input.kind.value,
+            prompt=pending.input.prompt,
+            tool_name=pending.call.name,
+            tool_call_id=pending.call.id,
+            metadata=pending.input.metadata,
+        )
+        await emitter.emit(
+            "run.waiting",
+            turn=turn,
+            request_id=pending.input.request_id,
+            input_kind=pending.input.kind.value,
+            prompt=pending.input.prompt,
+            tool_name=pending.call.name,
+            tool_call_id=pending.call.id,
+            checkpoint_revision=checkpoint.revision,
+        )
+        return RunResult(
+            run_id=emitter.run_id,
+            status=RunStatus.WAITING,
+            output=None,
+            text="",
+            snapshot=state.snapshot,
+            events=await emitter.events(),
+            tool_results=tuple(state.tool_results),
+            artifacts=await artifact_manager.list_outputs(),
+            artifact_inputs=await artifact_manager.list_inputs(),
+            pending_input=pending.input.public(),
         )
 
     async def _complete_model_turn(
@@ -947,7 +1428,8 @@ class Harness:
         emitter: EventEmitter,
         artifact_manager: ArtifactManager,
         resource_manager: ResourceManager,
-    ) -> ToolResult:
+        confirmation_granted: bool = False,
+    ) -> ToolResult | _PendingTool:
         tool = tools_by_name.get(call.name)
         if tool is None:
             result = ToolResult(
@@ -997,24 +1479,51 @@ class Harness:
             )
             return result
 
-        if tool.confirmation is Confirmation.REQUIRED:
+        if tool.confirmation is Confirmation.REQUIRED and not confirmation_granted:
+            request_id = str(uuid4())
             try:
-                approved = await self._confirmation_policy.confirm(
+                decision = await self._confirmation_policy.confirm(
                     ConfirmationRequest(
                         run_id=emitter.run_id,
                         agent_id=self._definition.id,
                         tool_name=call.name,
                         arguments=arguments,
                         side_effect=tool.side_effect,
+                        request_id=request_id,
+                        tool_call_id=call.id,
                     )
                 )
             except Exception:
                 # Governance is fail-closed. An unavailable confirmation
                 # channel must never become implicit approval.
-                approved = False
+                decision = ConfirmationPolicyDecision.REJECT
+            if decision is ConfirmationPolicyDecision.DEFER:
+                pending = PendingInputCheckpoint(
+                    request_id=request_id,
+                    kind=PendingInputKind.TOOL_CONFIRMATION,
+                    tool_call_id=call.id,
+                    tool_name=call.name,
+                    prompt=f"Confirm execution of Tool '{call.name}'?",
+                    metadata={
+                        "arguments": _json_value(arguments),
+                        "side_effect": tool.side_effect.value,
+                    },
+                )
+                await emitter.emit(
+                    "tool.confirmation.requested",
+                    turn=turn,
+                    request_id=request_id,
+                    tool_name=call.name,
+                    tool_call_id=call.id,
+                    arguments=_json_value(arguments),
+                    side_effect=tool.side_effect.value,
+                )
+                return _PendingTool(input=pending, call=call)
+            approved = decision is True or decision is ConfirmationPolicyDecision.APPROVE
             await emitter.emit(
                 "tool.confirmation",
                 turn=turn,
+                request_id=request_id,
                 tool_name=call.name,
                 tool_call_id=call.id,
                 approved=approved,
@@ -1105,6 +1614,25 @@ class Harness:
                 error=f"{type(exc).__name__}: {exc}",
             )
         else:
+            if isinstance(data, WaitForInput):
+                pending = PendingInputCheckpoint(
+                    request_id=str(uuid4()),
+                    kind=PendingInputKind.TOOL_INPUT,
+                    tool_call_id=call.id,
+                    tool_name=call.name,
+                    prompt=data.prompt,
+                    metadata=dict(data.metadata),
+                )
+                await emitter.emit(
+                    "tool.waiting",
+                    turn=turn,
+                    request_id=pending.request_id,
+                    tool_name=call.name,
+                    tool_call_id=call.id,
+                    prompt=data.prompt,
+                    metadata=dict(data.metadata),
+                )
+                return _PendingTool(input=pending, call=call)
             result = ToolResult(
                 call=call,
                 status=ToolResultStatus.SUCCESS,
@@ -1271,6 +1799,230 @@ def _event_output(output: Any) -> Any:
     if isinstance(output, BaseModel):
         return output.model_dump(mode="json")
     return output
+
+
+def _checkpoint_from_state(
+    state: _ExecutionState,
+    pending: _PendingTool,
+    *,
+    remaining_calls: tuple[ToolCall, ...],
+    overflow_calls: tuple[ToolCall, ...],
+    artifact_ids: tuple[str, ...],
+    revision: int,
+) -> RuntimeCheckpoint:
+    return RuntimeCheckpoint(
+        run_id=state.run_id,
+        agent_id=state.snapshot.agent_id,
+        snapshot_fingerprint=state.snapshot.fingerprint,
+        prompt=state.prompt,
+        stream=state.stream,
+        invocation=_invocation_payload(state.invocation),
+        memory_scope=(state.memory_scope.namespace if state.memory_scope is not None else None),
+        next_turn=state.next_turn,
+        messages=tuple(_message_payload(message) for message in state.messages),
+        memory=_memory_payload(state.memory),
+        tool_results=tuple(_tool_result_payload(result) for result in state.tool_results),
+        observation_bytes=state.observation_bytes,
+        called_any_tool=state.called_any_tool,
+        pending_input=pending.input,
+        pending_call=_tool_call_payload(pending.call),
+        remaining_calls=tuple(_tool_call_payload(call) for call in remaining_calls),
+        overflow_calls=tuple(_tool_call_payload(call) for call in overflow_calls),
+        artifact_ids=artifact_ids,
+        revision=revision,
+    )
+
+
+def _state_from_checkpoint(
+    checkpoint: RuntimeCheckpoint,
+    snapshot: HarnessSnapshot,
+    invocation: RunInvocation,
+    memory_scope: MemoryScope | None,
+) -> _ExecutionState:
+    return _ExecutionState(
+        run_id=checkpoint.run_id,
+        prompt=checkpoint.prompt,
+        stream=checkpoint.stream,
+        invocation=invocation,
+        memory_scope=memory_scope,
+        snapshot=snapshot,
+        memory=_memory_from_payload(checkpoint.memory),
+        messages=[_message_from_payload(item) for item in checkpoint.messages],
+        tool_results=[_tool_result_from_payload(item) for item in checkpoint.tool_results],
+        observation_bytes=checkpoint.observation_bytes,
+        called_any_tool=checkpoint.called_any_tool,
+        next_turn=checkpoint.next_turn,
+    )
+
+
+def _invocation_payload(invocation: RunInvocation) -> dict[str, Any]:
+    return {
+        "flow_run_id": invocation.flow_run_id,
+        "invocation_id": invocation.invocation_id,
+        "stage": invocation.stage,
+        "step_id": invocation.step_id,
+        "attempt": invocation.attempt,
+        "artifact_ids": list(invocation.artifact_ids),
+    }
+
+
+def _invocation_from_payload(payload: Mapping[str, Any]) -> RunInvocation:
+    artifact_ids = payload.get("artifact_ids", ())
+    return RunInvocation(
+        flow_run_id=_optional_str(payload.get("flow_run_id")),
+        invocation_id=_optional_str(payload.get("invocation_id")),
+        stage=_optional_str(payload.get("stage")),
+        step_id=_optional_str(payload.get("step_id")),
+        attempt=(int(payload["attempt"]) if payload.get("attempt") is not None else None),
+        artifact_ids=tuple(str(item) for item in artifact_ids),
+    )
+
+
+def _tool_call_payload(call: ToolCall) -> dict[str, Any]:
+    return {"id": call.id, "name": call.name, "arguments": _json_value(call.arguments)}
+
+
+def _tool_call_from_payload(payload: Mapping[str, Any]) -> ToolCall:
+    arguments = payload.get("arguments", {})
+    if not isinstance(arguments, Mapping):
+        raise ValueError("checkpoint ToolCall arguments must be an object")
+    return ToolCall(
+        id=str(payload["id"]),
+        name=str(payload["name"]),
+        arguments=dict(arguments),
+    )
+
+
+def _message_payload(message: Message) -> dict[str, Any]:
+    return {
+        "role": message.role,
+        "content": message.content,
+        "tool_calls": [_tool_call_payload(call) for call in message.tool_calls],
+        "tool_call_id": message.tool_call_id,
+        "name": message.name,
+        "message_id": message.message_id,
+    }
+
+
+def _message_from_payload(payload: Mapping[str, Any]) -> Message:
+    calls = payload.get("tool_calls", ())
+    return Message(
+        role=str(payload["role"]),
+        content=str(payload.get("content", "")),
+        tool_calls=tuple(_tool_call_from_payload(item) for item in calls),
+        tool_call_id=_optional_str(payload.get("tool_call_id")),
+        name=_optional_str(payload.get("name")),
+        message_id=_optional_str(payload.get("message_id")),
+    )
+
+
+def _tool_result_payload(result: ToolResult) -> dict[str, Any]:
+    return {
+        "call": _tool_call_payload(result.call),
+        "status": result.status.value,
+        "data": _json_value(result.data),
+        "error": result.error,
+    }
+
+
+def _tool_result_from_payload(payload: Mapping[str, Any]) -> ToolResult:
+    call = payload.get("call")
+    if not isinstance(call, Mapping):
+        raise ValueError("checkpoint ToolResult call must be an object")
+    return ToolResult(
+        call=_tool_call_from_payload(call),
+        status=ToolResultStatus(str(payload["status"])),
+        data=payload.get("data"),
+        error=_optional_str(payload.get("error")),
+    )
+
+
+def _memory_payload(memory: MemorySnapshot) -> dict[str, Any]:
+    return {
+        "enabled": memory.enabled,
+        "provider": memory.provider,
+        "scope": list(memory.scope.namespace) if memory.scope is not None else None,
+        "records": [
+            {
+                "id": record.id,
+                "kind": record.kind.value,
+                "content": record.content,
+                "scope": list(record.scope.namespace),
+                "trust": record.trust.value,
+                "version": record.version,
+                "relevance_score": record.relevance_score,
+                "source_message_ids": list(record.source_message_ids),
+                "metadata": _json_value(record.metadata),
+            }
+            for record in memory.records
+        ],
+    }
+
+
+def _memory_from_payload(payload: Mapping[str, Any]) -> MemorySnapshot:
+    scope_value = payload.get("scope")
+    scope = (
+        MemoryScope(tuple(str(item) for item in scope_value))
+        if scope_value is not None
+        else None
+    )
+    records = []
+    for item in payload.get("records", ()):
+        record_scope = MemoryScope(tuple(str(part) for part in item["scope"]))
+        metadata = item.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise ValueError("checkpoint Memory metadata must be an object")
+        records.append(
+            MemoryRecord(
+                id=str(item["id"]),
+                kind=MemoryKind(str(item["kind"])),
+                content=str(item["content"]),
+                scope=record_scope,
+                trust=MemoryTrust(str(item["trust"])),
+                version=str(item["version"]),
+                relevance_score=(
+                    float(item["relevance_score"])
+                    if item.get("relevance_score") is not None
+                    else None
+                ),
+                source_message_ids=tuple(str(value) for value in item["source_message_ids"]),
+                metadata=dict(metadata),
+            )
+        )
+    return MemorySnapshot(
+        enabled=bool(payload["enabled"]),
+        provider=str(payload["provider"]),
+        scope=scope,
+        records=tuple(records),
+    )
+
+
+def _validate_continuation(
+    checkpoint: RuntimeCheckpoint,
+    user_input: str | None,
+    confirmation: ToolConfirmation | None,
+) -> None:
+    pending = checkpoint.pending_input
+    if pending.kind is PendingInputKind.TOOL_INPUT:
+        if confirmation is not None:
+            raise ValueError("pending Tool input requires resume(), not confirm()")
+        if user_input is None or not user_input.strip():
+            raise ValueError("resume input must not be blank")
+        return
+    if user_input is not None:
+        raise ValueError("pending Tool confirmation requires confirm(), not resume()")
+    if confirmation is None:
+        raise ValueError("Tool confirmation decision is required")
+    if confirmation.request_id != pending.request_id:
+        raise ValueError("Tool confirmation targets another request")
+
+
+def _json_value(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False, default=str))
+
+
+def _optional_str(value: Any) -> str | None:
+    return None if value is None else str(value)
 
 
 def _skill_snapshot(skill: Skill) -> SkillSnapshot:

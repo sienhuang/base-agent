@@ -20,7 +20,8 @@ from base_agent.artifacts import (
 from base_agent.events import EventEmitter, EventStore, InMemoryEventStore
 from base_agent.flows.handle import FlowRunHandle
 from base_agent.flows.models import FlowStatus
-from base_agent.models import Event, RunInvocation, RunResult, RunStatus
+from base_agent.governance import ToolConfirmation
+from base_agent.models import Event, PendingInput, RunInvocation, RunResult, RunStatus
 from base_agent.observability import Observer
 from base_agent.run_handle import RunHandle, RunNotCancellableError
 from base_agent.verification import VerificationEvidence
@@ -90,6 +91,8 @@ class FlowResult:
     error: str | None = None
     artifact_specs: tuple[ArtifactSpec, ...] = ()
     artifact_bindings: tuple[ArtifactBinding, ...] = ()
+    pending_input: PendingInput | None = None
+    waiting_child_run_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -109,6 +112,13 @@ class _SequentialFlowState:
     cancelled_attempt: int | None = None
     accepted_artifacts: list[Artifact] = field(default_factory=list)
     artifact_bindings: list[ArtifactBinding] = field(default_factory=list)
+    started: bool = False
+    next_stage_index: int = 0
+    next_attempt: int = 1
+    retry_feedback: str | None = None
+    waiting_stage: Stage | None = None
+    waiting_run: RunResult | None = None
+    waiting_attempt: int | None = None
 
 
 class SequentialFlow:
@@ -153,6 +163,8 @@ class SequentialFlow:
             raise ValueError("Flow ArtifactSpec names must be unique")
         self.artifact_specs = tuple(declared_specs)
         self._observers = tuple(observers)
+        self._waiting_states: dict[str, _SequentialFlowState] = {}
+        self._waiting_lock = asyncio.Lock()
 
     async def run(
         self,
@@ -171,6 +183,58 @@ class SequentialFlow:
             flow_run_id=flow_run_id,
         )
         return await self._execute(state)
+
+    async def resume(self, flow_run_id: str, user_input: str) -> FlowResult:
+        """Resume the exact child Run currently suspending this Flow."""
+        state = await self._claim_waiting_state(flow_run_id)
+        stage = _require_waiting_stage(state)
+        waiting = _require_waiting_run(state)
+        async def forward_child_event(event: Event) -> None:
+            await self._forward_child_event(state, stage, state.waiting_attempt or 1, event)
+        try:
+            run = await stage.agent.resume(
+                waiting.run_id,
+                user_input,
+                on_event=(forward_child_event if self.forward_child_events else None),
+            )
+            await state.emitter.emit(
+                "flow.resumed",
+                stage=stage.name,
+                agent_run_id=run.run_id,
+                input_kind="tool_input",
+            )
+            return await self._execute(state, resumed_run=run)
+        except BaseException:
+            await self._restore_waiting_state(state)
+            raise
+
+    async def confirm(
+        self,
+        flow_run_id: str,
+        confirmation: ToolConfirmation,
+    ) -> FlowResult:
+        """Resolve the exact child Tool confirmation suspending this Flow."""
+        state = await self._claim_waiting_state(flow_run_id)
+        stage = _require_waiting_stage(state)
+        waiting = _require_waiting_run(state)
+        async def forward_child_event(event: Event) -> None:
+            await self._forward_child_event(state, stage, state.waiting_attempt or 1, event)
+        try:
+            run = await stage.agent.confirm(
+                waiting.run_id,
+                confirmation,
+                on_event=(forward_child_event if self.forward_child_events else None),
+            )
+            await state.emitter.emit(
+                "flow.resumed",
+                stage=stage.name,
+                agent_run_id=run.run_id,
+                input_kind="tool_confirmation",
+            )
+            return await self._execute(state, resumed_run=run)
+        except BaseException:
+            await self._restore_waiting_state(state)
+            raise
 
     def start(
         self,
@@ -222,9 +286,14 @@ class SequentialFlow:
             stream=stream,
         )
 
-    async def _execute(self, state: _SequentialFlowState) -> FlowResult:
+    async def _execute(
+        self,
+        state: _SequentialFlowState,
+        *,
+        resumed_run: RunResult | None = None,
+    ) -> FlowResult:
         try:
-            return await self._execute_stages(state)
+            return await self._execute_stages(state, resumed_run=resumed_run)
         except asyncio.CancelledError:
             await self._cancel_active_child(state)
             raise
@@ -234,17 +303,25 @@ class SequentialFlow:
                 f"{type(exc).__name__}: {exc}",
             )
 
-    async def _execute_stages(self, state: _SequentialFlowState) -> FlowResult:
-        await state.emitter.emit(
-            "flow.started",
-            flow_id=self.id,
-            stage_count=len(self.stages),
-            stream=state.stream,
-            artifact_specs=[
-                _artifact_spec_payload(artifact) for artifact in self.artifact_specs
-            ],
-        )
-        for index, stage in enumerate(self.stages):
+    async def _execute_stages(
+        self,
+        state: _SequentialFlowState,
+        *,
+        resumed_run: RunResult | None,
+    ) -> FlowResult:
+        if not state.started:
+            await state.emitter.emit(
+                "flow.started",
+                flow_id=self.id,
+                stage_count=len(self.stages),
+                stream=state.stream,
+                artifact_specs=[
+                    _artifact_spec_payload(artifact) for artifact in self.artifact_specs
+                ],
+            )
+            state.started = True
+        for index in range(state.next_stage_index, len(self.stages)):
+            stage = self.stages[index]
             stage_input = _select_stage_input(
                 stage,
                 index=index,
@@ -254,31 +331,70 @@ class SequentialFlow:
                     state.stage_results[-1].handoff if state.stage_results else None
                 ),
             )
-            retry_feedback: str | None = None
-            for attempt in range(1, stage.retry.max_attempts + 1):
+            retry_feedback = state.retry_feedback
+            first_attempt = state.next_attempt if index == state.next_stage_index else 1
+            for attempt in range(first_attempt, stage.retry.max_attempts + 1):
                 run_prompt = _stage_run_prompt(
                     stage,
                     stage_input=stage_input,
                     retry_feedback=retry_feedback,
                 )
-                handle = self._start_child(
-                    state,
-                    stage=stage,
-                    prompt=run_prompt,
-                    attempt=attempt,
-                )
-                await state.emitter.emit(
-                    "stage.started",
-                    stage=stage.name,
-                    agent_id=stage.agent.definition.id,
-                    agent_run_id=handle.run_id,
-                    attempt=attempt,
-                    max_attempts=stage.retry.max_attempts,
-                )
-                run = await handle.wait()
+                if resumed_run is not None:
+                    run = resumed_run
+                    resumed_run = None
+                else:
+                    handle = self._start_child(
+                        state,
+                        stage=stage,
+                        prompt=run_prompt,
+                        attempt=attempt,
+                    )
+                    await state.emitter.emit(
+                        "stage.started",
+                        stage=stage.name,
+                        agent_id=stage.agent.definition.id,
+                        agent_run_id=handle.run_id,
+                        attempt=attempt,
+                        max_attempts=stage.retry.max_attempts,
+                    )
+                    run = await handle.wait()
                 state.active_stage = None
                 state.active_handle = None
                 state.active_attempt = None
+                if run.status is RunStatus.WAITING:
+                    state.next_stage_index = index
+                    state.next_attempt = attempt
+                    state.retry_feedback = retry_feedback
+                    state.waiting_stage = stage
+                    state.waiting_run = run
+                    state.waiting_attempt = attempt
+                    async with self._waiting_lock:
+                        self._waiting_states[state.flow_run_id] = state
+                    pending = run.pending_input
+                    await state.emitter.emit(
+                        "stage.waiting",
+                        stage=stage.name,
+                        agent_run_id=run.run_id,
+                        attempt=attempt,
+                        request_id=(pending.request_id if pending is not None else None),
+                        input_kind=(pending.kind.value if pending is not None else None),
+                        prompt=(pending.prompt if pending is not None else None),
+                        tool_name=(pending.tool_name if pending is not None else None),
+                        tool_call_id=(pending.tool_call_id if pending is not None else None),
+                        metadata=(dict(pending.metadata) if pending is not None else {}),
+                    )
+                    await state.emitter.emit(
+                        "flow.waiting",
+                        stage=stage.name,
+                        agent_run_id=run.run_id,
+                        attempt=attempt,
+                        request_id=(pending.request_id if pending is not None else None),
+                        input_kind=(pending.kind.value if pending is not None else None),
+                    )
+                    return await self._result(state, FlowStatus.WAITING)
+                state.waiting_stage = None
+                state.waiting_run = None
+                state.waiting_attempt = None
                 if run.status is not RunStatus.SUCCEEDED:
                     failed_stage = StageResult(
                         name=stage.name,
@@ -342,6 +458,8 @@ class SequentialFlow:
                             if stage.retry.feedback_verification_failure
                             else None
                         )
+                        state.retry_feedback = retry_feedback
+                        state.next_attempt = attempt + 1
                         await state.emitter.emit(
                             "stage.retrying",
                             stage=stage.name,
@@ -386,6 +504,9 @@ class SequentialFlow:
                     agent_run_id=run.run_id,
                     attempt=attempt,
                 )
+                state.next_stage_index = index + 1
+                state.next_attempt = 1
+                state.retry_feedback = None
                 break
 
         await state.emitter.emit(
@@ -394,6 +515,19 @@ class SequentialFlow:
             child_runs=_sequential_child_runs(state),
         )
         return await self._result(state, FlowStatus.SUCCEEDED)
+
+    async def _claim_waiting_state(self, flow_run_id: str) -> _SequentialFlowState:
+        async with self._waiting_lock:
+            try:
+                return self._waiting_states.pop(flow_run_id)
+            except KeyError as exc:
+                raise ValueError(
+                    f"Flow Run '{flow_run_id}' is not waiting in this process"
+                ) from exc
+
+    async def _restore_waiting_state(self, state: _SequentialFlowState) -> None:
+        async with self._waiting_lock:
+            self._waiting_states[state.flow_run_id] = state
 
     def _start_child(
         self,
@@ -407,25 +541,7 @@ class SequentialFlow:
             raise RuntimeError("Flow already has an active child Run")
 
         async def forward_child_event(event: Event) -> None:
-            if event.kind in _UNFORWARDED_CHILD_EVENT_KINDS:
-                return
-            payload = dict(event.payload)
-            payload.update(
-                {
-                    "event_scope": "child_run",
-                    "flow_run_id": state.flow_run_id,
-                    "agent_run_id": event.run_id,
-                    "stage": stage.name,
-                    "attempt": attempt,
-                    "child_sequence": event.sequence,
-                    "child_kind": event.kind,
-                }
-            )
-            await state.emitter.emit(
-                _forwarded_child_kind(event.kind),
-                turn=event.turn,
-                **payload,
-            )
+            await self._forward_child_event(state, stage, attempt, event)
 
         artifact_ids = _artifact_input_ids(state, stage)
         if artifact_ids:
@@ -457,6 +573,33 @@ class SequentialFlow:
         state.active_handle = handle
         state.active_attempt = attempt
         return handle
+
+    async def _forward_child_event(
+        self,
+        state: _SequentialFlowState,
+        stage: Stage,
+        attempt: int,
+        event: Event,
+    ) -> None:
+        if event.kind in _UNFORWARDED_CHILD_EVENT_KINDS:
+            return
+        payload = dict(event.payload)
+        payload.update(
+            {
+                "event_scope": "child_run",
+                "flow_run_id": state.flow_run_id,
+                "agent_run_id": event.run_id,
+                "stage": stage.name,
+                "attempt": attempt,
+                "child_sequence": event.sequence,
+                "child_kind": event.kind,
+            }
+        )
+        await state.emitter.emit(
+            _forwarded_child_kind(event.kind),
+            turn=event.turn,
+            **payload,
+        )
 
     async def _cancel_active_child(self, state: _SequentialFlowState) -> None:
         stage = state.active_stage
@@ -500,6 +643,24 @@ class SequentialFlow:
         return await self._result(state, FlowStatus.FAILED, error=error)
 
     async def _cancelled_result(self, state: _SequentialFlowState) -> FlowResult:
+        if state.waiting_stage is not None and state.waiting_run is not None:
+            run = await state.waiting_stage.agent.cancel(state.waiting_run.run_id)
+            cancelled = StageResult(
+                name=state.waiting_stage.name,
+                run=run,
+                handoff=run.text,
+                attempt=state.waiting_attempt or 1,
+            )
+            state.stage_attempts.append(cancelled)
+            state.stage_results.append(cancelled)
+            state.cancelled_stage = state.waiting_stage
+            state.cancelled_run = run
+            state.cancelled_attempt = state.waiting_attempt
+            state.waiting_stage = None
+            state.waiting_run = None
+            state.waiting_attempt = None
+            async with self._waiting_lock:
+                self._waiting_states.pop(state.flow_run_id, None)
         if state.cancelled_stage is not None and state.cancelled_run is not None:
             await state.emitter.emit(
                 "stage.cancelled",
@@ -535,11 +696,29 @@ class SequentialFlow:
             error=error,
             artifact_specs=self.artifact_specs,
             artifact_bindings=tuple(state.artifact_bindings),
+            pending_input=(
+                state.waiting_run.pending_input if state.waiting_run is not None else None
+            ),
+            waiting_child_run_id=(
+                state.waiting_run.run_id if state.waiting_run is not None else None
+            ),
         )
 
 
 def _sequential_output(state: _SequentialFlowState) -> str:
     return state.stage_results[-1].handoff if state.stage_results else ""
+
+
+def _require_waiting_stage(state: _SequentialFlowState) -> Stage:
+    if state.waiting_stage is None:
+        raise RuntimeError("waiting Sequential Flow has no Stage")
+    return state.waiting_stage
+
+
+def _require_waiting_run(state: _SequentialFlowState) -> RunResult:
+    if state.waiting_run is None:
+        raise RuntimeError("waiting Sequential Flow has no child Run")
+    return state.waiting_run
 
 
 def _sequential_child_runs(state: _SequentialFlowState) -> tuple[dict[str, object], ...]:

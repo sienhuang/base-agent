@@ -2,11 +2,15 @@
 
 from base_agent.governance import (
     AllowAllConfirmations,
+    AwaitHumanConfirmations,
     Confirmation,
     ConfirmationPolicy,
+    ConfirmationPolicyDecision,
     ConfirmationRequest,
     DenyConfirmations,
     SideEffect,
+    ToolConfirmation,
+    ToolConfirmationDecision,
 )
 from base_agent.tools.core import (
     FunctionTool,
@@ -20,12 +24,16 @@ from base_agent.tools.core import (
 
 __all__ = [
     "AllowAllConfirmations",
+    "AwaitHumanConfirmations",
     "Confirmation",
     "ConfirmationPolicy",
+    "ConfirmationPolicyDecision",
     "ConfirmationRequest",
     "DenyConfirmations",
     "FunctionTool",
     "SideEffect",
+    "ToolConfirmation",
+    "ToolConfirmationDecision",
     "Tool",
     "ToolContext",
     "Toolkit",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -30,6 +31,7 @@ class FinishReason(StrEnum):
 
 class RunStatus(StrEnum):
     RUNNING = "running"
+    WAITING = "waiting"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -45,6 +47,57 @@ class ToolResultStatus(StrEnum):
     CONFIRMATION_DENIED = "confirmation_denied"
     TIMEOUT = "timeout"
     ERROR = "error"
+
+
+class PendingInputKind(StrEnum):
+    TOOL_INPUT = "tool_input"
+    TOOL_CONFIRMATION = "tool_confirmation"
+
+
+@dataclass(frozen=True, slots=True)
+class WaitForInput:
+    """A Tool outcome that suspends the Run until a host supplies input."""
+
+    prompt: str
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.prompt.strip():
+            raise ValueError("input prompt must not be blank")
+        try:
+            serialized = json.dumps(
+                dict(self.metadata),
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("input metadata must be finite JSON") from exc
+        normalized = json.loads(serialized)
+        object.__setattr__(self, "metadata", MappingProxyType(normalized))
+
+
+@dataclass(frozen=True, slots=True)
+class PendingInput:
+    """Stable public description of the exact continuation a Run awaits."""
+
+    request_id: str
+    kind: PendingInputKind
+    tool_call_id: str
+    tool_name: str
+    prompt: str
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.request_id, "request_id"),
+            (self.tool_call_id, "tool_call_id"),
+            (self.tool_name, "tool_name"),
+            (self.prompt, "prompt"),
+        ):
+            if not value.strip():
+                raise ValueError(f"{name} must not be blank")
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,6 +356,7 @@ class RunResult:
     failure: RunFailure | None = None
     artifacts: tuple[Artifact, ...] = ()
     artifact_inputs: tuple[Artifact, ...] = ()
+    pending_input: PendingInput | None = None
 
 
 @dataclass(frozen=True, slots=True)

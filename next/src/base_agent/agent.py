@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from base_agent.artifacts import ArtifactStore, InMemoryArtifactStore
+from base_agent.checkpoints import CheckpointStore, InMemoryCheckpointStore
 from base_agent.context import (
     ContextBudget,
     ContextPolicy,
@@ -16,6 +17,7 @@ from base_agent.context import (
 )
 from base_agent.definitions import AgentDefinition
 from base_agent.events import EventStore, InMemoryEventStore
+from base_agent.governance import ToolConfirmation
 from base_agent.memory import (
     DisabledMemoryProvider,
     DisabledMemoryWriter,
@@ -23,7 +25,7 @@ from base_agent.memory import (
     MemoryScope,
     MemoryWriter,
 )
-from base_agent.models import RunInvocation, RunResult
+from base_agent.models import RunInvocation, RunResult, RunStatus
 from base_agent.observability import Observer
 from base_agent.providers import ModelProvider
 from base_agent.resources import ResourceSpec
@@ -61,6 +63,8 @@ class Agent:
         memory_recall_timeout_seconds: float = 2.0,
         observers: Sequence[Observer] = (),
         event_store: EventStore | None = None,
+        checkpoint_store: CheckpointStore | None = None,
+        checkpoint_lease_seconds: float = 300.0,
         artifact_store: ArtifactStore | None = None,
         resources: Iterable[ResourceSpec] = (),
     ) -> None:
@@ -92,6 +96,8 @@ class Agent:
             raise ValueError("memory_recall_limit must be at least 1")
         if memory_recall_timeout_seconds <= 0:
             raise ValueError("memory_recall_timeout_seconds must be positive")
+        if checkpoint_lease_seconds <= 0:
+            raise ValueError("checkpoint_lease_seconds must be positive")
         resource_specs = tuple(resources)
         resource_names = [spec.name for spec in resource_specs]
         if len(set(resource_names)) != len(resource_names):
@@ -177,6 +183,10 @@ class Agent:
             raise ValueError(f"Provider '{model.info.name}' does not support structured output")
         self.definition = definition
         self.event_store = event_store if event_store is not None else InMemoryEventStore()
+        self.checkpoint_store = (
+            checkpoint_store if checkpoint_store is not None else InMemoryCheckpointStore()
+        )
+        self._checkpoint_lease_seconds = checkpoint_lease_seconds
         self.artifact_store = (
             artifact_store if artifact_store is not None else InMemoryArtifactStore()
         )
@@ -195,6 +205,8 @@ class Agent:
             memory_recall_timeout_seconds=memory_recall_timeout_seconds,
             observers=observers,
             event_store=self.event_store,
+            checkpoint_store=self.checkpoint_store,
+            checkpoint_lease_seconds=checkpoint_lease_seconds,
             artifact_store=self.artifact_store,
             resources=resource_specs,
         )
@@ -232,6 +244,46 @@ class Agent:
             invocation=invocation,
         )
 
+    async def resume(
+        self,
+        run_id: str,
+        user_input: str,
+        *,
+        on_event: Observer | None = None,
+    ) -> RunResult:
+        """Continue a Run waiting on a Tool-produced input request."""
+        return await self._harness.resume(run_id, user_input, on_event=on_event)
+
+    async def confirm(
+        self,
+        run_id: str,
+        confirmation: ToolConfirmation,
+        *,
+        on_event: Observer | None = None,
+    ) -> RunResult:
+        """Approve or reject one exact pending Tool confirmation."""
+        return await self._harness.confirm(run_id, confirmation, on_event=on_event)
+
+    async def cancel(self, run_id: str) -> RunResult:
+        """Cancel a checkpointed WAITING Run and consume its continuation."""
+        checkpoint = await self.checkpoint_store.load(run_id)
+        if checkpoint.agent_id != self.definition.id:
+            raise ValueError(
+                f"run '{run_id}' belongs to Agent '{checkpoint.agent_id}', "
+                f"not '{self.definition.id}'"
+            )
+        claim = await self.checkpoint_store.claim(
+            run_id,
+            owner_id=f"cancel:{self.definition.id}:{uuid4()}",
+            lease_seconds=self._checkpoint_lease_seconds,
+        )
+        result = await self._harness.cancelled_result(
+            run_id,
+            reason="run cancellation requested",
+        )
+        await self.checkpoint_store.complete(claim)
+        return result
+
     def start(
         self,
         prompt: str,
@@ -255,17 +307,17 @@ class Agent:
             )
 
         def cancel_in_background() -> Coroutine[Any, Any, RunResult]:
-            return self._harness.cancelled_result(
-                run_id,
-                reason="run cancellation requested",
-            )
+            if handle.status is RunStatus.WAITING:
+                return self.cancel(run_id)
+            return self._harness.cancelled_result(run_id, reason="run cancellation requested")
 
-        return RunHandle._launch(
+        handle = RunHandle._launch(
             run_id=run_id,
             operation=run_in_background,
             cancel_operation=cancel_in_background,
             event_store=self.event_store,
         )
+        return handle
 
 
 def _select_skills(

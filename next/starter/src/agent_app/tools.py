@@ -9,9 +9,10 @@ from base_agent import (
     SideEffect,
     Toolkit,
     ToolReadiness,
+    interaction_tools,
     tool,
 )
-from base_agent.tools import flatten_tools
+from base_agent.tools import Tool, flatten_tools
 
 
 def check_browser_readiness() -> ToolReadiness:
@@ -65,9 +66,20 @@ DIAGNOSTIC_TOOLKIT = Toolkit.of(
     slow_operation,
 )
 
+INTERACTION_TOOLS = interaction_tools()
+
 # Registration, enablement, and authorization are intentionally separate. The
 # browser implementation is registered for opt-in definitions but is not part
 # of the Starter Agent's default capability policy.
-REGISTERED_TOOLS = (DIAGNOSTIC_TOOLKIT, save_value, browse)
-ENABLED_TOOLS = (DIAGNOSTIC_TOOLKIT, save_value)
+REGISTERED_TOOLS: tuple[Tool | Toolkit, ...] = (
+    *INTERACTION_TOOLS,
+    DIAGNOSTIC_TOOLKIT,
+    save_value,
+    browse,
+)
+ENABLED_TOOLS: tuple[Tool | Toolkit, ...] = (
+    *INTERACTION_TOOLS,
+    DIAGNOSTIC_TOOLKIT,
+    save_value,
+)
 ENABLED_TOOL_NAMES = tuple(tool.spec.name for tool in flatten_tools(ENABLED_TOOLS))

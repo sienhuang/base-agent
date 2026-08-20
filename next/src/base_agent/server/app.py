@@ -11,6 +11,11 @@ from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.types import Lifespan
 
 from base_agent.agent import Agent
+from base_agent.checkpoints import (
+    CheckpointClaimError,
+    CheckpointConflictError,
+    CheckpointNotFoundError,
+)
 from base_agent.events import EventStore, EventStream
 from base_agent.flows import (
     FlowResult,
@@ -19,7 +24,8 @@ from base_agent.flows import (
     FlowStatus,
     PlannerReActResult,
 )
-from base_agent.models import Event, RunStatus
+from base_agent.governance import ToolConfirmation
+from base_agent.models import Event, RunResult, RunStatus
 from base_agent.run_handle import (
     EventStreamingNotSupportedError,
     RunHandle,
@@ -41,9 +47,12 @@ from base_agent.server.registry import (
 )
 from base_agent.server.schemas import (
     ArtifactRefResponse,
+    ConfirmRunRequest,
     EventResponse,
     FlowChildRunResponse,
     FlowResponse,
+    PendingInputResponse,
+    ResumeRunRequest,
     RunResponse,
     StartFlowRequest,
     StartFlowResponse,
@@ -106,6 +115,14 @@ def create_http_app(
             response_model=FlowResponse,
         )
         async def get_flow(flow_run_id: str) -> FlowResponse:
+            continued = flow_registry.continued_result(flow_run_id)
+            if continued is not None:
+                events = await _persisted_events(
+                    recovery_store,
+                    flow_run_id,
+                    kind="flow",
+                )
+                return _flow_result_response(flow_run_id, continued, events)
             handle = _find_flow_handle(flow_registry, flow_run_id)
             if handle is not None:
                 return await _flow_response(handle)
@@ -115,6 +132,51 @@ def create_http_app(
                 kind="flow",
             )
             return project_flow_response(flow_run_id, events)
+
+        @app.post(
+            f"{route_prefix}/flows/{{flow_run_id}}/resume",
+            response_model=FlowResponse,
+        )
+        async def resume_flow(
+            flow_run_id: str,
+            payload: ResumeRunRequest,
+        ) -> FlowResponse:
+            try:
+                result = await flow_registry.resume(flow_run_id, payload.input)
+            except FlowRunNotFoundError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except (CheckpointClaimError, CheckpointConflictError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            events = await _persisted_events(
+                recovery_store,
+                flow_run_id,
+                kind="flow",
+            )
+            return _flow_result_response(flow_run_id, result, events)
+
+        @app.post(
+            f"{route_prefix}/flows/{{flow_run_id}}/confirm",
+            response_model=FlowResponse,
+        )
+        async def confirm_flow(
+            flow_run_id: str,
+            payload: ConfirmRunRequest,
+        ) -> FlowResponse:
+            try:
+                result = await flow_registry.confirm(
+                    flow_run_id,
+                    ToolConfirmation(**payload.model_dump()),
+                )
+            except FlowRunNotFoundError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except (CheckpointClaimError, CheckpointConflictError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            events = await _persisted_events(
+                recovery_store,
+                flow_run_id,
+                kind="flow",
+            )
+            return _flow_result_response(flow_run_id, result, events)
 
         @app.post(
             f"{route_prefix}/flows/{{flow_run_id}}/cancel",
@@ -231,11 +293,43 @@ def _register_run_routes(
         response_model=RunResponse,
     )
     async def get_run(run_id: str) -> RunResponse:
+        continued = registry.continued_result(run_id)
+        if continued is not None:
+            return await _run_result_response(continued, event_store)
         handle = _find_handle(registry, run_id)
         if handle is not None:
             return await _run_response(handle)
         events = await _persisted_events(event_store, run_id, kind="run")
         return project_run_response(run_id, events)
+
+    @app.post(
+        f"{route_prefix}/runs/{{run_id}}/resume",
+        response_model=RunResponse,
+    )
+    async def resume_run(run_id: str, payload: ResumeRunRequest) -> RunResponse:
+        try:
+            result = await registry.resume(run_id, payload.input)
+        except CheckpointNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (CheckpointClaimError, CheckpointConflictError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return await _run_result_response(result, event_store)
+
+    @app.post(
+        f"{route_prefix}/runs/{{run_id}}/confirm",
+        response_model=RunResponse,
+    )
+    async def confirm_run(run_id: str, payload: ConfirmRunRequest) -> RunResponse:
+        try:
+            result = await registry.confirm(
+                run_id,
+                ToolConfirmation(**payload.model_dump()),
+            )
+        except CheckpointNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (CheckpointClaimError, CheckpointConflictError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return await _run_result_response(result, event_store)
 
     @app.post(
         f"{route_prefix}/runs/{{run_id}}/cancel",
@@ -245,13 +339,19 @@ def _register_run_routes(
         handle = _find_handle(registry, run_id)
         if handle is None:
             await _persisted_events(event_store, run_id, kind="run")
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Run '{run_id}' is not owned by this server process "
-                    "and cannot be cancelled"
-                ),
-            )
+            try:
+                result = await registry.cancel_waiting(run_id)
+            except CheckpointNotFoundError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Run '{run_id}' is not owned by this server process "
+                        "and has no cancellable WAITING checkpoint"
+                    ),
+                ) from exc
+            except (CheckpointClaimError, CheckpointConflictError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return await _run_result_response(result, event_store)
         try:
             await handle.cancel()
         except RunNotCancellableError as exc:
@@ -477,7 +577,43 @@ async def _run_response(handle: RunHandle) -> RunResponse:
         text=result.text,
         error=result.error,
         artifacts=tuple(_artifact_response(artifact) for artifact in result.artifacts),
+        **_pending_response_argument(result),
     )
+
+
+async def _run_result_response(
+    result: RunResult,
+    event_store: EventStore | None,
+) -> RunResponse:
+    events = () if event_store is None else await event_store.list(result.run_id)
+    return RunResponse(
+        run_id=result.run_id,
+        status=result.status,
+        event_count=len(events),
+        output=result.output,
+        text=result.text,
+        error=result.error,
+        artifacts=tuple(_artifact_response(artifact) for artifact in result.artifacts),
+        **_pending_response_argument(result),
+    )
+
+
+def _pending_response_argument(
+    result: RunResult,
+) -> dict[str, PendingInputResponse]:
+    pending = result.pending_input
+    if pending is None:
+        return {}
+    return {
+        "pending_input": PendingInputResponse(
+            request_id=pending.request_id,
+            kind=pending.kind,
+            tool_call_id=pending.tool_call_id,
+            tool_name=pending.tool_name,
+            prompt=pending.prompt,
+            metadata=dict(pending.metadata),
+        )
+    }
 
 
 async def _flow_response(
@@ -507,9 +643,17 @@ async def _flow_response(
             artifacts=_flow_artifact_responses(failed_events),
         )
     events = await handle.events()
+    return _flow_result_response(handle.flow_run_id, result, events)
+
+
+def _flow_result_response(
+    flow_run_id: str,
+    result: Any,
+    events: tuple[Event, ...],
+) -> FlowResponse:
     if isinstance(result, PlannerReActResult):
         return FlowResponse(
-            flow_run_id=handle.flow_run_id,
+            flow_run_id=flow_run_id,
             plan_id=result.plan_id,
             status=result.status,
             event_count=len(events),
@@ -536,10 +680,11 @@ async def _flow_response(
             artifacts=tuple(
                 _artifact_response(artifact) for artifact in result.artifacts
             ),
+            **_flow_pending_response_arguments(result),
         )
     if isinstance(result, FlowResult):
         return FlowResponse(
-            flow_run_id=handle.flow_run_id,
+            flow_run_id=flow_run_id,
             status=result.status,
             event_count=len(events),
             output=result.output,
@@ -561,14 +706,33 @@ async def _flow_response(
                 )
                 for stage in (result.stage_attempts or result.stages)
             ),
+            **_flow_pending_response_arguments(result),
         )
     return FlowResponse(
-        flow_run_id=handle.flow_run_id,
+        flow_run_id=flow_run_id,
         status=result.status,
         event_count=len(events),
         output=getattr(result, "output", None),
         error=getattr(result, "error", None),
     )
+
+
+def _flow_pending_response_arguments(result: Any) -> dict[str, Any]:
+    pending = getattr(result, "pending_input", None)
+    child_run_id = getattr(result, "waiting_child_run_id", None)
+    values: dict[str, Any] = {}
+    if pending is not None:
+        values["pending_input"] = PendingInputResponse(
+            request_id=pending.request_id,
+            kind=pending.kind,
+            tool_call_id=pending.tool_call_id,
+            tool_name=pending.tool_name,
+            prompt=pending.prompt,
+            metadata=dict(pending.metadata),
+        )
+    if child_run_id is not None:
+        values["waiting_child_run_id"] = child_run_id
+    return values
 
 
 def _plan_id(events: tuple[Event, ...]) -> str | None:

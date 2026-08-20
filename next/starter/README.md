@@ -230,9 +230,10 @@ AGENT_EVENT_POLL_INTERVAL_SECONDS=0.1
 ```
 
 `AGENT_POSTGRES_SCHEMA` 是 PostgreSQL namespace，不是另一份配置文件。FastAPI 启动时会在该
-schema 中创建 `base_agent_event_sequences` 和 `base_agent_events`，关闭时释放 Starter 自己
-创建的连接池。DSN、schema 和轮询间隔由 Starter 读取，再把构造出的同一个 Store 实例注入
-普通 Agent、Planner、Executor 和 Flow。
+schema 中创建 `base_agent_event_sequences`、`base_agent_events` 和
+`base_agent_checkpoints`，关闭时释放 Starter 自己创建的连接池。DSN、schema 和轮询间隔由
+Starter 读取；EventStore 注入普通 Agent、Planner、Executor 和 Flow，共享同一 Engine 的
+CheckpointStore 注入所有 Agent。
 
 启动服务并分别提交普通 Run 和 Planner-ReAct Flow：
 
@@ -271,7 +272,9 @@ BASE_AGENT_NEXT_TEST_POSTGRES_DSN='postgresql://agent:password@127.0.0.1:5432/ag
 `RunRegistry` 和 `FlowRunRegistry` 仍是进程内执行所有者，但读路由在 Registry miss 时会从
 PostgreSQL Event 投影状态、输出、Plan、子 Run 和 Artifact。因此服务重启后，旧 ID 的状态、
 历史与终态 SSE 仍可访问；把 Run ID 用在 Flow 路由（或反过来）会返回 404。重启后的进程不能
-取消旧进程拥有的执行，接口会返回 409；若旧进程在执行中崩溃，也不会仅凭 Event 自动续跑。
+取消旧进程仍在运行且没有 checkpoint 的执行，接口会返回 409。处于 `run.waiting` 的普通 Agent
+可以凭 PostgreSQL checkpoint 在新进程继续或取消；运行中的 Tool 不会自动重放，父
+Planner-ReAct Flow 的调度位置也还没有跨进程 checkpoint。
 
 提交并查询 Run：
 
@@ -288,6 +291,60 @@ curl http://127.0.0.1:8000/v1/runs/<run_id>
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/runs/<run_id>/cancel
 ```
+
+### 手动测试 WAITING 与确认
+
+Starter FastAPI 显式使用 `AwaitHumanConfirmations`。用 OfflineProvider 请求需要确认的
+`save_value`：
+
+```bash
+curl http://127.0.0.1:8000/v1/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"tool=save_value calls=1 tool_args={\"value\":42}"}'
+```
+
+查询返回的 `run_id`，状态应为 `waiting`，并包含 `pending_input.request_id`：
+
+```bash
+curl http://127.0.0.1:8000/v1/runs/<run_id>
+```
+
+批准精确请求。`subject_id` 应由认证层提供；这里仅用于本地手测：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/runs/<run_id>/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_id":"<pending-request-id>",
+    "decision":"approve",
+    "subject_id":"manual-user",
+    "reason_code":"manual_test"
+  }'
+```
+
+拒绝时把 `decision` 改成 `reject`；Harness 会为原 ToolCall 生成
+`confirmation_denied` Tool result，再让模型完成回答。
+
+Starter 也显式启用了基础 `ask_user` Tool 和 `interaction:ask` 权限。真实 Provider 会根据
+Prompt 和 Tool 描述自行判断是否调用；下面的 OfflineProvider 语法用于确定性地触发同一链路：
+
+```bash
+curl http://127.0.0.1:8000/v1/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"tool=ask_user calls=1 tool_args={\"question\":\"Which region?\",\"metadata\":{\"field\":\"region\"}}"}'
+```
+
+取得返回的 `run_id` 后，查询结果应为 `waiting`，`pending_input.tool_name` 为 `ask_user`。
+把用户回答提交给原 Run：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/runs/<run_id>/resume \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"APAC"}'
+```
+
+`run.waiting` 是一次 SSE 边界；confirm/resume 后从它的 sequence 重新连接，即可观察
+`run.resumed` 到下一次 waiting 或终态。
 
 回放 sequence 大于 3 的历史 Event：
 
@@ -499,8 +556,9 @@ DIAGNOSTIC_TOOLKIT = Toolkit.of(
     slow_operation,
 )
 
-REGISTERED_TOOLS = (DIAGNOSTIC_TOOLKIT, save_value, browse)
-ENABLED_TOOLS = (DIAGNOSTIC_TOOLKIT, save_value)
+INTERACTION_TOOLS = interaction_tools()
+REGISTERED_TOOLS = (*INTERACTION_TOOLS, DIAGNOSTIC_TOOLKIT, save_value, browse)
+ENABLED_TOOLS = (*INTERACTION_TOOLS, DIAGNOSTIC_TOOLKIT, save_value)
 ENABLED_TOOL_NAMES = tuple(
     tool.spec.name for tool in flatten_tools(ENABLED_TOOLS)
 )

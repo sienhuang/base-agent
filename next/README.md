@@ -105,6 +105,77 @@ Harness、RunResult 和 RunHandle 共享同一个 `EventStore`，默认使用
 显式使用 `base_agent.events.postgres.PostgresEventStore`；它提供原子 sequence、游标回放和
 polling 实时订阅。完整契约和当前 HTTP Registry 边界见 [`EVENTS.md`](EVENTS.md)。
 
+## WAITING 与 checkpoint
+
+base-agent 提供标准 `ask_user` Tool。应用通过 `interaction_tools()` 注册它，并在 Definition
+中显式启用名称和 `interaction:ask` 权限；模型判断必要信息缺失时即可主动调用。底层 Tool
+返回类型化 `WaitForInput`，Harness 不阻塞线程，也不重新调用模型；它提交
+`input.requested`、`run.waiting` 和一个 JSON checkpoint，然后返回 `RunStatus.WAITING`：
+
+```python
+from base_agent import Agent, AgentDefinition, interaction_tools
+
+definition = AgentDefinition(
+    id="report-agent",
+    version="1.0.0",
+    instructions="缺少必要信息时调用 ask_user，不要猜测。",
+    tools=("ask_user",),
+    permissions=frozenset({"interaction:ask"}),
+)
+agent = Agent(definition, model=model, tools=interaction_tools())
+
+waiting = await agent.run("生成报告")
+completed = await agent.resume(waiting.run_id, "APAC")
+```
+
+`ask_user` 接收 `question` 和可选 JSON `metadata`。它不是保留名称：应用自定义 Tool 仍可直接
+返回 `WaitForInput`，复用完全相同的 checkpoint/resume 语义。模型返回普通文本问题不会触发
+WAITING，因此应用 Prompt 应明确要求：需要更多输入时必须调用 `ask_user`，用户回复仍不完整时
+再次调用，不能用普通最终消息追问。
+
+用户回复会成为原 `tool_call_id` 的 Tool result；同一批 ToolCall 中等待点之前的调用不会重跑，
+等待点之后的调用会按原顺序继续。checkpoint 保存原始 transcript、固定 MemorySnapshot、当前
+turn、Tool result、observation budget、Artifact grants 和同批剩余调用，但不保存数据库连接、
+Resource 实例或二进制 Artifact；恢复时 Resource 会重新获取。
+
+需要人工批准的 Tool 可以显式使用等待策略。默认仍为 fail-closed 的 `DenyConfirmations`，因此
+已有应用不会自动进入等待：
+
+```python
+from base_agent import (
+    AwaitHumanConfirmations,
+    ToolConfirmation,
+    ToolConfirmationDecision,
+)
+
+agent = Agent(
+    definition,
+    model=model,
+    tools=tools,
+    confirmation_policy=AwaitHumanConfirmations(),
+)
+waiting = await agent.run("发布报告")
+completed = await agent.confirm(
+    waiting.run_id,
+    ToolConfirmation(
+        request_id=waiting.pending_input.request_id,
+        decision=ToolConfirmationDecision.APPROVE,
+        subject_id="authenticated-user-42",
+        reason_code="report_reviewed",
+    ),
+)
+```
+
+确认必须匹配 checkpoint 中的精确 `request_id`。CheckpointStore 使用带过期时间的 lease 和
+fencing token；同一个等待 Run 只能被一个 continuation claim，过期 owner 不能覆盖新状态。
+默认 `InMemoryCheckpointStore` 用于测试；PostgreSQL 配置见 EVENTS.md。
+
+Sequential 和 Planner-ReAct Flow 会把子 Run 的等待传播为 `FlowStatus.WAITING`，并可用
+`flow.resume(...)` / `flow.confirm(...)` 继续。第一版父 Flow continuation 保存在执行进程中；
+Agent checkpoint 已可跨进程恢复，但服务重启后还不能通过父 `flow_run_id` 恢复 Flow 调度位置。
+此时仍可通过 `waiting_child_run_id` 恢复子 Agent，完整父 Flow 跨进程恢复需要后续持久化
+FlowCheckpoint/FlowRunStore。
+
 ## Planner–ReAct Flow
 
 Planner 和 Executor 都是普通 Agent，但必须声明各自的结构化输出。Planner 只返回 Host
@@ -193,9 +264,10 @@ handle = flow.start("Research the topic", stream=True)
 
 Planner 与 Executor 的 Memory scope 必须分别通过 `planner_memory_scope` 和
 `executor_memory_scope` 显式传入。Plan 是 Flow 领域状态，不会作为 Memory 或 Message
-隐式共享。`FlowRunHandle` 和执行 Task 仍然属于启动它的进程；HTTP 读取层可以通过共享
-EventStore 在 Registry miss 时恢复 Plan、终态和事件访问，但跨进程取消、崩溃续跑和工作分配
-仍需要共享 FlowRunStore/RunStore、owner lease 与 checkpoint。
+隐式共享。`FlowRunHandle` 和父 Flow continuation 仍然属于启动它的进程；HTTP 读取层可以通过
+共享 EventStore 在 Registry miss 时恢复 Plan、WAITING/终态和事件访问。Agent WAITING 已有
+持久化 checkpoint 和 lease；父 Flow 的跨进程续跑、跨进程取消和工作分配仍需要共享
+FlowRunStore/FlowCheckpoint 与 owner lease。
 
 ## ContextPolicy
 
@@ -373,11 +445,15 @@ app = AgentApplication(
 | --- | --- | --- |
 | `POST` | `/v1/runs` | 后台启动 Run，立即返回 `202`。 |
 | `GET` | `/v1/runs/{run_id}` | 返回 Run 当前状态或最终结果。 |
+| `POST` | `/v1/runs/{run_id}/resume` | 提交普通待输入并继续同一个 Run。 |
+| `POST` | `/v1/runs/{run_id}/confirm` | 提交绑定 request_id 的批准或拒绝决定。 |
 | `POST` | `/v1/runs/{run_id}/cancel` | 取消运行中的 Run；已完成 Run 返回 `409`。 |
 | `GET` | `/v1/runs/{run_id}/events` | 按 sequence 游标回放 Event JSON。 |
 | `GET` | `/v1/runs/{run_id}/events/stream` | 先回放、再通过 SSE 实时跟随。 |
 | `POST` | `/v1/flows/{flow_name}` | 后台启动已注册 Flow，立即返回 `202`。 |
 | `GET` | `/v1/flows/{flow_run_id}` | 返回 Flow 状态、Plan 和子 Run 关联。 |
+| `POST` | `/v1/flows/{flow_run_id}/resume` | 在原执行进程继续等待中的子 Run 和 Flow。 |
+| `POST` | `/v1/flows/{flow_run_id}/confirm` | 在原执行进程确认等待中的子 Tool。 |
 | `POST` | `/v1/flows/{flow_run_id}/cancel` | 取消 Flow 及当前活动子 Run。 |
 | `GET` | `/v1/flows/{flow_run_id}/events` | 回放 Flow Event 和可选的关联子 Run Event。 |
 | `GET` | `/v1/flows/{flow_run_id}/events/stream` | 通过 SSE 回放并跟随 Flow。 |
@@ -395,8 +471,9 @@ data: {"sequence":8,"kind":"run.succeeded","run_id":"...","turn":1,"payload":{..
 默认每 15 秒发送一次 SSE comment 心跳，Run/Flow 终态事件发出后流自然关闭。Run 与 Flow
 registry 仍只保存当前进程的活动 Handle；配置共享 EventStore 后，重启或请求落到另一 Worker
 时，状态、历史和 SSE 会从持久 Event 投影，不再因为 Registry miss 直接返回 404。只有拥有
-活动 Handle 的进程可以取消执行；崩溃检测、断点续跑、分布式执行所有权和自动保留期仍需要
-共享 RunStore/FlowRunStore 与 lease/checkpoint 机制。
+活动 Handle 的进程可以取消执行。Agent WAITING 可以由共享 CheckpointStore 跨进程继续；父
+Flow continuation、运行中崩溃检测、分布式执行所有权和自动保留期仍需要共享
+RunStore/FlowRunStore 与 Flow checkpoint 机制。
 
 Planner-ReAct 使用与普通 Agent 相同的 `message.created` 表示原始用户消息，并在成功时发送
 `message.completed`（payload 含最终 `content`），随后发送 `flow.succeeded` 关闭 SSE。启用

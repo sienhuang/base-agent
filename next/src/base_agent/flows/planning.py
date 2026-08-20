@@ -17,8 +17,9 @@ from base_agent.artifacts import Artifact
 from base_agent.events import EventEmitter, EventStore, InMemoryEventStore
 from base_agent.flows.handle import FlowRunHandle
 from base_agent.flows.models import FlowStatus
+from base_agent.governance import ToolConfirmation
 from base_agent.memory import MemoryScope
-from base_agent.models import Event, RunInvocation, RunResult, RunStatus
+from base_agent.models import Event, PendingInput, RunInvocation, RunResult, RunStatus
 from base_agent.observability import Observer
 from base_agent.run_handle import RunHandle, RunNotCancellableError
 
@@ -180,6 +181,8 @@ class PlannerReActResult:
     events: tuple[Event, ...]
     error: str | None = None
     artifacts: tuple[Artifact, ...] = ()
+    pending_input: PendingInput | None = None
+    waiting_child_run_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -226,9 +229,21 @@ class _FlowRunState:
     selected_artifacts: list[Artifact] = field(default_factory=list)
     active_child: _ActiveChild | None = None
     cancelled_child: _ActiveChild | None = None
+    started: bool = False
+    phase: Literal["create", "execute", "review"] = "create"
+    current_step_index: int | None = None
+    review_outcome: StepOutcome | None = None
+    review_executor_run_id: str | None = None
+    review_artifacts: tuple[Artifact, ...] = ()
+    waiting_active: _ActiveChild | None = None
+    waiting_run: RunResult | None = None
 
 
 class _FlowExecutionError(RuntimeError):
+    pass
+
+
+class _FlowWaiting(RuntimeError):
     pass
 
 
@@ -267,6 +282,8 @@ class PlannerReActFlow:
         self.event_store = event_store if event_store is not None else InMemoryEventStore()
         self.forward_child_events = forward_child_events
         self._observers = tuple(observers)
+        self._waiting_states: dict[str, _FlowRunState] = {}
+        self._waiting_lock = asyncio.Lock()
 
     async def run(
         self,
@@ -286,6 +303,62 @@ class PlannerReActFlow:
             stream=stream,
         )
         return await self._execute(state)
+
+    async def resume(self, flow_run_id: str, user_input: str) -> PlannerReActResult:
+        state = await self._claim_waiting_state(flow_run_id)
+        active = _require_waiting_active(state)
+        agent = self.planner if active.role is ChildRunRole.PLANNER else self.executor
+        async def forward_child_event(event: Event) -> None:
+            await self._forward_child_event(state, active, event)
+        try:
+            run = await agent.resume(
+                active.handle.run_id,
+                user_input,
+                on_event=(forward_child_event if self.forward_child_events else None),
+            )
+            self._replace_waiting_child(state, run)
+            await state.emitter.emit(
+                "flow.resumed",
+                plan_id=state.plan_id,
+                agent_run_id=run.run_id,
+                child_role=active.role.value,
+                phase=active.phase,
+                input_kind="tool_input",
+            )
+            return await self._execute(state, resumed_run=run)
+        except BaseException:
+            await self._restore_waiting_state(state)
+            raise
+
+    async def confirm(
+        self,
+        flow_run_id: str,
+        confirmation: ToolConfirmation,
+    ) -> PlannerReActResult:
+        state = await self._claim_waiting_state(flow_run_id)
+        active = _require_waiting_active(state)
+        agent = self.planner if active.role is ChildRunRole.PLANNER else self.executor
+        async def forward_child_event(event: Event) -> None:
+            await self._forward_child_event(state, active, event)
+        try:
+            run = await agent.confirm(
+                active.handle.run_id,
+                confirmation,
+                on_event=(forward_child_event if self.forward_child_events else None),
+            )
+            self._replace_waiting_child(state, run)
+            await state.emitter.emit(
+                "flow.resumed",
+                plan_id=state.plan_id,
+                agent_run_id=run.run_id,
+                child_role=active.role.value,
+                phase=active.phase,
+                input_kind="tool_confirmation",
+            )
+            return await self._execute(state, resumed_run=run)
+        except BaseException:
+            await self._restore_waiting_state(state)
+            raise
 
     def start(
         self,
@@ -342,64 +415,91 @@ class PlannerReActFlow:
             stream=stream,
         )
 
-    async def _execute(self, state: _FlowRunState) -> PlannerReActResult:
+    async def _execute(
+        self,
+        state: _FlowRunState,
+        *,
+        resumed_run: RunResult | None = None,
+    ) -> PlannerReActResult:
         try:
-            await state.emitter.emit(
-                "flow.started",
-                flow_id=self.id,
-                plan_id=state.plan_id,
-                planner_agent_id=self.planner.definition.id,
-                executor_agent_id=self.executor.definition.id,
-                stream=state.stream,
-            )
-            await state.emitter.emit(
-                "message.created",
-                message_id=state.user_message_id,
-                role="user",
-                content=state.prompt,
-                event_scope="flow",
-            )
-            decision, planner_run_id = await self._invoke_planner(
-                state,
-                phase="create",
-                prompt=_create_planner_prompt(state.prompt, self.executor),
-                source_revision=None,
-            )
-            if decision.action is PlannerAction.FAIL:
-                raise _FlowExecutionError(decision.reason)
-            if decision.action is not PlannerAction.CREATE:
-                raise _FlowExecutionError(
-                    f"initial Planner action must be 'create', got '{decision.action.value}'"
+            if not state.started:
+                await state.emitter.emit(
+                    "flow.started",
+                    flow_id=self.id,
+                    plan_id=state.plan_id,
+                    planner_agent_id=self.planner.definition.id,
+                    executor_agent_id=self.executor.definition.id,
+                    stream=state.stream,
                 )
-
-            state.plan = _create_plan(state.plan_id, decision, self.limits)
-            self._set_last_planner_target(state, state.plan.revision)
-            await state.emitter.emit(
-                "plan.created",
-                plan_id=state.plan.id,
-                plan_revision=state.plan.revision,
-                planner_run_id=planner_run_id,
-                plan=state.plan.model_dump(mode="json"),
-            )
-
+                await state.emitter.emit(
+                    "message.created",
+                    message_id=state.user_message_id,
+                    role="user",
+                    content=state.prompt,
+                    event_scope="flow",
+                )
+                state.started = True
             while True:
-                step_index = _next_pending_step_index(state.plan)
-                if step_index is None:
-                    raise _FlowExecutionError(
-                        "Plan has no pending Step but Planner has not completed the Flow"
+                if state.phase == "create":
+                    decision, planner_run_id = await self._invoke_planner(
+                        state,
+                        phase="create",
+                        prompt=_create_planner_prompt(state.prompt, self.executor),
+                        source_revision=None,
+                        resumed_run=resumed_run,
                     )
-                executed_count = sum(
-                    child.role is ChildRunRole.EXECUTOR for child in state.child_runs
-                )
-                if executed_count >= self.limits.max_steps:
-                    raise _FlowExecutionError(
-                        f"Flow exceeded max_steps={self.limits.max_steps}"
+                    resumed_run = None
+                    if decision.action is PlannerAction.FAIL:
+                        raise _FlowExecutionError(decision.reason)
+                    if decision.action is not PlannerAction.CREATE:
+                        raise _FlowExecutionError(
+                            "initial Planner action must be 'create', got "
+                            f"'{decision.action.value}'"
+                        )
+                    state.plan = _create_plan(state.plan_id, decision, self.limits)
+                    self._set_last_planner_target(state, state.plan.revision)
+                    await state.emitter.emit(
+                        "plan.created",
+                        plan_id=state.plan.id,
+                        plan_revision=state.plan.revision,
+                        planner_run_id=planner_run_id,
+                        plan=state.plan.model_dump(mode="json"),
                     )
+                    state.phase = "execute"
+                    continue
 
-                outcome, executor_run_id, selected_artifacts = await self._execute_step(
-                    state,
-                    step_index=step_index,
-                )
+                if state.phase == "execute":
+                    step_index = state.current_step_index
+                    if step_index is None:
+                        step_index = _next_pending_step_index(_require_plan(state))
+                        state.current_step_index = step_index
+                    if step_index is None:
+                        raise _FlowExecutionError(
+                            "Plan has no pending Step but Planner has not completed the Flow"
+                        )
+                    executed_count = sum(
+                        child.role is ChildRunRole.EXECUTOR for child in state.child_runs
+                    )
+                    if resumed_run is None and executed_count >= self.limits.max_steps:
+                        raise _FlowExecutionError(
+                            f"Flow exceeded max_steps={self.limits.max_steps}"
+                        )
+                    outcome, executor_run_id, selected_artifacts = await self._execute_step(
+                        state,
+                        step_index=step_index,
+                        resumed_run=resumed_run,
+                    )
+                    resumed_run = None
+                    state.review_outcome = outcome
+                    state.review_executor_run_id = executor_run_id
+                    state.review_artifacts = selected_artifacts
+                    state.phase = "review"
+                    continue
+
+                step_index = _require_step_index(state)
+                outcome = _require_review_outcome(state)
+                executor_run_id = _require_review_executor_run_id(state)
+                selected_artifacts = state.review_artifacts
                 decision, planner_run_id = await self._invoke_planner(
                     state,
                     phase="review",
@@ -411,7 +511,9 @@ class PlannerReActFlow:
                         selected_artifacts,
                     ),
                     source_revision=_require_plan(state).revision,
+                    resumed_run=resumed_run,
                 )
+                resumed_run = None
                 _validate_review_goal(_require_plan(state), decision)
                 await state.emitter.emit(
                     "plan.reviewed",
@@ -430,6 +532,8 @@ class PlannerReActFlow:
                             "Planner returned 'continue' but the Plan has no pending Step"
                         )
                     self._set_last_planner_target(state, _require_plan(state).revision)
+                    self._clear_review(state)
+                    state.phase = "execute"
                     continue
                 if decision.action is PlannerAction.REVISE:
                     source_revision = _require_plan(state).revision
@@ -443,6 +547,8 @@ class PlannerReActFlow:
                         planner_run_id=planner_run_id,
                         plan=state.plan.model_dump(mode="json"),
                     )
+                    self._clear_review(state)
+                    state.phase = "execute"
                     continue
                 if decision.action is PlannerAction.COMPLETE:
                     self._set_last_planner_target(state, _require_plan(state).revision)
@@ -479,6 +585,28 @@ class PlannerReActFlow:
                 raise _FlowExecutionError(
                     f"review Planner action cannot be '{decision.action.value}'"
                 )
+        except _FlowWaiting:
+            async with self._waiting_lock:
+                self._waiting_states[state.flow_run_id] = state
+            active = _require_waiting_active(state)
+            run = _require_waiting_run(state)
+            pending = run.pending_input
+            await state.emitter.emit(
+                "flow.waiting",
+                plan_id=state.plan_id,
+                child_role=active.role.value,
+                phase=active.phase,
+                agent_run_id=run.run_id,
+                step_id=active.step_id,
+                attempt=active.attempt,
+                request_id=(pending.request_id if pending is not None else None),
+                input_kind=(pending.kind.value if pending is not None else None),
+                prompt=(pending.prompt if pending is not None else None),
+                tool_name=(pending.tool_name if pending is not None else None),
+                tool_call_id=(pending.tool_call_id if pending is not None else None),
+                metadata=(dict(pending.metadata) if pending is not None else {}),
+            )
+            return await self._result(state, FlowStatus.WAITING)
         except asyncio.CancelledError:
             await self._cancel_active_child(state)
             raise
@@ -498,26 +626,30 @@ class PlannerReActFlow:
         prompt: str,
         source_revision: int | None,
         target_revision: int | None = None,
+        resumed_run: RunResult | None = None,
     ) -> tuple[PlannerDecision, str]:
-        active = self._start_child(
-            state,
-            agent=self.planner,
-            role=ChildRunRole.PLANNER,
-            phase=phase,
-            prompt=prompt,
-            memory_scope=state.planner_memory_scope,
-            source_revision=source_revision,
-            target_revision=target_revision,
-        )
-        await state.emitter.emit(
-            "planner.started",
-            phase=phase,
-            plan_id=state.plan_id,
-            source_plan_revision=source_revision,
-            target_plan_revision=target_revision,
-            agent_run_id=active.handle.run_id,
-        )
-        run = await self._wait_for_active_child(state)
+        if resumed_run is None:
+            active = self._start_child(
+                state,
+                agent=self.planner,
+                role=ChildRunRole.PLANNER,
+                phase=phase,
+                prompt=prompt,
+                memory_scope=state.planner_memory_scope,
+                source_revision=source_revision,
+                target_revision=target_revision,
+            )
+            await state.emitter.emit(
+                "planner.started",
+                phase=phase,
+                plan_id=state.plan_id,
+                source_plan_revision=source_revision,
+                target_plan_revision=target_revision,
+                agent_run_id=active.handle.run_id,
+            )
+            run = await self._wait_for_active_child(state)
+        else:
+            run = resumed_run
         if run.status is not RunStatus.SUCCEEDED:
             raise _FlowExecutionError(
                 f"Planner Run '{run.run_id}' ended with status '{run.status.value}': "
@@ -542,45 +674,50 @@ class PlannerReActFlow:
         state: _FlowRunState,
         *,
         step_index: int,
+        resumed_run: RunResult | None = None,
     ) -> tuple[StepOutcome, str, tuple[Artifact, ...]]:
         plan = _require_plan(state)
         step = plan.steps[step_index]
-        attempt = step.attempt_count + 1
-        active = self._start_child(
-            state,
-            agent=self.executor,
-            role=ChildRunRole.EXECUTOR,
-            phase="execute",
-            prompt=_executor_prompt(
-                state.prompt,
+        if resumed_run is None:
+            attempt = step.attempt_count + 1
+            active = self._start_child(
+                state,
+                agent=self.executor,
+                role=ChildRunRole.EXECUTOR,
+                phase="execute",
+                prompt=_executor_prompt(
+                    state.prompt,
+                    plan,
+                    step_index,
+                    state.selected_artifacts,
+                ),
+                memory_scope=state.executor_memory_scope,
+                source_revision=plan.revision,
+                step_id=step.id,
+                attempt=attempt,
+            )
+            state.plan = _replace_step(
                 plan,
                 step_index,
-                state.selected_artifacts,
-            ),
-            memory_scope=state.executor_memory_scope,
-            source_revision=plan.revision,
-            step_id=step.id,
-            attempt=attempt,
-        )
-        state.plan = _replace_step(
-            plan,
-            step_index,
-            step.model_copy(
-                update={
-                    "status": PlanStepStatus.RUNNING,
-                    "attempt_count": attempt,
-                }
-            ),
-        )
-        await state.emitter.emit(
-            "step.started",
-            plan_id=plan.id,
-            plan_revision=plan.revision,
-            step_id=step.id,
-            attempt=attempt,
-            agent_run_id=active.handle.run_id,
-        )
-        run = await self._wait_for_active_child(state)
+                step.model_copy(
+                    update={
+                        "status": PlanStepStatus.RUNNING,
+                        "attempt_count": attempt,
+                    }
+                ),
+            )
+            await state.emitter.emit(
+                "step.started",
+                plan_id=plan.id,
+                plan_revision=plan.revision,
+                step_id=step.id,
+                attempt=attempt,
+                agent_run_id=active.handle.run_id,
+            )
+            run = await self._wait_for_active_child(state)
+        else:
+            attempt = step.attempt_count
+            run = resumed_run
         if run.status is not RunStatus.SUCCEEDED:
             state.plan = _replace_step_status(
                 _require_plan(state),
@@ -711,30 +848,18 @@ class PlannerReActFlow:
                 f"Flow exceeded max_child_runs={self.limits.max_child_runs}"
             )
         async def forward_child_event(event: Event) -> None:
-            if event.kind in _UNFORWARDED_CHILD_EVENT_KINDS:
-                return
-            payload = dict(event.payload)
-            payload.update(
-                {
-                    "event_scope": "child_run",
-                    "flow_run_id": state.flow_run_id,
-                    "plan_id": state.plan_id,
-                    "agent_run_id": event.run_id,
-                    "child_role": role.value,
-                    "flow_phase": phase,
-                    "source_plan_revision": source_revision,
-                    "target_plan_revision": target_revision,
-                    "step_id": step_id,
-                    "attempt": attempt,
-                    "child_sequence": event.sequence,
-                    "child_kind": event.kind,
-                }
+            active_event = _ActiveChild(
+                role=role,
+                phase=phase,
+                handle=handle,
+                flow_run_id=state.flow_run_id,
+                plan_id=state.plan_id,
+                source_plan_revision=source_revision,
+                target_plan_revision=target_revision,
+                step_id=step_id,
+                attempt=attempt,
             )
-            await state.emitter.emit(
-                _forwarded_child_kind(event.kind),
-                turn=event.turn,
-                **payload,
-            )
+            await self._forward_child_event(state, active_event, event)
 
         handle = agent.start(
             prompt,
@@ -766,6 +891,37 @@ class PlannerReActFlow:
         state.active_child = active
         return active
 
+    async def _forward_child_event(
+        self,
+        state: _FlowRunState,
+        active: _ActiveChild,
+        event: Event,
+    ) -> None:
+        if event.kind in _UNFORWARDED_CHILD_EVENT_KINDS:
+            return
+        payload = dict(event.payload)
+        payload.update(
+            {
+                "event_scope": "child_run",
+                "flow_run_id": state.flow_run_id,
+                "plan_id": state.plan_id,
+                "agent_run_id": event.run_id,
+                "child_role": active.role.value,
+                "flow_phase": active.phase,
+                "source_plan_revision": active.source_plan_revision,
+                "target_plan_revision": active.target_plan_revision,
+                "step_id": active.step_id,
+                "attempt": active.attempt,
+                "child_sequence": event.sequence,
+                "child_kind": event.kind,
+            }
+        )
+        await state.emitter.emit(
+            _forwarded_child_kind(event.kind),
+            turn=event.turn,
+            **payload,
+        )
+
     def _child_artifact_ids(
         self,
         state: _FlowRunState,
@@ -784,7 +940,39 @@ class PlannerReActFlow:
         run = await active.handle.wait()
         state.child_runs.append(active.finish(run))
         state.active_child = None
+        if run.status is RunStatus.WAITING:
+            state.waiting_active = active
+            state.waiting_run = run
+            raise _FlowWaiting
         return run
+
+    async def _claim_waiting_state(self, flow_run_id: str) -> _FlowRunState:
+        async with self._waiting_lock:
+            try:
+                return self._waiting_states.pop(flow_run_id)
+            except KeyError as exc:
+                raise ValueError(
+                    f"Flow Run '{flow_run_id}' is not waiting in this process"
+                ) from exc
+
+    async def _restore_waiting_state(self, state: _FlowRunState) -> None:
+        async with self._waiting_lock:
+            self._waiting_states[state.flow_run_id] = state
+
+    def _replace_waiting_child(self, state: _FlowRunState, run: RunResult) -> None:
+        active = _require_waiting_active(state)
+        if not state.child_runs or state.child_runs[-1].agent_run_id != run.run_id:
+            raise RuntimeError("waiting child Run history is inconsistent")
+        state.child_runs[-1] = active.finish(run)
+        state.waiting_active = None
+        state.waiting_run = None
+
+    @staticmethod
+    def _clear_review(state: _FlowRunState) -> None:
+        state.current_step_index = None
+        state.review_outcome = None
+        state.review_executor_run_id = None
+        state.review_artifacts = ()
 
     async def _cancel_active_child(self, state: _FlowRunState) -> None:
         active = state.active_child
@@ -843,6 +1031,26 @@ class PlannerReActFlow:
         return await self._result(state, FlowStatus.FAILED)
 
     async def _cancelled_result(self, state: _FlowRunState) -> PlannerReActResult:
+        if state.waiting_active is not None and state.waiting_run is not None:
+            active_wait = state.waiting_active
+            agent = (
+                self.planner
+                if active_wait.role is ChildRunRole.PLANNER
+                else self.executor
+            )
+            run = await agent.cancel(state.waiting_run.run_id)
+            self._replace_waiting_child(state, run)
+            state.cancelled_child = active_wait
+            if active_wait.role is ChildRunRole.EXECUTOR and state.plan is not None:
+                step_index = _step_index(state.plan, active_wait.step_id)
+                if step_index is not None:
+                    state.plan = _replace_step_status(
+                        state.plan,
+                        step_index,
+                        PlanStepStatus.CANCELLED,
+                    )
+            async with self._waiting_lock:
+                self._waiting_states.pop(state.flow_run_id, None)
         if state.plan is not None:
             state.plan = state.plan.model_copy(update={"status": PlanStatus.CANCELLED})
         active = state.cancelled_child
@@ -892,6 +1100,12 @@ class PlannerReActFlow:
             events=await state.emitter.events(),
             error=state.error,
             artifacts=_unique_artifacts(state.selected_artifacts),
+            pending_input=(
+                state.waiting_run.pending_input if state.waiting_run is not None else None
+            ),
+            waiting_child_run_id=(
+                state.waiting_run.run_id if state.waiting_run is not None else None
+            ),
         )
 
 
@@ -909,6 +1123,36 @@ def _planning_child_runs(state: _FlowRunState) -> tuple[dict[str, object], ...]:
         }
         for child in state.child_runs
     )
+
+
+def _require_waiting_active(state: _FlowRunState) -> _ActiveChild:
+    if state.waiting_active is None:
+        raise RuntimeError("waiting Planner/ReAct Flow has no active child")
+    return state.waiting_active
+
+
+def _require_waiting_run(state: _FlowRunState) -> RunResult:
+    if state.waiting_run is None:
+        raise RuntimeError("waiting Planner/ReAct Flow has no child Run")
+    return state.waiting_run
+
+
+def _require_step_index(state: _FlowRunState) -> int:
+    if state.current_step_index is None:
+        raise RuntimeError("Planner/ReAct review has no Step index")
+    return state.current_step_index
+
+
+def _require_review_outcome(state: _FlowRunState) -> StepOutcome:
+    if state.review_outcome is None:
+        raise RuntimeError("Planner/ReAct review has no Step outcome")
+    return state.review_outcome
+
+
+def _require_review_executor_run_id(state: _FlowRunState) -> str:
+    if state.review_executor_run_id is None:
+        raise RuntimeError("Planner/ReAct review has no Executor Run")
+    return state.review_executor_run_id
 
 
 def _unique_artifacts(artifacts: Sequence[Artifact]) -> tuple[Artifact, ...]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from base_agent import CheckpointStore, InMemoryCheckpointStore
 from base_agent.events import EventStore, InMemoryEventStore
 
 from agent_app.config import Settings
@@ -12,6 +13,7 @@ from agent_app.config import Settings
 @dataclass(frozen=True, slots=True)
 class EventStoreRuntime:
     store: EventStore
+    checkpoints: CheckpointStore
 
     async def start(self) -> None:
         create_schema = getattr(self.store, "create_schema", None)
@@ -27,21 +29,23 @@ class EventStoreRuntime:
 def build_event_store_runtime(settings: Settings) -> EventStoreRuntime:
     """Build the configured Store without hiding infrastructure ownership."""
     if settings.event_store == "memory":
-        return EventStoreRuntime(InMemoryEventStore())
+        return EventStoreRuntime(InMemoryEventStore(), InMemoryCheckpointStore())
     if settings.postgres_dsn is None:
         raise ValueError(
             "AGENT_POSTGRES_DSN is required when AGENT_EVENT_STORE=postgres"
         )
     try:
-        from base_agent.events.postgres import PostgresEventStore
+        from base_agent.events.postgres import PostgresCheckpointStore, PostgresEventStore
     except ImportError as exc:
         raise ImportError(
             "PostgreSQL EventStore requires the Starter 'postgres' extra"
         ) from exc
+    event_store = PostgresEventStore.from_url(
+        settings.postgres_dsn,
+        schema=settings.postgres_schema,
+        poll_interval=settings.event_poll_interval_seconds,
+    )
     return EventStoreRuntime(
-        PostgresEventStore.from_url(
-            settings.postgres_dsn,
-            schema=settings.postgres_schema,
-            poll_interval=settings.event_poll_interval_seconds,
-        )
+        event_store,
+        PostgresCheckpointStore.from_event_store(event_store),
     )

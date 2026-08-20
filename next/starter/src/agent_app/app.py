@@ -7,6 +7,7 @@ from base_agent import (
     Agent,
     AgentDefinition,
     ArtifactStore,
+    CheckpointStore,
     RunResult,
 )
 from base_agent.events import EventStore
@@ -41,6 +42,7 @@ ENABLED_SKILL_NAMES = (
 ENABLED_PERMISSIONS = frozenset(
     {
         "skills:scripts:execute",
+        "interaction:ask",
         "values:record",
         "values:write",
     }
@@ -84,6 +86,7 @@ def build_agent(
     observers: Sequence[Observer] = (),
     artifact_store: ArtifactStore | None = None,
     event_store: EventStore | None = None,
+    checkpoint_store: CheckpointStore | None = None,
 ) -> Agent:
     """Compose application Prompt and Provider with the SDK Agent facade."""
     return Agent(
@@ -95,6 +98,7 @@ def build_agent(
         observers=observers,
         artifact_store=artifact_store,
         event_store=event_store,
+        checkpoint_store=checkpoint_store,
     )
 
 
@@ -110,6 +114,7 @@ def build_plan_react_flow(
     observers: Sequence[Observer] = (),
     artifact_store: ArtifactStore,
     event_store: EventStore | None = None,
+    checkpoint_store: CheckpointStore | None = None,
 ) -> PlannerReActFlow:
     """Compose Planner and Executor Agents with independently selectable Providers."""
     provider = model or OfflineProvider()
@@ -128,6 +133,7 @@ def build_plan_react_flow(
         model=planner_provider or provider,
         artifact_store=artifact_store,
         event_store=event_store,
+        checkpoint_store=checkpoint_store,
     )
     executor = build_agent(
         executor_provider or provider,
@@ -135,6 +141,7 @@ def build_plan_react_flow(
         confirmation_policy=confirmation_policy,
         artifact_store=artifact_store,
         event_store=event_store,
+        checkpoint_store=checkpoint_store,
     )
     return Flow.planner_react(
         id="starter-plan-react",
@@ -157,6 +164,7 @@ async def run(
     on_event: Observer | None = None,
     artifact_store: ArtifactStore | None = None,
     event_store: EventStore | None = None,
+    checkpoint_store: CheckpointStore | None = None,
 ) -> RunResult:
     agent = build_agent(
         model,
@@ -164,6 +172,7 @@ async def run(
         confirmation_policy=confirmation_policy,
         artifact_store=artifact_store,
         event_store=event_store,
+        checkpoint_store=checkpoint_store,
     )
     if stream:
         if on_event is None:
@@ -186,6 +195,7 @@ async def run_plan_react(
     on_event: Observer | None = None,
     artifact_store: ArtifactStore,
     event_store: EventStore | None = None,
+    checkpoint_store: CheckpointStore | None = None,
 ) -> PlannerReActResult:
     """Run the Starter's fixed Planner/ReAct composition to completion."""
     observers = () if on_event is None else (on_event,)
@@ -200,5 +210,6 @@ async def run_plan_react(
         observers=observers,
         artifact_store=artifact_store,
         event_store=event_store,
+        checkpoint_store=checkpoint_store,
     )
     return await flow.run(prompt_text, stream=stream)

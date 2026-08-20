@@ -3,10 +3,11 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from base_agent.flows import FlowStatus
-from base_agent.models import RunStatus
+from base_agent.governance import ToolConfirmationDecision
+from base_agent.models import PendingInputKind, RunStatus
 
 
 class StartRunRequest(BaseModel):
@@ -28,6 +29,39 @@ class StartRunResponse(BaseModel):
 
     run_id: str
     status: RunStatus
+
+
+class ResumeRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input: str
+
+    @field_validator("input")
+    @classmethod
+    def input_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("input must not be blank")
+        return value
+
+
+class ConfirmRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    decision: ToolConfirmationDecision
+    subject_id: str
+    reason_code: str
+
+
+class PendingInputResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    kind: PendingInputKind
+    tool_call_id: str
+    tool_name: str
+    prompt: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ArtifactResponse(BaseModel):
@@ -61,6 +95,10 @@ class RunResponse(BaseModel):
     text: str | None = None
     error: str | None = None
     artifacts: tuple[ArtifactResponse, ...] = ()
+    pending_input: PendingInputResponse | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class EventResponse(BaseModel):
@@ -121,3 +159,11 @@ class FlowResponse(BaseModel):
     plan: dict[str, Any] | None = None
     child_runs: tuple[FlowChildRunResponse, ...] = ()
     artifacts: tuple[ArtifactResponse, ...] = ()
+    pending_input: PendingInputResponse | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    waiting_child_run_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )

@@ -13,23 +13,26 @@ from base_agent.server.schemas import (
     ArtifactRefResponse,
     FlowChildRunResponse,
     FlowResponse,
+    PendingInputResponse,
     RunResponse,
 )
 
 ExecutionKind = Literal["run", "flow"]
 
 _RUN_ROOT_KINDS = frozenset(
-    {"run.started", "run.succeeded", "run.failed", "run.cancelled"}
+    {"run.started", "run.waiting", "run.succeeded", "run.failed", "run.cancelled"}
 )
 _FLOW_ROOT_KINDS = frozenset(
-    {"flow.started", "flow.succeeded", "flow.failed", "flow.cancelled"}
+    {"flow.started", "flow.waiting", "flow.succeeded", "flow.failed", "flow.cancelled"}
 )
 _RUN_TERMINAL_STATUSES = {
+    "run.waiting": RunStatus.WAITING,
     "run.succeeded": RunStatus.SUCCEEDED,
     "run.failed": RunStatus.FAILED,
     "run.cancelled": RunStatus.CANCELLED,
 }
 _FLOW_TERMINAL_STATUSES = {
+    "flow.waiting": FlowStatus.WAITING,
     "flow.succeeded": FlowStatus.SUCCEEDED,
     "flow.failed": FlowStatus.FAILED,
     "flow.cancelled": FlowStatus.CANCELLED,
@@ -52,7 +55,7 @@ def project_run_response(run_id: str, events: tuple[Event, ...]) -> RunResponse:
         if completed is not None
         else None
     )
-    if status is RunStatus.RUNNING:
+    if status in {RunStatus.RUNNING, RunStatus.WAITING}:
         output: Any | None = None
         text: str | None = None
         error = None
@@ -66,6 +69,7 @@ def project_run_response(run_id: str, events: tuple[Event, ...]) -> RunResponse:
         output = None
         text = _optional_string(terminal.payload.get("text")) or ""
         error = _terminal_error(terminal)
+    pending = _pending_input_response(events) if status is RunStatus.WAITING else None
     return RunResponse(
         run_id=run_id,
         status=status,
@@ -74,6 +78,23 @@ def project_run_response(run_id: str, events: tuple[Event, ...]) -> RunResponse:
         text=text,
         error=error,
         artifacts=_artifact_responses(events),
+        **({"pending_input": pending} if pending is not None else {}),
+    )
+
+
+def _pending_input_response(events: tuple[Event, ...]) -> PendingInputResponse | None:
+    requested = _last_event(events, "input.requested")
+    if requested is None:
+        return None
+    return PendingInputResponse.model_validate(
+        {
+            "request_id": requested.payload.get("request_id"),
+            "kind": requested.payload.get("input_kind"),
+            "tool_call_id": requested.payload.get("tool_call_id"),
+            "tool_name": requested.payload.get("tool_name"),
+            "prompt": requested.payload.get("prompt"),
+            "metadata": requested.payload.get("metadata", {}),
+        }
     )
 
 
@@ -91,6 +112,12 @@ def project_flow_response(
         else None
     )
     plan = _flow_plan(events, terminal, status)
+    pending = _flow_pending_input(terminal) if status is FlowStatus.WAITING else None
+    waiting_child = (
+        _optional_string(terminal.payload.get("agent_run_id"))
+        if status is FlowStatus.WAITING
+        else None
+    )
     return FlowResponse(
         flow_run_id=flow_run_id,
         plan_id=_plan_id(events),
@@ -101,6 +128,23 @@ def project_flow_response(
         plan=plan,
         child_runs=_flow_child_runs(events, terminal),
         artifacts=_flow_artifact_responses(events),
+        pending_input=pending,
+        waiting_child_run_id=waiting_child,
+    )
+
+
+def _flow_pending_input(event: Event) -> PendingInputResponse | None:
+    if event.payload.get("request_id") is None:
+        return None
+    return PendingInputResponse.model_validate(
+        {
+            "request_id": event.payload.get("request_id"),
+            "kind": event.payload.get("input_kind"),
+            "tool_call_id": event.payload.get("tool_call_id"),
+            "tool_name": event.payload.get("tool_name"),
+            "prompt": event.payload.get("prompt"),
+            "metadata": event.payload.get("metadata", {}),
+        }
     )
 
 
@@ -157,6 +201,7 @@ def _flow_plan(
         return None
     plan["status"] = {
         FlowStatus.RUNNING: "running",
+        FlowStatus.WAITING: "running",
         FlowStatus.SUCCEEDED: "succeeded",
         FlowStatus.FAILED: "failed",
         FlowStatus.CANCELLED: "cancelled",
