@@ -7,7 +7,8 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from base_agent.events.postgres import PostgresEventStore
+from base_agent.events.postgres import PostgresEventStore, PostgresRunStore
+from base_agent.models import RunStatus
 from sqlalchemy.schema import DropSchema
 
 from agent_app import asgi
@@ -120,11 +121,15 @@ async def test_fastapi_persists_agent_flow_and_child_events_across_store_reopen(
         schema=schema,
         poll_interval=0.01,
     )
+    reopened_runs = PostgresRunStore.from_event_store(reopened)
     try:
         replayed_run = await reopened.list(run_id)
         replayed_flow = await reopened.list(flow_run_id)
+        run_record = await reopened_runs.get(run_id)
 
         assert replayed_run[-1].kind == "run.succeeded"
+        assert run_record.status is RunStatus.SUCCEEDED
+        assert run_record.output == run["output"]
         assert replayed_flow[-1].kind == "flow.succeeded"
         assert len(replayed_run) == len(run_history.json())
         assert len(replayed_flow) == len(flow_history.json())

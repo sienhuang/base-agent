@@ -60,6 +60,17 @@ from base_agent.resources import (
     ResourceSpec,
 )
 from base_agent.run_handle import RunHandle
+from base_agent.run_store import (
+    AgentRunRecord,
+    InMemoryRunStore,
+    RunLease,
+    RunLeaseConflictError,
+    RunLeaseLostError,
+    RunRecordAlreadyExistsError,
+    RunRecordNotFoundError,
+    RunStore,
+    RunTransitionError,
+)
 from base_agent.skills import Skill, SkillCatalog, SkillDescriptor, SkillPackage
 from base_agent.toolkits import interaction_tools
 from base_agent.tools import ToolContext, Toolkit, ToolReadiness, tool
@@ -68,6 +79,7 @@ from base_agent.verification import VerificationEvidence
 __all__ = [
     "Agent",
     "AgentDefinition",
+    "AgentRunRecord",
     "AwaitHumanConfirmations",
     "Artifact",
     "ArtifactBinding",
@@ -88,6 +100,7 @@ __all__ = [
     "FlowStatus",
     "InMemoryArtifactStore",
     "InMemoryCheckpointStore",
+    "InMemoryRunStore",
     "interaction_tools",
     "LocalArtifactStore",
     "PlannerDecision",
@@ -99,7 +112,14 @@ __all__ = [
     "RunResult",
     "RunFailure",
     "RunHandle",
+    "RunLease",
+    "RunLeaseConflictError",
+    "RunLeaseLostError",
+    "RunRecordAlreadyExistsError",
+    "RunRecordNotFoundError",
+    "RunStore",
     "RunStatus",
+    "RunTransitionError",
     "RuntimeCheckpoint",
     "ResourceContext",
     "ResourceManager",

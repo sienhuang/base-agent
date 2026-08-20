@@ -10,6 +10,7 @@ from fastapi import FastAPI
 
 from base_agent.agent import Agent
 from base_agent.events import EventStore
+from base_agent.run_store import RunStore
 from base_agent.server.app import create_http_app
 from base_agent.server.registry import RegisteredFlow
 
@@ -29,6 +30,10 @@ class AgentApplication:
         preflight: Sequence[Preflight] = (),
         shutdown: Sequence[Shutdown] = (),
         event_store: EventStore | None = None,
+        run_store: RunStore | None = None,
+        run_lease_seconds: float = 30.0,
+        run_heartbeat_interval_seconds: float | None = None,
+        runtime_build_id: str | None = None,
         title: str = "base-agent Application",
         prefix: str = "/v1",
         sse_ping_seconds: int = 15,
@@ -41,6 +46,10 @@ class AgentApplication:
         self.preflight = tuple(preflight)
         self.shutdown = tuple(shutdown)
         self.event_store = event_store
+        self.run_store = run_store
+        self.run_lease_seconds = run_lease_seconds
+        self.run_heartbeat_interval_seconds = run_heartbeat_interval_seconds
+        self.runtime_build_id = runtime_build_id
         self.title = title
         self.prefix = prefix
         self.sse_ping_seconds = sse_ping_seconds
@@ -70,4 +79,8 @@ class AgentApplication:
             flows=self.flows,
             lifespan=lifespan,
             event_store=self.event_store,
+            run_store=self.run_store,
+            run_lease_seconds=self.run_lease_seconds,
+            run_heartbeat_interval_seconds=self.run_heartbeat_interval_seconds,
+            runtime_build_id=self.runtime_build_id,
         )

@@ -19,9 +19,11 @@ from base_agent.events.postgres import (
     EventPayloadSerializationError,
     PostgresCheckpointStore,
     PostgresEventStore,
+    PostgresRunStore,
     build_postgres_event_tables,
 )
-from base_agent.models import ModelResponse, ToolCall
+from base_agent.models import ModelResponse, RunStatus, ToolCall
+from base_agent.run_store import AgentRunRecord, RunLeaseConflictError
 from base_agent.testing import FakeModel
 
 POSTGRES_DSN = os.getenv("BASE_AGENT_NEXT_TEST_POSTGRES_DSN")
@@ -38,6 +40,7 @@ def test_postgres_event_schema_and_configuration_are_validated() -> None:
     assert tables.sequences.name == "base_agent_event_sequences"
     assert tables.events.name == "base_agent_events"
     assert tables.checkpoints.name == "base_agent_checkpoints"
+    assert tables.runs.name == "base_agent_runs"
     assert {column.name for column in tables.events.primary_key} == {
         "run_id",
         "sequence",
@@ -98,6 +101,54 @@ async def test_postgres_checkpoint_resumes_after_adapter_recreation() -> None:
                 await reopened_checkpoints.load(waiting.run_id)
         finally:
             await reopened_events.close()
+    finally:
+        async with events.engine.begin() as connection:
+            await connection.execute(DropSchema(schema, cascade=True, if_exists=True))
+        await events.close()
+
+
+@requires_postgres
+async def test_postgres_run_store_persists_and_blocks_expired_owner() -> None:
+    assert POSTGRES_DSN is not None
+    schema = f"base_agent_next_{uuid4().hex}"
+    events = PostgresEventStore.from_url(POSTGRES_DSN, schema=schema)
+    runs = PostgresRunStore.from_event_store(events)
+    await events.create_schema()
+    try:
+        created = await runs.create(
+            AgentRunRecord(
+                run_id="durable-run",
+                agent_id="postgres-agent",
+                agent_version="1.0.0",
+                snapshot_fingerprint="snapshot-a",
+                runtime_build_id="build-a",
+            )
+        )
+        lease = await runs.claim(
+            created.run_id,
+            owner_id="worker-a",
+            lease_seconds=0.05,
+        )
+
+        reopened = PostgresRunStore.from_url(POSTGRES_DSN, schema=schema)
+        try:
+            running = await reopened.get(created.run_id)
+            assert running.status is RunStatus.RUNNING
+            assert running.lease_token == lease.token
+            with pytest.raises(RunLeaseConflictError):
+                await reopened.claim(
+                    created.run_id,
+                    owner_id="worker-b",
+                    lease_seconds=30,
+                )
+
+            await asyncio.sleep(0.06)
+            blocked = await reopened.block_expired()
+            assert [record.run_id for record in blocked] == [created.run_id]
+            assert (await runs.get(created.run_id)).status is RunStatus.BLOCKED
+            assert await runs.block_expired() == ()
+        finally:
+            await reopened.close()
     finally:
         async with events.engine.begin() as connection:
             await connection.execute(DropSchema(schema, cascade=True, if_exists=True))

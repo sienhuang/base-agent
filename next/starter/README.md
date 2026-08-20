@@ -227,13 +227,22 @@ AGENT_EVENT_STORE=postgres
 AGENT_POSTGRES_DSN=postgresql://agent:password@127.0.0.1:5432/agent
 AGENT_POSTGRES_SCHEMA=base_agent
 AGENT_EVENT_POLL_INTERVAL_SECONDS=0.1
+AGENT_RUN_LEASE_SECONDS=30
+AGENT_RUN_HEARTBEAT_SECONDS=10
+AGENT_RUNTIME_BUILD_ID=release-2026-08-20
 ```
 
 `AGENT_POSTGRES_SCHEMA` 是 PostgreSQL namespace，不是另一份配置文件。FastAPI 启动时会在该
-schema 中创建 `base_agent_event_sequences`、`base_agent_events` 和
-`base_agent_checkpoints`，关闭时释放 Starter 自己创建的连接池。DSN、schema 和轮询间隔由
-Starter 读取；EventStore 注入普通 Agent、Planner、Executor 和 Flow，共享同一 Engine 的
-CheckpointStore 注入所有 Agent。
+schema 中创建 `base_agent_event_sequences`、`base_agent_events`、
+`base_agent_checkpoints` 和 `base_agent_runs`，关闭时释放 Starter 自己创建的连接池。DSN、schema
+和轮询间隔由 Starter 读取；EventStore 注入普通 Agent、Planner、Executor 和 Flow，共享同一
+Engine 的 CheckpointStore 注入所有 Agent，RunStore 则作为顶层普通 Agent Run 的状态权威。
+
+`AGENT_RUN_LEASE_SECONDS` 是本地 Executor 对 `RUNNING` Run 的所有权期限，
+`AGENT_RUN_HEARTBEAT_SECONDS` 必须更短。每次心跳都用 lease token 做 fencing；服务故障后，超过
+租约的 `RUNNING` 会在下次启动或访问时转成 `BLOCKED` 并产生 `run.blocked` Event，第一版不会自动
+重放模型或 Tool。`AGENT_RUNTIME_BUILD_ID` 建议填写镜像 digest、Git SHA 或发布号；未填写时使用
+Agent snapshot fingerprint。RunRecord 同时保存两者，但当前等待恢复仍要求 snapshot 完全一致。
 
 启动服务并分别提交普通 Run 和 Planner-ReAct Flow：
 
@@ -257,6 +266,11 @@ SELECT sequence, kind, turn, payload
 FROM base_agent.base_agent_events
 WHERE run_id = '<run_id-or-flow_run_id>'
 ORDER BY sequence;
+
+SELECT run_id, status, revision, lease_owner, lease_expires_at,
+       runtime_build_id, snapshot_fingerprint, updated_at
+FROM base_agent.base_agent_runs
+WHERE run_id = '<agent-run-id>';
 ```
 
 也可以运行真实 PostgreSQL 集成测试。测试会经 FastAPI 创建一个普通 Run 和一个
@@ -269,12 +283,16 @@ BASE_AGENT_NEXT_TEST_POSTGRES_DSN='postgresql://agent:password@127.0.0.1:5432/ag
   pytest tests/test_postgres_events.py -q
 ```
 
-`RunRegistry` 和 `FlowRunRegistry` 仍是进程内执行所有者，但读路由在 Registry miss 时会从
-PostgreSQL Event 投影状态、输出、Plan、子 Run 和 Artifact。因此服务重启后，旧 ID 的状态、
-历史与终态 SSE 仍可访问；把 Run ID 用在 Flow 路由（或反过来）会返回 404。重启后的进程不能
-取消旧进程仍在运行且没有 checkpoint 的执行，接口会返回 409。处于 `run.waiting` 的普通 Agent
-可以凭 PostgreSQL checkpoint 在新进程继续或取消；运行中的 Tool 不会自动重放，父
-Planner-ReAct Flow 的调度位置也还没有跨进程 checkpoint。
+`RunRegistry` 仍只保留当前进程的 Handle，但普通 Agent Run 的状态、取消请求、所有者和结果由
+PostgreSQL RunStore 管理；EventStore 负责历史与 SSE。服务重启后，已完成和 `WAITING` 的普通 Run
+可以直接查询，`WAITING` 可凭 PostgreSQL checkpoint 在新进程继续或取消。故障时遗留的
+`RUNNING` 在租约到期后变为 `BLOCKED`，由人工检查副作用后决定后续操作，不会自动拉起。部署前
+创建、只有 Event/checkpoint 的旧版 `WAITING` Run 会在首次访问时自动补建 RunRecord。
+
+FlowRunRegistry 仍是进程内执行所有者，Flow 读路由继续用 Event 投影恢复 Plan、子 Run 和
+Artifact。把 Run ID 用在 Flow 路由（或反过来）会返回 404。父 Planner-ReAct Flow 的调度位置
+尚未写入独立 FlowRunStore，因此这一版只解决顶层普通 Agent Run；Flow 的跨进程执行恢复仍是
+下一阶段工作。
 
 提交并查询 Run：
 

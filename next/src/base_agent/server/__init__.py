@@ -2,6 +2,7 @@
 
 from base_agent.server.app import create_http_app
 from base_agent.server.application import AgentApplication, Preflight, Shutdown
+from base_agent.server.executor import LocalRunExecutor
 from base_agent.server.registry import (
     FlowNotRegisteredError,
     FlowRunNotFoundError,
@@ -28,6 +29,7 @@ __all__ = [
     "ArtifactRefResponse",
     "ArtifactResponse",
     "InMemoryRunRegistry",
+    "LocalRunExecutor",
     "Preflight",
     "RegisteredFlow",
     "InMemoryFlowRegistry",

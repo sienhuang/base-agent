@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     DateTime,
     Integer,
@@ -38,7 +39,17 @@ from base_agent.checkpoints import (
     RuntimeCheckpoint,
     checkpoint_json,
 )
-from base_agent.models import Event
+from base_agent.models import Event, RunStatus
+from base_agent.run_store import (
+    AgentRunRecord,
+    RunLease,
+    RunLeaseConflictError,
+    RunLeaseLostError,
+    RunRecordAlreadyExistsError,
+    RunRecordNotFoundError,
+    RunTransitionError,
+    run_record_json,
+)
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TERMINAL_EVENT_KINDS = frozenset(
@@ -51,11 +62,14 @@ _TERMINAL_EVENT_KINDS = frozenset(
         "run.failed",
         "run.cancelled",
         "run.waiting",
+        "run.blocked",
+        "run.interrupted",
     }
 )
 _PERMANENT_TERMINAL_EVENT_KINDS = _TERMINAL_EVENT_KINDS - {
     "flow.waiting",
     "run.waiting",
+    "run.blocked",
 }
 
 
@@ -69,6 +83,7 @@ class PostgresEventTables:
     sequences: Table
     events: Table
     checkpoints: Table
+    runs: Table
 
 
 def build_postgres_event_tables(schema: str | None = None) -> PostgresEventTables:
@@ -103,11 +118,31 @@ def build_postgres_event_tables(schema: str | None = None) -> PostgresEventTable
         Column("lease_expires_at", DateTime(timezone=True), nullable=True, index=True),
         Column("updated_at", DateTime(timezone=True), nullable=False),
     )
+    runs = Table(
+        "base_agent_runs",
+        metadata,
+        Column("run_id", String(256), primary_key=True),
+        Column("agent_id", String(256), nullable=False, index=True),
+        Column("agent_version", String(128), nullable=False),
+        Column("snapshot_fingerprint", String(128), nullable=False, index=True),
+        Column("runtime_build_id", String(256), nullable=False, index=True),
+        Column("status", String(32), nullable=False, index=True),
+        Column("revision", Integer, nullable=False),
+        Column("cancel_requested", Boolean, nullable=False),
+        Column("lease_token", String(64), nullable=True, unique=True),
+        Column("lease_owner", String(512), nullable=True, index=True),
+        Column("lease_expires_at", DateTime(timezone=True), nullable=True, index=True),
+        Column("heartbeat_at", DateTime(timezone=True), nullable=True),
+        Column("payload", JSONB, nullable=False),
+        Column("created_at", DateTime(timezone=True), nullable=False),
+        Column("updated_at", DateTime(timezone=True), nullable=False),
+    )
     return PostgresEventTables(
         metadata=metadata,
         sequences=sequences,
         events=events,
         checkpoints=checkpoints,
+        runs=runs,
     )
 
 
@@ -253,7 +288,7 @@ class PostgresEventStore:
                 if event.kind in _PERMANENT_TERMINAL_EVENT_KINDS:
                     return
                 if (
-                    event.kind in {"flow.waiting", "run.waiting"}
+                    event.kind in {"flow.waiting", "run.waiting", "run.blocked"}
                     and index == len(events) - 1
                     and await self._is_terminal(run_id)
                 ):
@@ -480,6 +515,400 @@ class PostgresCheckpointStore:
         )
         async with self.engine.connect() as connection:
             return (await connection.execute(statement)).scalar_one_or_none() is not None
+
+
+class PostgresRunStore:
+    """Lease-fenced Agent Run state sharing the EventStore engine and schema."""
+
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        schema: str | None = None,
+        owns_engine: bool = False,
+    ) -> None:
+        self.engine = engine
+        self.tables = build_postgres_event_tables(schema)
+        self.schema = schema
+        self._owns_engine = owns_engine
+
+    @classmethod
+    def from_event_store(cls, event_store: PostgresEventStore) -> PostgresRunStore:
+        return cls(event_store.engine, schema=event_store.schema)
+
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        *,
+        schema: str | None = None,
+        **engine_options: Any,
+    ) -> PostgresRunStore:
+        if not url.strip():
+            raise ValueError("PostgreSQL URL must not be blank")
+        return cls(
+            create_async_engine(_asyncpg_url(url), **engine_options),
+            schema=schema,
+            owns_engine=True,
+        )
+
+    async def create_schema(self) -> None:
+        async with self.engine.begin() as connection:
+            if self.schema is not None:
+                await connection.execute(CreateSchema(self.schema, if_not_exists=True))
+            await connection.run_sync(self.tables.metadata.create_all)
+
+    async def close(self) -> None:
+        if self._owns_engine:
+            await self.engine.dispose()
+
+    async def create(self, record: AgentRunRecord) -> AgentRunRecord:
+        payload = run_record_json(record)
+        statement = (
+            postgresql_insert(self.tables.runs)
+            .values(**_run_columns(record, payload))
+            .on_conflict_do_nothing(index_elements=[self.tables.runs.c.run_id])
+            .returning(self.tables.runs.c.run_id)
+        )
+        async with self.engine.begin() as connection:
+            inserted = (await connection.execute(statement)).scalar_one_or_none()
+        if inserted is None:
+            raise RunRecordAlreadyExistsError(f"Run record '{record.run_id}' already exists")
+        return AgentRunRecord.model_validate(payload)
+
+    async def get(self, run_id: str) -> AgentRunRecord:
+        statement = select(self.tables.runs.c.payload).where(
+            self.tables.runs.c.run_id == run_id
+        )
+        async with self.engine.connect() as connection:
+            payload = (await connection.execute(statement)).scalar_one_or_none()
+        if payload is None:
+            raise RunRecordNotFoundError(f"Run record '{run_id}' was not found")
+        return AgentRunRecord.model_validate(payload)
+
+    async def create_claimed(
+        self,
+        record: AgentRunRecord,
+        *,
+        owner_id: str,
+        lease_seconds: float,
+    ) -> RunLease:
+        _validate_run_lease(owner_id, lease_seconds)
+        if record.status is not RunStatus.CREATED:
+            raise RunTransitionError("create_claimed requires a CREATED Run record")
+        now = datetime.now(UTC)
+        lease = RunLease(
+            run_id=record.run_id,
+            owner_id=owner_id,
+            token=str(uuid4()),
+            expires_at=now + timedelta(seconds=lease_seconds),
+        )
+        running = AgentRunRecord.model_validate(
+            {
+                **record.model_dump(mode="json"),
+                "status": RunStatus.RUNNING,
+                "revision": record.revision + 1,
+                "lease_owner": owner_id,
+                "lease_token": lease.token,
+                "lease_expires_at": lease.expires_at,
+                "heartbeat_at": now,
+                "updated_at": now,
+            }
+        )
+        statement = (
+            postgresql_insert(self.tables.runs)
+            .values(**_run_columns(running))
+            .on_conflict_do_nothing(index_elements=[self.tables.runs.c.run_id])
+            .returning(self.tables.runs.c.run_id)
+        )
+        async with self.engine.begin() as connection:
+            inserted = (await connection.execute(statement)).scalar_one_or_none()
+        if inserted is None:
+            raise RunRecordAlreadyExistsError(f"Run record '{record.run_id}' already exists")
+        return lease
+
+    async def claim(
+        self,
+        run_id: str,
+        *,
+        owner_id: str,
+        lease_seconds: float,
+    ) -> RunLease:
+        _validate_run_lease(owner_id, lease_seconds)
+        now = datetime.now(UTC)
+        lease = RunLease(
+            run_id=run_id,
+            owner_id=owner_id,
+            token=str(uuid4()),
+            expires_at=now + timedelta(seconds=lease_seconds),
+        )
+        async with self.engine.begin() as connection:
+            record = await self._locked_record(connection, run_id)
+            if record.status not in {RunStatus.CREATED, RunStatus.WAITING}:
+                raise RunLeaseConflictError(
+                    f"Run '{run_id}' with status '{record.status.value}' cannot be claimed"
+                )
+            updated = record.model_copy(
+                update={
+                    "status": RunStatus.RUNNING,
+                    "revision": record.revision + 1,
+                    "lease_owner": owner_id,
+                    "lease_token": lease.token,
+                    "lease_expires_at": lease.expires_at,
+                    "heartbeat_at": now,
+                    "updated_at": now,
+                    "error": None,
+                }
+            )
+            await connection.execute(
+                update(self.tables.runs)
+                .where(self.tables.runs.c.run_id == run_id)
+                .values(**_run_columns(updated))
+            )
+        return lease
+
+    async def renew(self, lease: RunLease, *, lease_seconds: float) -> RunLease:
+        _validate_run_lease(lease.owner_id, lease_seconds)
+        now = datetime.now(UTC)
+        async with self.engine.begin() as connection:
+            record = await self._locked_record(connection, lease.run_id)
+            _validate_owned_run(record, lease, now)
+            renewed = lease.model_copy(
+                update={"expires_at": now + timedelta(seconds=lease_seconds)}
+            )
+            updated = record.model_copy(
+                update={
+                    "revision": record.revision + 1,
+                    "lease_expires_at": renewed.expires_at,
+                    "heartbeat_at": now,
+                    "updated_at": now,
+                }
+            )
+            await connection.execute(
+                update(self.tables.runs)
+                .where(self.tables.runs.c.run_id == lease.run_id)
+                .values(**_run_columns(updated))
+            )
+        return renewed
+
+    async def settle(
+        self,
+        lease: RunLease,
+        *,
+        status: RunStatus,
+        output: Any | None = None,
+        text: str | None = None,
+        error: str | None = None,
+        pending_input: dict[str, Any] | None = None,
+        checkpoint_revision: int | None = None,
+    ) -> AgentRunRecord:
+        _validate_run_settlement(status, checkpoint_revision)
+        now = datetime.now(UTC)
+        async with self.engine.begin() as connection:
+            record = await self._locked_record(connection, lease.run_id)
+            _validate_owned_run(record, lease, now)
+            settled = AgentRunRecord.model_validate(
+                {
+                    **record.model_dump(mode="json"),
+                    "status": status,
+                    "revision": record.revision + 1,
+                    "lease_owner": None,
+                    "lease_token": None,
+                    "lease_expires_at": None,
+                    "heartbeat_at": None,
+                    "checkpoint_revision": checkpoint_revision,
+                    "output": output,
+                    "text": text,
+                    "error": error,
+                    "pending_input": pending_input,
+                    "updated_at": now,
+                }
+            )
+            payload = run_record_json(settled)
+            await connection.execute(
+                update(self.tables.runs)
+                .where(self.tables.runs.c.run_id == lease.run_id)
+                .values(**_run_columns(settled, payload))
+            )
+        return settled
+
+    async def request_cancel(self, run_id: str) -> AgentRunRecord:
+        now = datetime.now(UTC)
+        async with self.engine.begin() as connection:
+            record = await self._locked_record(connection, run_id)
+            if record.status in {
+                RunStatus.SUCCEEDED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+                RunStatus.INTERRUPTED,
+            } or record.cancel_requested:
+                return record
+            updated = record.model_copy(
+                update={
+                    "cancel_requested": True,
+                    "revision": record.revision + 1,
+                    "updated_at": now,
+                }
+            )
+            await connection.execute(
+                update(self.tables.runs)
+                .where(self.tables.runs.c.run_id == run_id)
+                .values(**_run_columns(updated))
+            )
+        return updated
+
+    async def cancel_unowned(self, run_id: str, *, reason: str) -> AgentRunRecord:
+        now = datetime.now(UTC)
+        async with self.engine.begin() as connection:
+            record = await self._locked_record(connection, run_id)
+            if record.status is RunStatus.CANCELLED:
+                return record
+            if record.status is RunStatus.RUNNING:
+                raise RunTransitionError(f"RUNNING Run '{run_id}' must be cancelled by its owner")
+            if record.status in {
+                RunStatus.SUCCEEDED,
+                RunStatus.FAILED,
+                RunStatus.INTERRUPTED,
+            }:
+                raise RunTransitionError(
+                    f"Run '{run_id}' already reached status '{record.status.value}'"
+                )
+            cancelled = AgentRunRecord.model_validate(
+                {
+                    **record.model_dump(mode="json"),
+                    "status": RunStatus.CANCELLED,
+                    "revision": record.revision + 1,
+                    "cancel_requested": True,
+                    "checkpoint_revision": None,
+                    "pending_input": None,
+                    "output": None,
+                    "text": "",
+                    "error": reason,
+                    "updated_at": now,
+                }
+            )
+            await connection.execute(
+                update(self.tables.runs)
+                .where(self.tables.runs.c.run_id == run_id)
+                .values(**_run_columns(cancelled))
+            )
+        return cancelled
+
+    async def block_expired(
+        self,
+        *,
+        agent_id: str | None = None,
+    ) -> tuple[AgentRunRecord, ...]:
+        now = datetime.now(UTC)
+        conditions = [
+            self.tables.runs.c.status == RunStatus.RUNNING.value,
+            self.tables.runs.c.lease_expires_at <= now,
+        ]
+        if agent_id is not None:
+            conditions.append(self.tables.runs.c.agent_id == agent_id)
+        statement = (
+            select(self.tables.runs.c.payload)
+            .where(*conditions)
+            .with_for_update(skip_locked=True)
+        )
+        blocked: list[AgentRunRecord] = []
+        async with self.engine.begin() as connection:
+            rows = (await connection.execute(statement)).scalars().all()
+            for payload in rows:
+                record = AgentRunRecord.model_validate(payload)
+                updated = AgentRunRecord.model_validate(
+                    {
+                        **record.model_dump(mode="json"),
+                        "status": RunStatus.BLOCKED,
+                        "revision": record.revision + 1,
+                        "lease_owner": None,
+                        "lease_token": None,
+                        "lease_expires_at": None,
+                        "heartbeat_at": None,
+                        "error": "Run owner lease expired; automatic replay is disabled",
+                        "updated_at": now,
+                    }
+                )
+                await connection.execute(
+                    update(self.tables.runs)
+                    .where(
+                        self.tables.runs.c.run_id == record.run_id,
+                        self.tables.runs.c.status == RunStatus.RUNNING.value,
+                    )
+                    .values(**_run_columns(updated))
+                )
+                blocked.append(updated)
+        return tuple(blocked)
+
+    async def _locked_record(self, connection: Any, run_id: str) -> AgentRunRecord:
+        statement = (
+            select(self.tables.runs.c.payload)
+            .where(self.tables.runs.c.run_id == run_id)
+            .with_for_update()
+        )
+        payload = (await connection.execute(statement)).scalar_one_or_none()
+        if payload is None:
+            raise RunRecordNotFoundError(f"Run record '{run_id}' was not found")
+        return AgentRunRecord.model_validate(payload)
+
+
+def _run_columns(
+    record: AgentRunRecord,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "run_id": record.run_id,
+        "agent_id": record.agent_id,
+        "agent_version": record.agent_version,
+        "snapshot_fingerprint": record.snapshot_fingerprint,
+        "runtime_build_id": record.runtime_build_id,
+        "status": record.status.value,
+        "revision": record.revision,
+        "cancel_requested": record.cancel_requested,
+        "lease_token": record.lease_token,
+        "lease_owner": record.lease_owner,
+        "lease_expires_at": record.lease_expires_at,
+        "heartbeat_at": record.heartbeat_at,
+        "payload": payload if payload is not None else run_record_json(record),
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+    }
+
+
+def _validate_run_lease(owner_id: str, lease_seconds: float) -> None:
+    if not owner_id.strip():
+        raise ValueError("Run lease owner_id must not be blank")
+    if lease_seconds <= 0:
+        raise ValueError("Run lease_seconds must be greater than zero")
+
+
+def _validate_owned_run(record: AgentRunRecord, lease: RunLease, now: datetime) -> None:
+    if (
+        record.status is not RunStatus.RUNNING
+        or record.lease_owner != lease.owner_id
+        or record.lease_token != lease.token
+    ):
+        raise RunLeaseLostError(f"Run lease for '{lease.run_id}' is no longer owned")
+    if record.lease_expires_at is None or record.lease_expires_at <= now:
+        raise RunLeaseLostError(f"Run lease for '{lease.run_id}' has expired")
+
+
+def _validate_run_settlement(
+    status: RunStatus,
+    checkpoint_revision: int | None,
+) -> None:
+    if status not in {
+        RunStatus.WAITING,
+        RunStatus.SUCCEEDED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.INTERRUPTED,
+    }:
+        raise RunTransitionError(f"RUNNING Run cannot settle as '{status.value}'")
+    if status is RunStatus.WAITING and checkpoint_revision is None:
+        raise RunTransitionError("WAITING settlement requires checkpoint_revision")
+    if status is not RunStatus.WAITING and checkpoint_revision is not None:
+        raise RunTransitionError("only WAITING settlement may retain checkpoint_revision")
 
 
 def _asyncpg_url(url: str) -> str:

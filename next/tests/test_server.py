@@ -902,7 +902,7 @@ async def test_http_reports_unsupported_provider_streaming_as_failed_run() -> No
         )
         failed = await _wait_for_status(client, started.json()["run_id"], "failed")
 
-    assert failed["event_count"] == 0
+    assert failed["event_count"] == 1
     assert failed["error"] == (
         "ValueError: Provider 'http-gated-model' does not support streaming"
     )

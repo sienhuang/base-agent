@@ -50,6 +50,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         preflight=(event_runtime.start,),
         shutdown=(event_runtime.close,),
         event_store=event_runtime.store,
+        run_store=event_runtime.runs,
+        run_lease_seconds=resolved_settings.run_lease_seconds,
+        run_heartbeat_interval_seconds=resolved_settings.run_heartbeat_interval_seconds,
+        runtime_build_id=resolved_settings.runtime_build_id,
     ).fastapi()
     return application
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -30,6 +31,15 @@ from base_agent.run_handle import (
     EventStreamingNotSupportedError,
     RunHandle,
     RunNotCancellableError,
+)
+from base_agent.run_store import (
+    AgentRunRecord,
+    InMemoryRunStore,
+    RunLeaseConflictError,
+    RunLeaseLostError,
+    RunRecordNotFoundError,
+    RunStore,
+    RunTransitionError,
 )
 from base_agent.server.recovery import (
     ExecutionKind,
@@ -70,6 +80,10 @@ def create_http_app(
     flows: Mapping[str, RegisteredFlow] | None = None,
     lifespan: Lifespan[FastAPI] | None = None,
     event_store: EventStore | None = None,
+    run_store: RunStore | None = None,
+    run_lease_seconds: float = 30.0,
+    run_heartbeat_interval_seconds: float | None = None,
+    runtime_build_id: str | None = None,
 ) -> FastAPI:
     """Create HTTP routes with process-local execution and persistent read fallback."""
     if not prefix.startswith("/") or (len(prefix) > 1 and prefix.endswith("/")):
@@ -81,13 +95,45 @@ def create_http_app(
         raise ValueError("create_http_app requires at least one Agent or Flow")
     resolved_flows = dict(flows or {})
     _validate_event_store_ownership(event_store, agent, resolved_flows)
-    registry = InMemoryRunRegistry(agent) if agent is not None else None
+    resolved_run_store = run_store or (InMemoryRunStore() if agent is not None else None)
+    registry = (
+        InMemoryRunRegistry(
+            agent,
+            resolved_run_store,
+            lease_seconds=run_lease_seconds,
+            heartbeat_interval_seconds=run_heartbeat_interval_seconds,
+            runtime_build_id=runtime_build_id,
+        )
+        if agent is not None and resolved_run_store is not None
+        else None
+    )
     flow_registry = InMemoryFlowRegistry(resolved_flows)
     recovery_store = event_store or _common_event_store(agent, resolved_flows)
-    app = FastAPI(title=title, lifespan=lifespan)
+    @asynccontextmanager
+    async def execution_lifespan(application: FastAPI) -> AsyncIterator[None]:
+        @asynccontextmanager
+        async def execution_scope() -> AsyncIterator[None]:
+            if registry is not None:
+                await registry.executor.startup()
+            try:
+                yield
+            finally:
+                if registry is not None:
+                    await registry.executor.close()
+
+        if lifespan is None:
+            async with execution_scope():
+                yield
+            return
+        async with lifespan(application):
+            async with execution_scope():
+                yield
+
+    app = FastAPI(title=title, lifespan=execution_lifespan)
     app.state.run_registry = registry
     app.state.flow_registry = flow_registry
     app.state.event_store = recovery_store
+    app.state.run_store = resolved_run_store
     app.state.sse_ping_seconds = sse_ping_seconds
 
     if registry is not None:
@@ -285,22 +331,20 @@ def _register_run_routes(
         status_code=status.HTTP_202_ACCEPTED,
     )
     async def start_run(payload: StartRunRequest) -> StartRunResponse:
-        handle = registry.start(payload.prompt, stream=payload.stream)
-        return StartRunResponse(run_id=handle.run_id, status=handle.status)
+        record = await registry.start(payload.prompt, stream=payload.stream)
+        return StartRunResponse(run_id=record.run_id, status=record.status)
 
     @app.get(
         f"{route_prefix}/runs/{{run_id}}",
         response_model=RunResponse,
     )
     async def get_run(run_id: str) -> RunResponse:
-        continued = registry.continued_result(run_id)
-        if continued is not None:
-            return await _run_result_response(continued, event_store)
-        handle = _find_handle(registry, run_id)
-        if handle is not None:
-            return await _run_response(handle)
-        events = await _persisted_events(event_store, run_id, kind="run")
-        return project_run_response(run_id, events)
+        try:
+            record = await registry.record(run_id)
+        except RunRecordNotFoundError:
+            events = await _persisted_events(event_store, run_id, kind="run")
+            return project_run_response(run_id, events)
+        return await _run_record_response(record, event_store)
 
     @app.post(
         f"{route_prefix}/runs/{{run_id}}/resume",
@@ -308,12 +352,19 @@ def _register_run_routes(
     )
     async def resume_run(run_id: str, payload: ResumeRunRequest) -> RunResponse:
         try:
-            result = await registry.resume(run_id, payload.input)
-        except CheckpointNotFoundError as exc:
+            record = await registry.resume(run_id, payload.input)
+        except (CheckpointNotFoundError, RunRecordNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except (CheckpointClaimError, CheckpointConflictError, ValueError) as exc:
+        except (
+            CheckpointClaimError,
+            CheckpointConflictError,
+            RunLeaseConflictError,
+            RunLeaseLostError,
+            RunTransitionError,
+            ValueError,
+        ) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return await _run_result_response(result, event_store)
+        return await _run_record_response(record, event_store)
 
     @app.post(
         f"{route_prefix}/runs/{{run_id}}/confirm",
@@ -321,42 +372,54 @@ def _register_run_routes(
     )
     async def confirm_run(run_id: str, payload: ConfirmRunRequest) -> RunResponse:
         try:
-            result = await registry.confirm(
+            record = await registry.confirm(
                 run_id,
                 ToolConfirmation(**payload.model_dump()),
             )
-        except CheckpointNotFoundError as exc:
+        except (CheckpointNotFoundError, RunRecordNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except (CheckpointClaimError, CheckpointConflictError, ValueError) as exc:
+        except (
+            CheckpointClaimError,
+            CheckpointConflictError,
+            RunLeaseConflictError,
+            RunLeaseLostError,
+            RunTransitionError,
+            ValueError,
+        ) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return await _run_result_response(result, event_store)
+        return await _run_record_response(record, event_store)
 
     @app.post(
         f"{route_prefix}/runs/{{run_id}}/cancel",
         response_model=RunResponse,
     )
     async def cancel_run(run_id: str) -> RunResponse:
-        handle = _find_handle(registry, run_id)
-        if handle is None:
-            await _persisted_events(event_store, run_id, kind="run")
-            try:
-                result = await registry.cancel_waiting(run_id)
-            except CheckpointNotFoundError as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Run '{run_id}' is not owned by this server process "
-                        "and has no cancellable WAITING checkpoint"
-                    ),
-                ) from exc
-            except (CheckpointClaimError, CheckpointConflictError, ValueError) as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            return await _run_result_response(result, event_store)
         try:
-            await handle.cancel()
-        except RunNotCancellableError as exc:
+            record = await registry.cancel(run_id)
+        except RunRecordNotFoundError as exc:
+            try:
+                await _persisted_events(event_store, run_id, kind="run")
+            except HTTPException:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Run '{run_id}' is not owned by this server process and "
+                    "predates persistent Run control state; it cannot be cancelled"
+                ),
+            ) from exc
+        except (
+            CheckpointNotFoundError,
+            CheckpointClaimError,
+            CheckpointConflictError,
+            RunLeaseConflictError,
+            RunLeaseLostError,
+            RunTransitionError,
+            RunNotCancellableError,
+            ValueError,
+        ) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return await _run_response(handle)
+        return await _run_record_response(record, event_store)
 
     @app.get(
         f"{route_prefix}/runs/{{run_id}}/events",
@@ -595,6 +658,28 @@ async def _run_result_response(
         error=result.error,
         artifacts=tuple(_artifact_response(artifact) for artifact in result.artifacts),
         **_pending_response_argument(result),
+    )
+
+
+async def _run_record_response(
+    record: AgentRunRecord,
+    event_store: EventStore | None,
+) -> RunResponse:
+    events = () if event_store is None else await event_store.list(record.run_id)
+    pending = (
+        PendingInputResponse.model_validate(record.pending_input)
+        if record.pending_input is not None
+        else None
+    )
+    return RunResponse(
+        run_id=record.run_id,
+        status=record.status,
+        event_count=len(events),
+        output=record.output,
+        text=record.text,
+        error=record.error,
+        artifacts=_artifact_responses(events),
+        **({"pending_input": pending} if pending is not None else {}),
     )
 
 

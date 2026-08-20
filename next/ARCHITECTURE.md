@@ -294,32 +294,28 @@ AgentDefinition(
    SequentialFlow handoff、SQL/CSV/Markdown Artifact、Host verifier、自动修正和 SSE；
 7. 在已有 Skill 受控目录发现、Descriptor/Catalog/`skill_view` 基础上，根据真实
    目录规模再增加检索、缓存和外部 Skill 源 Adapter；
-8. 在已有 EventStore/EventStream 小型契约上按真实部署需求增加 PostgreSQL durable store
-   和 Redis notification adapter，再迁入 Artifact、Resource 等其他 Protocol。
+8. 已在 EventStore/EventStream 和 CheckpointStore 之上增加 PostgreSQL durable adapter，
+   并增加顶层 AgentRunRecord、RunStore 与 LocalRunExecutor lease/heartbeat；Redis notification
+   和 Artifact、Resource 的其他持久 Adapter 仍按真实部署需求迁入。
 
 Worker、Lease、Operator API 和分布式恢复不在以上主路径内；只有明确部署需求出现时，才
 作为独立生产 Adapter 评估。
 
-### 多进程 Run 管理（已记录，暂缓实现）
+### 多进程 Run 管理（第一版已实现）
 
-当前 `InMemoryRunRegistry`、`InMemoryFlowRegistry`、`RunHandle` 和 `FlowRunHandle` 都是执行
-进程内对象，只支持单 Worker。以后支持多进程或多实例时，HTTP 层不能再把 Handle 当权威
-记录：
+`RunHandle`、`FlowRunHandle` 和两个 Registry 仍是进程内对象，但普通顶层 Agent Run 的 HTTP
+状态权威已迁移到 `AgentRunRecord`：
 
-1. 共享 `RunStore` 保存 Run 状态、结果、取消标记和执行租约；
-2. API Worker 只创建/查询 RunRecord，不直接持有后台 `asyncio.Task`；
-3. Execution Worker 领取 Run 后，可以在本进程内部使用 `RunHandle`，但它只是执行细节；
+1. `InMemoryRunStore` / `PostgresRunStore` 保存状态、结果、取消标记、版本指纹和执行租约；
+2. `LocalRunExecutor` 创建并领取 RunRecord，在本进程内部使用 `RunHandle`，Handle 只是执行细节；
+3. heartbeat 用 lease token fencing；失联 `RUNNING` 过期后转成 `BLOCKED`，第一版不自动领取或重放；
 4. PostgreSQL EventStore 作为事件事实源，Redis/PgNotify 只负责实时唤醒 SSE；
-5. Worker 崩溃后的重新领取依赖 lease、幂等写入和后续 checkpoint，而不是恢复旧 RunHandle。
+5. `WAITING` 继续使用现有 checkpoint lease；相同 snapshot 的新进程可恢复。
 
-已经明确的部署门槛：`RunHandle` 只保留为 Execution Worker 内部控制本地 Task 的原语；任何
-Kubernetes、多 Pod、多 Worker、滚动更新或弹性扩缩容部署，都必须先把 HTTP Run 创建、查询、
-取消和结果读取迁移为共享 `RunStore`/`FlowRunStore` 驱动。API Pod 通过 Store 写入取消请求，
-持有 lease 的 Worker 再取消自己的本地 Handle；负载均衡、sticky session 或共享 EventStore
-都不能替代状态 Store。
-
-这部分等单进程 Run/Event/Server 契约稳定后再实现，当前 Starter 明确保持单 Worker，不能
-作为多副本 K8s Run Server 部署。
+当前仍是“API 与本地执行同进程”的第一版，没有外部任务队列，`CREATED` 不会被其他 Worker
+扫描领取，`BLOCKED` 也不会自动恢复；父 Flow 仍没有 FlowRunStore/FlowCheckpoint。因此它解决
+了重启后的状态权威、等待恢复和崩溃检测，但还不能作为完整的多副本弹性执行平台。下一版应把
+提交与执行解耦，再设计显式 Operator retry/replay，而不是直接重新领取未知副作用的旧 Run。
 
 ### 已知限制 NEXT-RUN-001：滚动发布后旧 WAITING Run 无法直接恢复
 

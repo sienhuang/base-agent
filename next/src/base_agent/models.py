@@ -30,11 +30,14 @@ class FinishReason(StrEnum):
 
 
 class RunStatus(StrEnum):
+    CREATED = "created"
     RUNNING = "running"
     WAITING = "waiting"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    BLOCKED = "blocked"
+    INTERRUPTED = "interrupted"
 
 
 class ToolResultStatus(StrEnum):

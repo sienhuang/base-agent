@@ -25,7 +25,7 @@ from base_agent.memory import (
     MemoryScope,
     MemoryWriter,
 )
-from base_agent.models import RunInvocation, RunResult, RunStatus
+from base_agent.models import HarnessSnapshot, RunInvocation, RunResult, RunStatus
 from base_agent.observability import Observer
 from base_agent.providers import ModelProvider
 from base_agent.resources import ResourceSpec
@@ -227,6 +227,11 @@ class Agent:
             invocation=invocation,
         )
 
+    @property
+    def snapshot(self) -> HarnessSnapshot:
+        """Stable identity of the Agent configuration used by new Runs."""
+        return self._harness.snapshot()
+
     async def stream(
         self,
         prompt: str,
@@ -292,27 +297,33 @@ class Agent:
         on_event: Observer | None = None,
         memory_scope: MemoryScope | None = None,
         invocation: RunInvocation | None = None,
+        run_id: str | None = None,
     ) -> RunHandle:
         """Start a process-local background Run and return immediately."""
-        run_id = str(uuid4())
+        resolved_run_id = run_id or str(uuid4())
+        if not resolved_run_id.strip():
+            raise ValueError("run_id must not be blank when provided")
 
         def run_in_background() -> Coroutine[Any, Any, RunResult]:
             return self._harness.run(
                 prompt,
                 stream=stream,
                 on_event=on_event,
-                run_id=run_id,
+                run_id=resolved_run_id,
                 memory_scope=memory_scope,
                 invocation=invocation,
             )
 
         def cancel_in_background() -> Coroutine[Any, Any, RunResult]:
             if handle.status is RunStatus.WAITING:
-                return self.cancel(run_id)
-            return self._harness.cancelled_result(run_id, reason="run cancellation requested")
+                return self.cancel(resolved_run_id)
+            return self._harness.cancelled_result(
+                resolved_run_id,
+                reason="run cancellation requested",
+            )
 
         handle = RunHandle._launch(
-            run_id=run_id,
+            run_id=resolved_run_id,
             operation=run_in_background,
             cancel_operation=cancel_in_background,
             event_store=self.event_store,

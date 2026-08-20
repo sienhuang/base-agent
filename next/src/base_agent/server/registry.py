@@ -8,8 +8,9 @@ from typing import Any, Protocol, runtime_checkable
 from base_agent.agent import Agent
 from base_agent.flows import FlowRunHandle
 from base_agent.governance import ToolConfirmation
-from base_agent.models import RunResult
 from base_agent.run_handle import RunHandle
+from base_agent.run_store import AgentRunRecord, InMemoryRunStore, RunStore
+from base_agent.server.executor import LocalRunExecutor
 
 
 class RunNotFoundError(LookupError):
@@ -44,41 +45,49 @@ class ResumableRegisteredFlow(Protocol):
 
 
 class InMemoryRunRegistry:
-    """Retain RunHandles for HTTP status polling in one server process."""
+    """Retain local handles while delegating lifecycle authority to a RunStore."""
 
-    def __init__(self, agent: Agent) -> None:
-        self._agent = agent
-        self._handles: dict[str, RunHandle] = {}
-        self._continued_results: dict[str, RunResult] = {}
+    def __init__(
+        self,
+        agent: Agent,
+        run_store: RunStore | None = None,
+        *,
+        lease_seconds: float = 30.0,
+        heartbeat_interval_seconds: float | None = None,
+        runtime_build_id: str | None = None,
+    ) -> None:
+        self.executor = LocalRunExecutor(
+            agent,
+            run_store or InMemoryRunStore(),
+            lease_seconds=lease_seconds,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            runtime_build_id=runtime_build_id,
+        )
 
-    def start(self, prompt: str, *, stream: bool = False) -> RunHandle:
-        handle = self._agent.start(prompt, stream=stream)
-        self._handles[handle.run_id] = handle
-        return handle
+    async def start(self, prompt: str, *, stream: bool = False) -> AgentRunRecord:
+        return await self.executor.start(prompt, stream=stream)
 
     def get(self, run_id: str) -> RunHandle:
-        try:
-            return self._handles[run_id]
-        except KeyError as exc:
-            raise RunNotFoundError(f"Run '{run_id}' was not found") from exc
+        handle = self.executor.local_handle(run_id)
+        if handle is None:
+            raise RunNotFoundError(f"Run '{run_id}' was not found")
+        return handle
 
-    def continued_result(self, run_id: str) -> RunResult | None:
-        return self._continued_results.get(run_id)
+    async def record(self, run_id: str) -> AgentRunRecord:
+        return await self.executor.get(run_id)
 
-    async def resume(self, run_id: str, user_input: str) -> RunResult:
-        result = await self._agent.resume(run_id, user_input)
-        self._continued_results[run_id] = result
-        return result
+    async def resume(self, run_id: str, user_input: str) -> AgentRunRecord:
+        return await self.executor.resume(run_id, user_input)
 
-    async def confirm(self, run_id: str, confirmation: ToolConfirmation) -> RunResult:
-        result = await self._agent.confirm(run_id, confirmation)
-        self._continued_results[run_id] = result
-        return result
+    async def confirm(
+        self,
+        run_id: str,
+        confirmation: ToolConfirmation,
+    ) -> AgentRunRecord:
+        return await self.executor.confirm(run_id, confirmation)
 
-    async def cancel_waiting(self, run_id: str) -> RunResult:
-        result = await self._agent.cancel(run_id)
-        self._continued_results[run_id] = result
-        return result
+    async def cancel(self, run_id: str) -> AgentRunRecord:
+        return await self.executor.cancel(run_id)
 
 
 class InMemoryFlowRegistry:

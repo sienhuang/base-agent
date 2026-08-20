@@ -474,10 +474,10 @@ data: {"sequence":8,"kind":"run.succeeded","run_id":"...","turn":1,"payload":{..
 大于 5 的 Event；Header 优先于 `last_event_id`，再与 `after_sequence` 取较大值。连接空闲时
 默认每 15 秒发送一次 SSE comment 心跳，Run/Flow 终态事件发出后流自然关闭。Run 与 Flow
 registry 仍只保存当前进程的活动 Handle；配置共享 EventStore 后，重启或请求落到另一 Worker
-时，状态、历史和 SSE 会从持久 Event 投影，不再因为 Registry miss 直接返回 404。只有拥有
-活动 Handle 的进程可以取消执行。Agent WAITING 可以由共享 CheckpointStore 跨进程继续；父
-Flow continuation、运行中崩溃检测、分布式执行所有权和自动保留期仍需要共享
-RunStore/FlowRunStore 与 Flow checkpoint 机制。
+时，历史和 SSE 会从持久 Event 回放。普通顶层 Agent Run 另由共享 RunStore 保存状态、结果、
+取消请求和本地 Executor lease；故障遗留的 `RUNNING` 在 lease 过期后 fail-closed 为
+`BLOCKED`，不会自动重放。Agent `WAITING` 可以由共享 CheckpointStore 跨进程继续。父 Flow
+continuation、FlowRunStore、外部任务队列和自动保留期仍未实现。
 
 Planner-ReAct 使用与普通 Agent 相同的 `message.created` 表示原始用户消息，并在成功时发送
 `message.completed`（payload 含最终 `content`），随后发送 `flow.succeeded` 关闭 SSE。启用
@@ -516,6 +516,8 @@ Skill Package 的目录、Tool 贡献、Script 执行边界和 snapshot 契约�
 - Tool 参数、权限、超时和确认治理；
 - Provider-neutral text/ToolCall streaming 与完整响应聚合；
 - 进程内 `Agent.start()`、`RunHandle`、显式取消、Event 快照回放和实时订阅；
+- Server 边界的 `AgentRunRecord`、内存/PostgreSQL RunStore，以及带 heartbeat/fencing 的
+  `LocalRunExecutor`；过期 `RUNNING` 转为 `BLOCKED`，不自动重放；
 - 默认内存 `EventStore`、可替换持久历史和可选 `EventStream` 契约；
 - 可选 `base_agent.server` FastAPI Run 提交、状态查询与取消；
 - 有序只读 Event；
@@ -524,6 +526,6 @@ Skill Package 的目录、Tool 贡献、Script 执行边界和 snapshot 契约�
 - 固定 Planner/Executor 的 Planner–ReAct Flow、结构化 Plan/Step outcome、逐步 Review/Replan、
   子 Run 关联、事件回放和取消传播。
 
-SDK Runtime 核心明确不依赖 HTTP Server、Worker、Lease、持久化恢复、Operator API、
+SDK Harness 核心明确不依赖 HTTP Server、Worker、Run lease、持久化恢复、Operator API、
 插件市场、动态 Tool Search、复杂多 Agent 调度或产品级会话路由。FastAPI Run Server 位于
 `base_agent.server` 可选边界，只有安装 `base-agent-next[server]` 并显式导入时才会加载。

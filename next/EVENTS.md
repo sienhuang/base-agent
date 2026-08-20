@@ -123,15 +123,17 @@ Redis、PostgreSQL、embedding 或摘要模型。
 - 每个 SSE 帧以 sequence 作为 `id`，以 Event kind 作为 `event`；
 - 断线重连支持 `Last-Event-ID` Header，以及 `last_event_id` / `after_sequence` 查询参数；
 - 空闲连接默认每 15 秒发送 comment 心跳，心跳不进入 EventStore，也不推进游标；
-- `run.waiting`、`run.succeeded`、`run.failed` 或 `run.cancelled` 发出后本次订阅自然结束，
+- `run.waiting`、`run.blocked`、`run.succeeded`、`run.failed`、`run.cancelled` 或
+  `run.interrupted` 发出后本次订阅自然结束，
   客户端断开不会取消 Run；提交 resume/confirm 后用 waiting Event 的 sequence 重新连接即可
   跟随后续事件。
 
-Server 的 Run/Flow Handle 仍在当前进程中，但配置共享 EventStore 后，读路由不再依赖 Handle：
-Registry miss 时会先校验持久历史属于 Agent Run 还是 Flow Run，再投影状态、输出、Plan、子 Run
-关联和 Artifact。JSON 历史与终态 SSE 因此可以跨服务重启访问。重启前由旧进程拥有的执行不能
-在新进程取消，取消接口返回 `409`；`run.waiting` / `flow.waiting` 可以投影为 `waiting`。
-EventStore 本身不提供运行中崩溃检测；Agent 的等待恢复由独立 CheckpointStore 和 lease 提供。
+Server 的 Run/Flow Handle 仍在当前进程中，但配置共享 EventStore 后，历史路由不再依赖 Handle：
+Registry miss 时会先校验持久历史属于 Agent Run 还是 Flow Run，再投影 Plan、子 Run 关联和
+Artifact。JSON 历史与终态 SSE 因此可以跨服务重启访问。普通顶层 Agent Run 的状态和取消请求
+由独立 RunStore 管理，LocalRunExecutor 用 heartbeat 续租；过期 `RUNNING` 转为 `BLOCKED` 并以
+`run.blocked` 结束本次 SSE，不会自动重放。Agent 的等待恢复由 CheckpointStore lease 提供，
+Flow 的状态权威和崩溃恢复仍未迁移到 FlowRunStore。
 
 `RunHandle.cancel()` 取消后台 Task，并在清理完成后写入唯一的 `run.cancelled` 终态 Event。
 如果取消发生在 Tool 执行期间，Harness 会先写入 `tool.completed(status=cancelled)`，避免留下
@@ -144,7 +146,7 @@ EventStore 本身不提供运行中崩溃检测；Agent 的等待恢复由独立
 因此不需要额外的进程全局 StreamBridge。只实现历史读取的 EventStore 仍可使用 JSON 接口，
 SSE 接口会明确返回 `501`。
 
-## PostgreSQL EventStore 与 CheckpointStore
+## PostgreSQL EventStore、CheckpointStore 与 RunStore
 
 可选的 `PostgresEventStore` 已经实现 durable EventStore：它在同一个事务内更新
 per-Run sequence 计数器并写入 Event，通过 `(run_id, sequence)` 主键保证顺序和唯一性；
@@ -158,7 +160,11 @@ uv sync --project next --extra postgres
 ```
 
 ```python
-from base_agent.events.postgres import PostgresCheckpointStore, PostgresEventStore
+from base_agent.events.postgres import (
+    PostgresCheckpointStore,
+    PostgresEventStore,
+    PostgresRunStore,
+)
 
 events = PostgresEventStore.from_url(
     "postgresql://agent:password@127.0.0.1:5432/agent",
@@ -166,6 +172,7 @@ events = PostgresEventStore.from_url(
 )
 await events.create_schema()
 checkpoints = PostgresCheckpointStore.from_event_store(events)
+runs = PostgresRunStore.from_event_store(events)
 ```
 
 应用需要把同一个 Store 显式传给 Agent 或 Flow：
@@ -180,8 +187,8 @@ agent = Agent(
 flow = Flow.sequence(id="analysis", stages=stages, event_store=events)
 ```
 
-`create_schema()` 同时创建 `base_agent_event_sequences`、`base_agent_events` 和
-`base_agent_checkpoints`。Checkpoint 行保存有限 JSON 状态、revision、lease owner/token 和
+`create_schema()` 同时创建 `base_agent_event_sequences`、`base_agent_events`、
+`base_agent_checkpoints` 和 `base_agent_runs`。Checkpoint 行保存有限 JSON 状态、revision、lease owner/token 和
 过期时间；`claim()` 使用数据库条件更新保证同一 Run 同时只有一个 continuation，
 `release()` / `complete()` 必须携带同一个 fencing token。Tool 的幂等键仍保持
 `run_id:tool_call_id`，checkpoint 不保存 Resource 连接或 Artifact 二进制。
@@ -190,13 +197,15 @@ flow = Flow.sequence(id="analysis", stages=stages, event_store=events)
 的 Engine 通过 `await events.close()` 释放；注入已有 `AsyncEngine` 时，Engine 生命周期仍归应用。
 数据库集成测试通过 `BASE_AGENT_NEXT_TEST_POSTGRES_DSN` 显式启用。
 
-`AgentApplication(event_store=events)` 会把这个 Store 同时交给 HTTP 持久化读取层。服务重启
+`AgentApplication(event_store=events, run_store=runs)` 会把 EventStore 和 RunStore 交给 HTTP
+执行/读取层。RunRecord 保存状态、结果、取消请求、Agent/version/snapshot/runtime build，以及
+LocalRunExecutor 的 lease owner/token/heartbeat。服务重启
 后，`GET /runs/{id}`、`GET /flows/{id}`、历史 JSON 和 SSE 可以从 Event 重建；新的终态 Event
 会携带完整输出投影，旧 Event 则从最终 Message、Plan/Step 和 Artifact 事件尽力重建。这里恢复
-的终态与 Flow 状态主要是只读投影；但处于 `run.waiting` 的 Agent 可以由新的 Agent 实例通过
-同一 CheckpointStore 执行 `resume()` / `confirm()`。运行中的 Tool 崩溃不会自动重放，父 Flow
-调度位置也尚未跨进程 checkpoint；这些仍需要 RunStore/FlowCheckpoint、owner heartbeat 和
-幂等 Tool 共同完成。
+的 Flow 状态仍是只读投影；普通顶层 Agent Run 以 RunRecord 为状态权威。处于 `run.waiting` 的
+Agent 可以由新的 Agent 实例通过同一 CheckpointStore 执行 `resume()` / `confirm()`。执行 owner
+失联后，过期 `RUNNING` 转成 `BLOCKED` 并写入 `run.blocked`；运行中的 Tool 不会自动重放。父
+Flow 调度位置尚未跨进程 checkpoint，仍需要 FlowRunStore/FlowCheckpoint。
 
 ## Redis 演进方向
 

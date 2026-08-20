@@ -1299,6 +1299,10 @@ class Harness:
             fingerprint=fingerprint,
         )
 
+    def snapshot(self) -> HarnessSnapshot:
+        """Return the immutable runtime identity used for Run compatibility checks."""
+        return self._create_snapshot()
+
     async def _check_readiness(self, emitter: EventEmitter) -> str | None:
         for tool in self._tools:
             try:
@@ -1719,6 +1723,8 @@ class Harness:
             "run.succeeded",
             "run.failed",
             "run.cancelled",
+            "run.blocked",
+            "run.interrupted",
         }:
             return await self._result_from_terminal_events(run_id, existing_events)
         turn = next(
@@ -1773,11 +1779,12 @@ class Harness:
             )
         error = terminal.payload.get("error") or terminal.payload.get("reason")
         resolved_error = str(error or terminal.kind)
-        status = (
-            RunStatus.FAILED
-            if terminal.kind == "run.failed"
-            else RunStatus.CANCELLED
-        )
+        status = {
+            "run.failed": RunStatus.FAILED,
+            "run.cancelled": RunStatus.CANCELLED,
+            "run.blocked": RunStatus.BLOCKED,
+            "run.interrupted": RunStatus.INTERRUPTED,
+        }[terminal.kind]
         return RunResult(
             run_id=run_id,
             status=status,

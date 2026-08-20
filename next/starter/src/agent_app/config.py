@@ -68,6 +68,9 @@ class Settings:
     postgres_dsn: str | None = None
     postgres_schema: str = "base_agent"
     event_poll_interval_seconds: float = 0.1
+    run_lease_seconds: float = 30.0
+    run_heartbeat_interval_seconds: float = 10.0
+    runtime_build_id: str | None = None
 
     @classmethod
     def from_env(
@@ -127,14 +130,32 @@ class Settings:
             event_poll_interval_seconds = float(
                 _env_value("AGENT_EVENT_POLL_INTERVAL_SECONDS", file_values) or "0.1"
             )
+            run_lease_seconds = float(
+                _env_value("AGENT_RUN_LEASE_SECONDS", file_values) or "30"
+            )
+            run_heartbeat_interval_seconds = float(
+                _env_value("AGENT_RUN_HEARTBEAT_SECONDS", file_values) or "10"
+            )
         except ValueError as exc:
-            raise ValueError("AGENT_EVENT_POLL_INTERVAL_SECONDS must be numeric") from exc
+            raise ValueError(
+                "Event polling and Run lease settings must be numeric"
+            ) from exc
         if timeout_seconds <= 0:
             raise ValueError("AGENT_CLI_TIMEOUT_SECONDS must be greater than zero")
         if max_output_bytes < 1:
             raise ValueError("AGENT_CLI_MAX_OUTPUT_BYTES must be greater than zero")
         if event_poll_interval_seconds <= 0:
             raise ValueError("AGENT_EVENT_POLL_INTERVAL_SECONDS must be greater than zero")
+        if run_lease_seconds <= 0:
+            raise ValueError("AGENT_RUN_LEASE_SECONDS must be greater than zero")
+        if (
+            run_heartbeat_interval_seconds <= 0
+            or run_heartbeat_interval_seconds >= run_lease_seconds
+        ):
+            raise ValueError(
+                "AGENT_RUN_HEARTBEAT_SECONDS must be positive and shorter than "
+                "AGENT_RUN_LEASE_SECONDS"
+            )
 
         raw_event_store = (
             _env_value("AGENT_EVENT_STORE", file_values) or "memory"
@@ -198,6 +219,9 @@ class Settings:
             postgres_dsn=postgres_dsn,
             postgres_schema=postgres_schema,
             event_poll_interval_seconds=event_poll_interval_seconds,
+            run_lease_seconds=run_lease_seconds,
+            run_heartbeat_interval_seconds=run_heartbeat_interval_seconds,
+            runtime_build_id=_optional_env("AGENT_RUNTIME_BUILD_ID", file_values),
         )
 
     def for_plan_react_role(self, role: PlanReactRole) -> Settings:

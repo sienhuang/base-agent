@@ -20,7 +20,15 @@ from base_agent.server.schemas import (
 ExecutionKind = Literal["run", "flow"]
 
 _RUN_ROOT_KINDS = frozenset(
-    {"run.started", "run.waiting", "run.succeeded", "run.failed", "run.cancelled"}
+    {
+        "run.started",
+        "run.waiting",
+        "run.succeeded",
+        "run.failed",
+        "run.cancelled",
+        "run.blocked",
+        "run.interrupted",
+    }
 )
 _FLOW_ROOT_KINDS = frozenset(
     {"flow.started", "flow.waiting", "flow.succeeded", "flow.failed", "flow.cancelled"}
@@ -30,6 +38,8 @@ _RUN_TERMINAL_STATUSES = {
     "run.succeeded": RunStatus.SUCCEEDED,
     "run.failed": RunStatus.FAILED,
     "run.cancelled": RunStatus.CANCELLED,
+    "run.blocked": RunStatus.BLOCKED,
+    "run.interrupted": RunStatus.INTERRUPTED,
 }
 _FLOW_TERMINAL_STATUSES = {
     "flow.waiting": FlowStatus.WAITING,
