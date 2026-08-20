@@ -26,6 +26,7 @@ from base_agent import (
     tool,
 )
 from base_agent.events import InMemoryEventStore
+from base_agent.flows import PlanStepStatus
 from base_agent.models import ModelResponse, PendingInputKind, ToolCall
 from base_agent.providers import ProviderCapabilities, ProviderInfo
 from base_agent.server import create_http_app
@@ -508,6 +509,108 @@ async def test_planner_react_flow_resumes_a_waiting_executor() -> None:
     assert completed.status is FlowStatus.SUCCEEDED
     assert completed.output == "report ready"
     assert "child.run.resumed" in {event.kind for event in completed.events}
+    assert [child.run.status for child in completed.child_runs] == [
+        RunStatus.SUCCEEDED,
+        RunStatus.SUCCEEDED,
+        RunStatus.SUCCEEDED,
+    ]
+
+
+async def test_planner_react_flow_can_wait_again_after_resume() -> None:
+    @tool
+    async def ask() -> WaitForInput:
+        return WaitForInput("More information?")
+
+    planner = Agent(
+        AgentDefinition(
+            id="repeated-wait-planner",
+            version="1.0.0",
+            instructions="Plan.",
+            response_model=PlannerDecision,
+        ),
+        model=FakeModel(
+            [
+                ModelResponse(
+                    content=json.dumps(
+                        {
+                            "action": "create",
+                            "goal": "Build report",
+                            "steps": [{"description": "Collect report inputs"}],
+                            "reason": "one step",
+                            "final_output": None,
+                        }
+                    )
+                ),
+                ModelResponse(
+                    content=json.dumps(
+                        {
+                            "action": "complete",
+                            "goal": "Build report",
+                            "steps": [],
+                            "reason": "done",
+                            "final_output": "report ready",
+                        }
+                    )
+                ),
+            ]
+        ),
+    )
+    executor = Agent(
+        AgentDefinition(
+            id="repeated-wait-executor",
+            version="1.0.0",
+            instructions="Execute.",
+            tools=("ask",),
+            max_model_turns=3,
+            response_model=StepOutcome,
+        ),
+        model=FakeModel(
+            [
+                ModelResponse(
+                    tool_calls=(ToolCall(id="ask-region", name="ask", arguments={}),)
+                ),
+                ModelResponse(
+                    tool_calls=(ToolCall(id="ask-period", name="ask", arguments={}),)
+                ),
+                ModelResponse(
+                    content=json.dumps(
+                        {
+                            "success": True,
+                            "summary": "inputs collected",
+                            "output": "APAC 2025",
+                            "error": None,
+                            "artifact_ids": [],
+                        }
+                    )
+                ),
+            ]
+        ),
+        tools=(ask,),
+    )
+    flow = Flow.planner_react(
+        id="repeated-wait-plan",
+        planner=planner,
+        executor=executor,
+        forward_child_events=True,
+    )
+
+    first_wait = await flow.run("Build")
+    second_wait = await flow.resume(first_wait.flow_run_id, "APAC")
+
+    assert second_wait.status is FlowStatus.WAITING
+    assert second_wait.pending_input is not None
+    assert second_wait.pending_input.tool_call_id == "ask-period"
+    assert second_wait.waiting_child_run_id == first_wait.waiting_child_run_id
+    assert second_wait.plan is not None
+    assert second_wait.plan.steps[0].status is PlanStepStatus.RUNNING
+    second_wait_event_kinds = [event.kind for event in second_wait.events]
+    assert "child.run.waiting" in second_wait_event_kinds
+    assert second_wait_event_kinds[-2:] == ["flow.resumed", "flow.waiting"]
+
+    completed = await flow.resume(second_wait.flow_run_id, "2025")
+
+    assert completed.status is FlowStatus.SUCCEEDED
+    assert completed.output == "report ready"
     assert [child.run.status for child in completed.child_runs] == [
         RunStatus.SUCCEEDED,
         RunStatus.SUCCEEDED,

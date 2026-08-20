@@ -170,6 +170,10 @@ completed = await agent.confirm(
 fencing token；同一个等待 Run 只能被一个 continuation claim，过期 owner 不能覆盖新状态。
 默认 `InMemoryCheckpointStore` 用于测试；PostgreSQL 配置见 EVENTS.md。
 
+已知限制 `NEXT-RUN-001`：WAITING 期间如果滚动发布改变了 Agent snapshot，旧 PostgreSQL
+checkpoint 会保留，但当前单一 Runtime 会因 fingerprint 不一致拒绝恢复。该限制和后续版本化
+Runtime 路由方向记录在 [`ARCHITECTURE.md`](ARCHITECTURE.md#已知限制-next-run-001滚动发布后旧-waiting-run-无法直接恢复)，当前不放宽安全校验。
+
 Sequential 和 Planner-ReAct Flow 会把子 Run 的等待传播为 `FlowStatus.WAITING`，并可用
 `flow.resume(...)` / `flow.confirm(...)` 继续。第一版父 Flow continuation 保存在执行进程中；
 Agent checkpoint 已可跨进程恢复，但服务重启后还不能通过父 `flow_run_id` 恢复 Flow 调度位置。

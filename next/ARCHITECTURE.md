@@ -320,3 +320,23 @@ Kubernetes、多 Pod、多 Worker、滚动更新或弹性扩缩容部署，都�
 
 这部分等单进程 Run/Event/Server 契约稳定后再实现，当前 Starter 明确保持单 Worker，不能
 作为多副本 K8s Run Server 部署。
+
+### 已知限制 NEXT-RUN-001：滚动发布后旧 WAITING Run 无法直接恢复
+
+状态：已记录，暂不处理。
+
+`RuntimeCheckpoint` 会固定创建 Run 时的 `HarnessSnapshot.fingerprint`。如果 Run 在
+`WAITING` 期间发布了包含 Prompt、模型、Tool schema/描述、Skill、权限、ContextPolicy 或预算
+变化的新版本，重启后的单一 Agent 实例会生成不同 fingerprint。PostgreSQL 中的 Event 和
+checkpoint 仍可读取，但 `resume()` 会 fail-closed 并返回 `Agent snapshot changed`，不能用
+新版本语义静默继续旧 Run。
+
+复现路径：旧进程创建 WAITING Run 并保存 checkpoint → 发布语义快照不同的新版本 → 重启服务
+→ 查询原 Run 仍为 WAITING → `/resume` 返回冲突。相同代码、配置和 Agent snapshot 的普通进程
+重启不受影响。
+
+后续解决方向是版本化 Runtime 路由，而不是跳过 fingerprint 校验：RunStore/FlowRunStore 固定
+`agent_id`、`agent_version`、snapshot fingerprint、checkpoint format 和 runtime build；新请求
+进入新版本，旧 Run 路由到兼容旧 Worker。长期 WAITING Run 需要 TTL、旧版本保留窗口和显式、
+可审计的 checkpoint migrator；找不到兼容 Runtime 时应进入 BLOCKED/EXPIRED 或由 Operator
+取消，不能自动交给当前版本执行。

@@ -439,6 +439,8 @@ class PlannerReActFlow:
                     event_scope="flow",
                 )
                 state.started = True
+            if resumed_run is not None and resumed_run.status is RunStatus.WAITING:
+                raise _FlowWaiting
             while True:
                 if state.phase == "create":
                     decision, planner_run_id = await self._invoke_planner(
@@ -964,6 +966,9 @@ class PlannerReActFlow:
         if not state.child_runs or state.child_runs[-1].agent_run_id != run.run_id:
             raise RuntimeError("waiting child Run history is inconsistent")
         state.child_runs[-1] = active.finish(run)
+        if run.status is RunStatus.WAITING:
+            state.waiting_run = run
+            return
         state.waiting_active = None
         state.waiting_run = None
 
