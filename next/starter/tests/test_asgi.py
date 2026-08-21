@@ -8,6 +8,24 @@ from agent_app.app import STARTER_AGENT_DEFINITION
 from agent_app.config import Settings
 
 
+def test_queued_api_requires_operator_credentials() -> None:
+    settings = Settings(
+        provider="offline",
+        event_store="postgres",
+        postgres_dsn="postgresql://agent:password@db/agent",
+        execution_mode="postgres-worker",
+    )
+
+    try:
+        asgi.create_app(settings)
+    except ValueError as exc:
+        assert str(exc) == (
+            "AGENT_OPERATOR_TOKEN is required by the API in postgres-worker mode"
+        )
+    else:
+        raise AssertionError("queued API without Operator credentials must fail")
+
+
 def test_starter_composes_sdk_http_adapter(monkeypatch) -> None:
     monkeypatch.setattr(
         asgi.Settings,

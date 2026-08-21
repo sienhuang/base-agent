@@ -95,7 +95,14 @@ class LocalRunExecutor:
             if pending_supervisors:
                 await asyncio.gather(*pending_supervisors, return_exceptions=True)
 
-    async def start(self, prompt: str, *, stream: bool = False) -> AgentRunRecord:
+    async def start(
+        self,
+        prompt: str,
+        *,
+        stream: bool = False,
+        idempotency_key: str | None = None,
+    ) -> AgentRunRecord:
+        del idempotency_key
         await self.reconcile_expired()
         snapshot = self.agent.snapshot
         run_id = str(uuid4())

@@ -298,10 +298,12 @@ AgentDefinition(
    并增加顶层 AgentRunRecord、RunStore 与 LocalRunExecutor lease/heartbeat；Redis notification
    和 Artifact、Resource 的其他持久 Adapter 仍按真实部署需求迁入。
 
-Worker、Lease、Operator API 和分布式恢复不在以上主路径内；只有明确部署需求出现时，才
-作为独立生产 Adapter 评估。
+Worker、Lease、Operator API 和分布式恢复不进入 Harness 主路径。MTBI 长任务与 Kubernetes
+滚动发布已经证明独立执行面的实际需求，普通 Agent Run 已按
+[`EXECUTOR_DESIGN.md`](EXECUTOR_DESIGN.md) 增加可选 PostgreSQL Worker Adapter；默认本地 Agent
+API 仍不要求开发者理解 Worker、Attempt 或 lease，Flow 的持久恢复仍是后续阶段。
 
-### 多进程 Run 管理（第一版已实现）
+### 本地持久 Run 管理（兼容模式）
 
 `RunHandle`、`FlowRunHandle` 和两个 Registry 仍是进程内对象，但普通顶层 Agent Run 的 HTTP
 状态权威已迁移到 `AgentRunRecord`：
@@ -312,10 +314,16 @@ Worker、Lease、Operator API 和分布式恢复不在以上主路径内；只�
 4. PostgreSQL EventStore 作为事件事实源，Redis/PgNotify 只负责实时唤醒 SSE；
 5. `WAITING` 继续使用现有 checkpoint lease；相同 snapshot 的新进程可恢复。
 
-当前仍是“API 与本地执行同进程”的第一版，没有外部任务队列，`CREATED` 不会被其他 Worker
-扫描领取，`BLOCKED` 也不会自动恢复；父 Flow 仍没有 FlowRunStore/FlowCheckpoint。因此它解决
-了重启后的状态权威、等待恢复和崩溃检测，但还不能作为完整的多副本弹性执行平台。下一版应把
-提交与执行解耦，再设计显式 Operator retry/replay，而不是直接重新领取未知副作用的旧 Run。
+该兼容模式仍是“API 与本地执行同进程”，不由其他 Worker 扫描领取；它适合开发和单进程部署。
+可选生产 Adapter 已把普通 Agent Run 的提交与执行解耦，并提供显式 Operator
+retry/cancel/fail；父 Flow 仍没有 FlowRunStore/FlowCheckpoint，因此 Flow 还不能作为完整的
+多副本弹性执行平台。
+
+生产 Adapter 把 API、Executor Supervisor 和 Execution Child 拆成独立进程，并把逻辑 Run、
+ExecutionRequest、ExecutionAttempt 与 RecoveryDecision 分开。lease 归 Attempt；失联只转为
+`RECOVERY_REQUIRED`，由受信任 Operator 接口决定 retry/cancel/fail。完整状态机、PostgreSQL
+模型、fencing、graceful shutdown，以及尚未实现的 Flow 分阶段迁移见
+[`EXECUTOR_DESIGN.md`](EXECUTOR_DESIGN.md)。
 
 ### 已知限制 NEXT-RUN-001：滚动发布后旧 WAITING Run 无法直接恢复
 

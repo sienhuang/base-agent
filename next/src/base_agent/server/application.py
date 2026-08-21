@@ -10,8 +10,9 @@ from fastapi import FastAPI
 
 from base_agent.agent import Agent
 from base_agent.events import EventStore
+from base_agent.execution import ExecutionStore
 from base_agent.run_store import RunStore
-from base_agent.server.app import create_http_app
+from base_agent.server.app import OperatorAuthorizer, create_http_app
 from base_agent.server.registry import RegisteredFlow
 
 LifecycleCallback = Callable[[], None | Awaitable[None]]
@@ -34,6 +35,10 @@ class AgentApplication:
         run_lease_seconds: float = 30.0,
         run_heartbeat_interval_seconds: float | None = None,
         runtime_build_id: str | None = None,
+        execution_store: ExecutionStore | None = None,
+        execution_mode: str = "local",
+        runtime_route: str = "default",
+        operator_authorizer: OperatorAuthorizer | None = None,
         title: str = "base-agent Application",
         prefix: str = "/v1",
         sse_ping_seconds: int = 15,
@@ -50,12 +55,16 @@ class AgentApplication:
         self.run_lease_seconds = run_lease_seconds
         self.run_heartbeat_interval_seconds = run_heartbeat_interval_seconds
         self.runtime_build_id = runtime_build_id
+        self.execution_store = execution_store
+        self.execution_mode = execution_mode
+        self.runtime_route = runtime_route
+        self.operator_authorizer = operator_authorizer
         self.title = title
         self.prefix = prefix
         self.sse_ping_seconds = sse_ping_seconds
 
     def fastapi(self) -> FastAPI:
-        """Create local execution routes with optional persistent read recovery."""
+        """Create local or queued execution routes with persistent read recovery."""
 
         @asynccontextmanager
         async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -83,4 +92,8 @@ class AgentApplication:
             run_lease_seconds=self.run_lease_seconds,
             run_heartbeat_interval_seconds=self.run_heartbeat_interval_seconds,
             runtime_build_id=self.runtime_build_id,
+            execution_store=self.execution_store,
+            execution_mode=self.execution_mode,
+            runtime_route=self.runtime_route,
+            operator_authorizer=self.operator_authorizer,
         )

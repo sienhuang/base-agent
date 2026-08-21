@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from base_agent.execution import RecoveryDecision, RecoveryStrategy
 from base_agent.flows import FlowStatus
 from base_agent.governance import ToolConfirmationDecision
 from base_agent.models import PendingInputKind, RunStatus
@@ -85,6 +86,42 @@ class ArtifactResponse(BaseModel):
 ArtifactRefResponse = ArtifactResponse
 
 
+class RecoveryAttemptResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    attempt_id: str
+    status: str
+    owner_id: str
+    runtime_build_id: str
+    heartbeat_at: datetime
+    lease_expires_at: datetime
+    reason_code: str | None = None
+
+
+class RecoveryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason_code: str
+    revision: int
+    detected_at: datetime
+    last_attempt: RecoveryAttemptResponse | None = None
+
+
+class RecoveryDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: RecoveryDecision
+    strategy: RecoveryStrategy | None = None
+    expected_revision: int = Field(ge=1)
+    subject_id: str = Field(min_length=1, max_length=256)
+    reason_code: str = Field(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    )
+    idempotency_key: str = Field(min_length=1, max_length=256)
+
+
 class RunResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -95,6 +132,10 @@ class RunResponse(BaseModel):
     text: str | None = None
     error: str | None = None
     artifacts: tuple[ArtifactResponse, ...] = ()
+    recovery: RecoveryResponse | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     pending_input: PendingInputResponse | None = Field(
         default=None,
         exclude_if=lambda value: value is None,

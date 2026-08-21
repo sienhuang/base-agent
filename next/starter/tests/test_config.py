@@ -28,6 +28,11 @@ _CONFIG_NAMES = (
     "AGENT_RUN_LEASE_SECONDS",
     "AGENT_RUN_HEARTBEAT_SECONDS",
     "AGENT_RUNTIME_BUILD_ID",
+    "AGENT_EXECUTION_MODE",
+    "AGENT_RUNTIME_ROUTE",
+    "AGENT_WORKER_POLL_SECONDS",
+    "AGENT_WORKER_RECONCILE_SECONDS",
+    "AGENT_OPERATOR_TOKEN",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_MODEL",
@@ -205,6 +210,29 @@ def test_settings_default_to_process_local_event_store(
     assert settings.run_lease_seconds == 30
     assert settings.run_heartbeat_interval_seconds == 10
     assert settings.runtime_build_id is None
+    assert settings.execution_mode == "local"
+    assert settings.runtime_route == "default"
+    assert settings.operator_token is None
+
+
+def test_postgres_worker_settings_can_be_used_by_a_non_api_process(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    for name in _CONFIG_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(config, "_DOTENV_PATH", tmp_path / ".env")
+    monkeypatch.setenv("AGENT_EVENT_STORE", "postgres")
+    monkeypatch.setenv(
+        "AGENT_POSTGRES_DSN",
+        "postgresql://agent:password@db/agent",
+    )
+    monkeypatch.setenv("AGENT_EXECUTION_MODE", "postgres-worker")
+
+    settings = Settings.from_env()
+
+    assert settings.execution_mode == "postgres-worker"
+    assert settings.operator_token is None
 
 
 def test_settings_require_postgres_dsn(

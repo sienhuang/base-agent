@@ -9,6 +9,7 @@ import httpx
 import pytest
 from base_agent.events.postgres import PostgresEventStore, PostgresRunStore
 from base_agent.models import RunStatus
+from base_agent.server.worker import ExecutionWorker, default_python_child_command
 from sqlalchemy.schema import DropSchema
 
 from agent_app import asgi
@@ -19,6 +20,96 @@ requires_postgres = pytest.mark.skipif(
     POSTGRES_DSN is None,
     reason="set BASE_AGENT_NEXT_TEST_POSTGRES_DSN to run PostgreSQL integration tests",
 )
+
+
+@requires_postgres
+async def test_queued_fastapi_and_worker_execute_in_an_isolated_child(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    assert POSTGRES_DSN is not None
+    schema = f"starter_worker_{uuid4().hex}"
+    artifact_root = tmp_path / "artifacts"
+    settings = Settings(
+        provider="offline",
+        artifact_root=artifact_root,
+        event_store="postgres",
+        postgres_dsn=POSTGRES_DSN,
+        postgres_schema=schema,
+        event_poll_interval_seconds=0.01,
+        execution_mode="postgres-worker",
+        runtime_route="starter-test",
+        runtime_build_id="starter-worker-test",
+        operator_token="api-only-test-token",
+    )
+    child_environment = {
+        "AGENT_PROVIDER": "offline",
+        "AGENT_EVENT_STORE": "postgres",
+        "AGENT_POSTGRES_DSN": POSTGRES_DSN,
+        "AGENT_POSTGRES_SCHEMA": schema,
+        "AGENT_EVENT_POLL_INTERVAL_SECONDS": "0.01",
+        "AGENT_EXECUTION_MODE": "postgres-worker",
+        "AGENT_RUNTIME_ROUTE": "starter-test",
+        "AGENT_RUNTIME_BUILD_ID": "starter-worker-test",
+        "AGENT_ARTIFACT_ROOT": str(artifact_root),
+    }
+    for name, value in child_environment.items():
+        monkeypatch.setenv(name, value)
+    application = asgi.create_app(settings)
+    worker = ExecutionWorker(
+        application.state.execution_store,
+        child_command=default_python_child_command("agent_app.execution_child"),
+        runtime_route=settings.runtime_route,
+        runtime_build_id="starter-worker-test",
+        lease_seconds=2,
+        heartbeat_interval_seconds=0.2,
+        poll_interval_seconds=0.01,
+        reconcile_interval_seconds=0.05,
+        child_env_remove=("AGENT_OPERATOR_TOKEN",),
+        child_env_overrides={
+            "AGENT_OPERATOR_TOKEN": "execution-child-no-operator-authority"
+        },
+    )
+
+    try:
+        async with application.router.lifespan_context(application):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=application),
+                base_url="http://testserver",
+            ) as client:
+                started = await client.post(
+                    "/v1/runs",
+                    headers={"Idempotency-Key": "isolated-child-1"},
+                    json={"prompt": "isolated worker"},
+                )
+                started.raise_for_status()
+                run_id = started.json()["run_id"]
+                assert started.json()["status"] == "queued"
+
+                assert await worker.run_once() is True
+                completed = await client.get(f"/v1/runs/{run_id}")
+                history = await client.get(f"/v1/runs/{run_id}/events")
+
+        completed.raise_for_status()
+        history.raise_for_status()
+        kinds = [event["kind"] for event in history.json()]
+        assert completed.json()["status"] == "succeeded"
+        assert kinds.count("run.succeeded") == 1
+        assert "execution.child.succeeded" in kinds
+        assert all(
+            event["payload"].get("execution_attempt_id")
+            for event in history.json()
+            if event["kind"].startswith("execution.child.")
+        )
+    finally:
+        reopened = PostgresEventStore.from_url(POSTGRES_DSN, schema=schema)
+        try:
+            async with reopened.engine.begin() as connection:
+                await connection.execute(
+                    DropSchema(schema, cascade=True, if_exists=True)
+                )
+        finally:
+            await reopened.close()
 
 
 async def _wait_for_terminal(

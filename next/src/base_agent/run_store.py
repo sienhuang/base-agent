@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast, runtime_checkable
 from uuid import uuid4
@@ -82,6 +82,11 @@ class AgentRunRecord(BaseModel):
     status: RunStatus = RunStatus.CREATED
     revision: int = Field(default=1, ge=1)
     cancel_requested: bool = False
+    current_request_id: str | None = None
+    current_attempt_id: str | None = None
+    runtime_route: str = "default"
+    recovery_reason_code: str | None = None
+    recovery_detected_at: datetime | None = None
     lease_owner: str | None = None
     lease_token: str | None = None
     lease_expires_at: datetime | None = None
@@ -100,6 +105,7 @@ class AgentRunRecord(BaseModel):
         "agent_version",
         "snapshot_fingerprint",
         "runtime_build_id",
+        "runtime_route",
     )
     @classmethod
     def required_strings_are_not_blank(cls, value: str) -> str:
@@ -107,7 +113,13 @@ class AgentRunRecord(BaseModel):
             raise ValueError("Run identity fields must not be blank")
         return value
 
-    @field_validator("created_at", "updated_at", "lease_expires_at", "heartbeat_at")
+    @field_validator(
+        "created_at",
+        "updated_at",
+        "lease_expires_at",
+        "heartbeat_at",
+        "recovery_detected_at",
+    )
     @classmethod
     def timestamps_are_timezone_aware(cls, value: datetime | None) -> datetime | None:
         if value is not None and value.tzinfo is None:
@@ -129,8 +141,10 @@ class AgentRunRecord(BaseModel):
             self.lease_expires_at,
             self.heartbeat_at,
         )
-        if self.status is _LEASED_STATUS and any(value is None for value in lease_values):
-            raise ValueError("RUNNING records require a complete lease")
+        if self.status is _LEASED_STATUS and any(value is None for value in lease_values) and any(
+            value is not None for value in lease_values
+        ):
+            raise ValueError("RUNNING records require either a complete lease or no logical lease")
         if self.status is not _LEASED_STATUS and any(value is not None for value in lease_values):
             raise ValueError("only RUNNING records may retain a lease")
         if self.updated_at < self.created_at:
@@ -146,6 +160,10 @@ class AgentRunRecord(BaseModel):
             raise ValueError("WAITING records require checkpoint_revision")
         if self.status is RunStatus.WAITING and self.pending_input is None:
             raise ValueError("WAITING records require pending_input")
+        if self.status is RunStatus.RECOVERY_REQUIRED and self.recovery_reason_code is None:
+            raise ValueError("RECOVERY_REQUIRED records require recovery_reason_code")
+        if self.status is RunStatus.RECOVERY_REQUIRED and self.recovery_detected_at is None:
+            raise ValueError("RECOVERY_REQUIRED records require recovery_detected_at")
         if self.pending_input is not None and self.checkpoint_revision is None:
             raise ValueError("pending_input requires checkpoint_revision")
         if self.status in {
@@ -413,6 +431,45 @@ class InMemoryRunStore:
             )
             self._records[run_id] = cancelled
             return cancelled.model_copy(deep=True)
+
+    async def transition(
+        self,
+        run_id: str,
+        *,
+        expected_statuses: Collection[RunStatus],
+        status: RunStatus,
+        expected_revision: int | None = None,
+        updates: Mapping[str, Any] | None = None,
+    ) -> AgentRunRecord:
+        async with self._lock:
+            record = self._get(run_id)
+            if record.status not in expected_statuses:
+                raise RunTransitionError(
+                    f"Run '{run_id}' with status '{record.status.value}' cannot "
+                    f"transition to '{status.value}'"
+                )
+            if expected_revision is not None and record.revision != expected_revision:
+                raise RunTransitionError(
+                    f"Run '{run_id}' revision changed from {expected_revision} "
+                    f"to {record.revision}"
+                )
+            now = _utc(self._clock())
+            values: dict[str, Any] = {
+                "status": status,
+                "revision": record.revision + 1,
+                "updated_at": now,
+                **dict(updates or {}),
+            }
+            if status is not RunStatus.RUNNING:
+                values.update(
+                    lease_owner=None,
+                    lease_token=None,
+                    lease_expires_at=None,
+                    heartbeat_at=None,
+                )
+            transitioned = _json_record(record.model_copy(update=values))
+            self._records[run_id] = transitioned
+            return transitioned.model_copy(deep=True)
 
     async def block_expired(
         self,

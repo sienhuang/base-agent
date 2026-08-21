@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from base_agent.agent import Agent
+from base_agent.execution import (
+    ExecutionAttempt,
+    RecoveryDecision,
+    RecoveryDecisionRecord,
+    RecoveryStrategy,
+)
 from base_agent.flows import FlowRunHandle
 from base_agent.governance import ToolConfirmation
 from base_agent.run_handle import RunHandle
@@ -36,6 +42,34 @@ class RegisteredFlow(Protocol):
     ) -> FlowRunHandle[Any]: ...
 
 
+class RegisteredRunExecutor(Protocol):
+    async def startup(self) -> tuple[AgentRunRecord, ...]: ...
+
+    async def close(self) -> None: ...
+
+    async def start(
+        self,
+        prompt: str,
+        *,
+        stream: bool = False,
+        idempotency_key: str | None = None,
+    ) -> AgentRunRecord: ...
+
+    async def get(self, run_id: str) -> AgentRunRecord: ...
+
+    def local_handle(self, run_id: str) -> RunHandle | None: ...
+
+    async def resume(self, run_id: str, user_input: str) -> AgentRunRecord: ...
+
+    async def confirm(
+        self,
+        run_id: str,
+        confirmation: ToolConfirmation,
+    ) -> AgentRunRecord: ...
+
+    async def cancel(self, run_id: str) -> AgentRunRecord: ...
+
+
 
 @runtime_checkable
 class ResumableRegisteredFlow(Protocol):
@@ -55,8 +89,9 @@ class InMemoryRunRegistry:
         lease_seconds: float = 30.0,
         heartbeat_interval_seconds: float | None = None,
         runtime_build_id: str | None = None,
+        executor: RegisteredRunExecutor | None = None,
     ) -> None:
-        self.executor = LocalRunExecutor(
+        self.executor = executor or LocalRunExecutor(
             agent,
             run_store or InMemoryRunStore(),
             lease_seconds=lease_seconds,
@@ -64,8 +99,18 @@ class InMemoryRunRegistry:
             runtime_build_id=runtime_build_id,
         )
 
-    async def start(self, prompt: str, *, stream: bool = False) -> AgentRunRecord:
-        return await self.executor.start(prompt, stream=stream)
+    async def start(
+        self,
+        prompt: str,
+        *,
+        stream: bool = False,
+        idempotency_key: str | None = None,
+    ) -> AgentRunRecord:
+        return await self.executor.start(
+            prompt,
+            stream=stream,
+            idempotency_key=idempotency_key,
+        )
 
     def get(self, run_id: str) -> RunHandle:
         handle = self.executor.local_handle(run_id)
@@ -88,6 +133,39 @@ class InMemoryRunRegistry:
 
     async def cancel(self, run_id: str) -> AgentRunRecord:
         return await self.executor.cancel(run_id)
+
+    async def latest_attempt(self, run_id: str) -> ExecutionAttempt | None:
+        method = getattr(self.executor, "latest_attempt", None)
+        if method is None:
+            return None
+        return cast(ExecutionAttempt | None, await method(run_id))
+
+    async def decide_recovery(
+        self,
+        run_id: str,
+        *,
+        decision: RecoveryDecision,
+        strategy: RecoveryStrategy | None,
+        subject_id: str,
+        reason_code: str,
+        expected_revision: int,
+        idempotency_key: str,
+    ) -> tuple[AgentRunRecord, RecoveryDecisionRecord]:
+        method = getattr(self.executor, "decide_recovery", None)
+        if method is None:
+            raise RunNotFoundError("Operator recovery requires queued execution mode")
+        return cast(
+            tuple[AgentRunRecord, RecoveryDecisionRecord],
+            await method(
+                run_id,
+                decision=decision,
+                strategy=strategy,
+                subject_id=subject_id,
+                reason_code=reason_code,
+                expected_revision=expected_revision,
+                idempotency_key=idempotency_key,
+            ),
+        )
 
 
 class InMemoryFlowRegistry:

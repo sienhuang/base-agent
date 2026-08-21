@@ -19,6 +19,7 @@ from base_agent.events.postgres import (
     EventPayloadSerializationError,
     PostgresCheckpointStore,
     PostgresEventStore,
+    PostgresExecutionStore,
     PostgresRunStore,
     build_postgres_event_tables,
 )
@@ -41,6 +42,9 @@ def test_postgres_event_schema_and_configuration_are_validated() -> None:
     assert tables.events.name == "base_agent_events"
     assert tables.checkpoints.name == "base_agent_checkpoints"
     assert tables.runs.name == "base_agent_runs"
+    assert tables.execution_requests.name == "base_agent_execution_requests"
+    assert tables.execution_attempts.name == "base_agent_execution_attempts"
+    assert tables.recovery_decisions.name == "base_agent_recovery_decisions"
     assert {column.name for column in tables.events.primary_key} == {
         "run_id",
         "sequence",
@@ -101,6 +105,75 @@ async def test_postgres_checkpoint_resumes_after_adapter_recreation() -> None:
                 await reopened_checkpoints.load(waiting.run_id)
         finally:
             await reopened_events.close()
+    finally:
+        async with events.engine.begin() as connection:
+            await connection.execute(DropSchema(schema, cascade=True, if_exists=True))
+        await events.close()
+
+
+@requires_postgres
+async def test_postgres_execution_store_fences_claims_and_requires_recovery() -> None:
+    from base_agent.execution import (
+        ExecutionLeaseLostError,
+        ExecutionOperation,
+        RecoveryDecision,
+        RecoveryStrategy,
+    )
+
+    assert POSTGRES_DSN is not None
+    schema = f"base_agent_next_{uuid4().hex}"
+    events = PostgresEventStore.from_url(POSTGRES_DSN, schema=schema)
+    executions = PostgresExecutionStore.from_event_store(events)
+    await events.create_schema()
+    try:
+        queued, _ = await executions.enqueue_run(
+            AgentRunRecord(
+                run_id="queued-run",
+                agent_id="postgres-agent",
+                agent_version="1.0.0",
+                snapshot_fingerprint="snapshot-a",
+                runtime_build_id="build-a",
+            ),
+            operation=ExecutionOperation.EXECUTE,
+            payload={"prompt": "work"},
+            idempotency_key="submit-queued-run",
+        )
+        claims = await asyncio.gather(
+            executions.claim_next(
+                owner_id="worker-a",
+                runtime_route="default",
+                runtime_build_id="build-a",
+                lease_seconds=0.05,
+            ),
+            executions.claim_next(
+                owner_id="worker-b",
+                runtime_route="default",
+                runtime_build_id="build-a",
+                lease_seconds=0.05,
+            ),
+        )
+        claim = next(item for item in claims if item is not None)
+        assert queued.status is RunStatus.QUEUED
+        assert sum(item is not None for item in claims) == 1
+
+        await asyncio.sleep(0.06)
+        transitions = await executions.reconcile_expired()
+        recovery = await executions.runs.get("queued-run")
+        assert len(transitions) == 1
+        assert recovery.status is RunStatus.RECOVERY_REQUIRED
+        with pytest.raises(ExecutionLeaseLostError):
+            await executions.settle(claim.lease, status=RunStatus.SUCCEEDED)
+
+        retried, _ = await executions.decide_recovery(
+            "queued-run",
+            decision=RecoveryDecision.RETRY,
+            strategy=RecoveryStrategy.RESTART,
+            subject_id="operator-1",
+            reason_code="verified_safe",
+            expected_revision=recovery.revision,
+            idempotency_key="ticket-postgres-1",
+        )
+        assert retried.status is RunStatus.QUEUED
     finally:
         async with events.engine.begin() as connection:
             await connection.execute(DropSchema(schema, cascade=True, if_exists=True))

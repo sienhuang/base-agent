@@ -88,7 +88,7 @@ def project_run_response(run_id: str, events: tuple[Event, ...]) -> RunResponse:
         text=text,
         error=error,
         artifacts=_artifact_responses(events),
-        **({"pending_input": pending} if pending is not None else {}),
+        pending_input=pending,
     )
 
 

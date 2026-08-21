@@ -11,6 +11,7 @@ from base_agent import (
     RunStore,
 )
 from base_agent.events import EventStore, InMemoryEventStore
+from base_agent.execution import ExecutionStore, InMemoryExecutionStore
 
 from agent_app.config import Settings
 
@@ -20,6 +21,7 @@ class EventStoreRuntime:
     store: EventStore
     checkpoints: CheckpointStore
     runs: RunStore
+    executions: ExecutionStore
 
     async def start(self) -> None:
         create_schema = getattr(self.store, "create_schema", None)
@@ -35,10 +37,13 @@ class EventStoreRuntime:
 def build_event_store_runtime(settings: Settings) -> EventStoreRuntime:
     """Build the configured Store without hiding infrastructure ownership."""
     if settings.event_store == "memory":
+        events = InMemoryEventStore()
+        runs = InMemoryRunStore()
         return EventStoreRuntime(
-            InMemoryEventStore(),
+            events,
             InMemoryCheckpointStore(),
-            InMemoryRunStore(),
+            runs,
+            InMemoryExecutionStore(runs, event_store=events),
         )
     if settings.postgres_dsn is None:
         raise ValueError(
@@ -48,6 +53,7 @@ def build_event_store_runtime(settings: Settings) -> EventStoreRuntime:
         from base_agent.events.postgres import (
             PostgresCheckpointStore,
             PostgresEventStore,
+            PostgresExecutionStore,
             PostgresRunStore,
         )
     except ImportError as exc:
@@ -63,4 +69,5 @@ def build_event_store_runtime(settings: Settings) -> EventStoreRuntime:
         event_store,
         PostgresCheckpointStore.from_event_store(event_store),
         PostgresRunStore.from_event_store(event_store),
+        PostgresExecutionStore.from_event_store(event_store),
     )

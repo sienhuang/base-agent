@@ -493,6 +493,11 @@ Skill Package 的目录、Tool 贡献、Script 执行边界和 snapshot 契约�
 模块职责、执行不变量和后续迁移顺序见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，旧实现的
 迁入门槛见 [`MIGRATION.md`](MIGRATION.md)。
 
+API/Executor 分离、Supervisor/Child 隔离、ExecutionAttempt 状态细分、周期性 lease
+reconcile 和人工恢复接口见 [`EXECUTOR_DESIGN.md`](EXECUTOR_DESIGN.md)。普通 Agent Run 的
+第一条 PostgreSQL Worker 纵向链路已经实现，默认仍使用兼容的 `LocalRunExecutor`；FlowRunStore、
+Stage 级恢复和副作用证据仍按该文档的后续阶段推进。
+
 当前 Provider 契约、OpenAI-compatible Adapter、错误分类和验收命令见
 [`PROVIDERS.md`](PROVIDERS.md)。
 

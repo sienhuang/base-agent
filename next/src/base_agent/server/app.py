@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, status
+from fastapi import FastAPI, Header, HTTPException, Query, Request, status
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.types import Lifespan
 
@@ -18,6 +18,11 @@ from base_agent.checkpoints import (
     CheckpointNotFoundError,
 )
 from base_agent.events import EventStore, EventStream
+from base_agent.execution import (
+    ExecutionAttempt,
+    ExecutionRequestConflictError,
+    ExecutionStore,
+)
 from base_agent.flows import (
     FlowResult,
     FlowRunHandle,
@@ -41,6 +46,7 @@ from base_agent.run_store import (
     RunStore,
     RunTransitionError,
 )
+from base_agent.server.queued_executor import QueuedRunExecutor
 from base_agent.server.recovery import (
     ExecutionKind,
     is_execution_history,
@@ -62,6 +68,9 @@ from base_agent.server.schemas import (
     FlowChildRunResponse,
     FlowResponse,
     PendingInputResponse,
+    RecoveryAttemptResponse,
+    RecoveryDecisionRequest,
+    RecoveryResponse,
     ResumeRunRequest,
     RunResponse,
     StartFlowRequest,
@@ -69,6 +78,8 @@ from base_agent.server.schemas import (
     StartRunRequest,
     StartRunResponse,
 )
+
+OperatorAuthorizer = Callable[[Request, str], None | Awaitable[None]]
 
 
 def create_http_app(
@@ -84,8 +95,12 @@ def create_http_app(
     run_lease_seconds: float = 30.0,
     run_heartbeat_interval_seconds: float | None = None,
     runtime_build_id: str | None = None,
+    execution_store: ExecutionStore | None = None,
+    execution_mode: str = "local",
+    runtime_route: str = "default",
+    operator_authorizer: OperatorAuthorizer | None = None,
 ) -> FastAPI:
-    """Create HTTP routes with process-local execution and persistent read fallback."""
+    """Create HTTP routes with local or independently queued Agent execution."""
     if not prefix.startswith("/") or (len(prefix) > 1 and prefix.endswith("/")):
         raise ValueError("prefix must start with '/' and must not end with '/'")
     if sse_ping_seconds < 1:
@@ -93,9 +108,27 @@ def create_http_app(
     route_prefix = "" if prefix == "/" else prefix
     if agent is None and not flows:
         raise ValueError("create_http_app requires at least one Agent or Flow")
+    if execution_mode not in {"local", "queued"}:
+        raise ValueError("execution_mode must be local or queued")
+    if execution_mode == "queued" and (run_store is None or execution_store is None):
+        raise ValueError("queued execution requires run_store and execution_store")
     resolved_flows = dict(flows or {})
     _validate_event_store_ownership(event_store, agent, resolved_flows)
     resolved_run_store = run_store or (InMemoryRunStore() if agent is not None else None)
+    queued_executor = (
+        QueuedRunExecutor(
+            agent,
+            resolved_run_store,
+            execution_store,
+            runtime_route=runtime_route,
+            runtime_build_id=runtime_build_id,
+        )
+        if agent is not None
+        and resolved_run_store is not None
+        and execution_store is not None
+        and execution_mode == "queued"
+        else None
+    )
     registry = (
         InMemoryRunRegistry(
             agent,
@@ -103,6 +136,7 @@ def create_http_app(
             lease_seconds=run_lease_seconds,
             heartbeat_interval_seconds=run_heartbeat_interval_seconds,
             runtime_build_id=runtime_build_id,
+            executor=queued_executor,
         )
         if agent is not None and resolved_run_store is not None
         else None
@@ -134,6 +168,7 @@ def create_http_app(
     app.state.flow_registry = flow_registry
     app.state.event_store = recovery_store
     app.state.run_store = resolved_run_store
+    app.state.execution_store = execution_store
     app.state.sse_ping_seconds = sse_ping_seconds
 
     if registry is not None:
@@ -143,6 +178,7 @@ def create_http_app(
             event_store=recovery_store,
             route_prefix=route_prefix,
             sse_ping_seconds=sse_ping_seconds,
+            operator_authorizer=operator_authorizer,
         )
 
     if flow_registry.names:
@@ -324,14 +360,28 @@ def _register_run_routes(
     event_store: EventStore | None,
     route_prefix: str,
     sse_ping_seconds: int,
+    operator_authorizer: OperatorAuthorizer | None,
 ) -> None:
     @app.post(
         f"{route_prefix}/runs",
         response_model=StartRunResponse,
         status_code=status.HTTP_202_ACCEPTED,
     )
-    async def start_run(payload: StartRunRequest) -> StartRunResponse:
-        record = await registry.start(payload.prompt, stream=payload.stream)
+    async def start_run(
+        payload: StartRunRequest,
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key", min_length=1, max_length=256),
+        ] = None,
+    ) -> StartRunResponse:
+        try:
+            record = await registry.start(
+                payload.prompt,
+                stream=payload.stream,
+                idempotency_key=idempotency_key,
+            )
+        except ExecutionRequestConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return StartRunResponse(run_id=record.run_id, status=record.status)
 
     @app.get(
@@ -344,7 +394,11 @@ def _register_run_routes(
         except RunRecordNotFoundError:
             events = await _persisted_events(event_store, run_id, kind="run")
             return project_run_response(run_id, events)
-        return await _run_record_response(record, event_store)
+        return await _run_record_response(
+            record,
+            event_store,
+            recovery_attempt=await registry.latest_attempt(run_id),
+        )
 
     @app.post(
         f"{route_prefix}/runs/{{run_id}}/resume",
@@ -365,6 +419,48 @@ def _register_run_routes(
         ) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return await _run_record_response(record, event_store)
+
+    @app.post(
+        f"{route_prefix}/operator/runs/{{run_id}}/recovery-decisions",
+        response_model=RunResponse,
+    )
+    async def decide_run_recovery(
+        request: Request,
+        run_id: str,
+        payload: RecoveryDecisionRequest,
+    ) -> RunResponse:
+        if operator_authorizer is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Operator recovery authorization is not configured",
+            )
+        authorization = operator_authorizer(request, payload.subject_id)
+        if isinstance(authorization, Awaitable):
+            await authorization
+        try:
+            record, _ = await registry.decide_recovery(
+                run_id,
+                decision=payload.decision,
+                strategy=payload.strategy,
+                subject_id=payload.subject_id,
+                reason_code=payload.reason_code,
+                expected_revision=payload.expected_revision,
+                idempotency_key=payload.idempotency_key,
+            )
+        except RunRecordNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (
+            ExecutionRequestConflictError,
+            RunTransitionError,
+            RunNotFoundError,
+            ValueError,
+        ) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return await _run_record_response(
+            record,
+            event_store,
+            recovery_attempt=await registry.latest_attempt(run_id),
+        )
 
     @app.post(
         f"{route_prefix}/runs/{{run_id}}/confirm",
@@ -432,7 +528,12 @@ def _register_run_routes(
         """Replay the persisted Event history strictly after one cursor."""
         handle = _find_handle(registry, run_id)
         if handle is None:
-            events = await _persisted_events(event_store, run_id, kind="run")
+            try:
+                await registry.record(run_id)
+            except RunRecordNotFoundError:
+                events = await _persisted_events(event_store, run_id, kind="run")
+            else:
+                events = () if event_store is None else await event_store.list(run_id)
             return tuple(
                 _event_response(event)
                 for event in events
@@ -468,7 +569,10 @@ def _register_run_routes(
             except EventStreamingNotSupportedError as exc:
                 raise HTTPException(status_code=501, detail=str(exc)) from exc
         else:
-            await _persisted_events(event_store, run_id, kind="run")
+            try:
+                await registry.record(run_id)
+            except RunRecordNotFoundError:
+                await _persisted_events(event_store, run_id, kind="run")
             events = _persisted_stream(
                 event_store,
                 run_id,
@@ -640,7 +744,7 @@ async def _run_response(handle: RunHandle) -> RunResponse:
         text=result.text,
         error=result.error,
         artifacts=tuple(_artifact_response(artifact) for artifact in result.artifacts),
-        **_pending_response_argument(result),
+        pending_input=_pending_response(result),
     )
 
 
@@ -657,13 +761,15 @@ async def _run_result_response(
         text=result.text,
         error=result.error,
         artifacts=tuple(_artifact_response(artifact) for artifact in result.artifacts),
-        **_pending_response_argument(result),
+        pending_input=_pending_response(result),
     )
 
 
 async def _run_record_response(
     record: AgentRunRecord,
     event_store: EventStore | None,
+    *,
+    recovery_attempt: ExecutionAttempt | None = None,
 ) -> RunResponse:
     events = () if event_store is None else await event_store.list(record.run_id)
     pending = (
@@ -679,26 +785,54 @@ async def _run_record_response(
         text=record.text,
         error=record.error,
         artifacts=_artifact_responses(events),
-        **({"pending_input": pending} if pending is not None else {}),
+        pending_input=pending,
+        recovery=_recovery_response(record, recovery_attempt),
     )
 
 
-def _pending_response_argument(
+def _recovery_response(
+    record: AgentRunRecord,
+    attempt: ExecutionAttempt | None,
+) -> RecoveryResponse | None:
+    if record.status not in {RunStatus.RECOVERY_REQUIRED, RunStatus.BLOCKED}:
+        return None
+    if record.recovery_reason_code is None or record.recovery_detected_at is None:
+        return None
+    last_attempt = (
+        RecoveryAttemptResponse(
+            attempt_id=attempt.attempt_id,
+            status=attempt.status.value,
+            owner_id=attempt.owner_id,
+            runtime_build_id=attempt.runtime_build_id,
+            heartbeat_at=attempt.heartbeat_at,
+            lease_expires_at=attempt.lease_expires_at,
+            reason_code=attempt.reason_code,
+        )
+        if attempt is not None
+        else None
+    )
+    return RecoveryResponse(
+        reason_code=record.recovery_reason_code,
+        revision=record.revision,
+        detected_at=record.recovery_detected_at,
+        last_attempt=last_attempt,
+    )
+
+
+def _pending_response(
     result: RunResult,
-) -> dict[str, PendingInputResponse]:
+) -> PendingInputResponse | None:
     pending = result.pending_input
     if pending is None:
-        return {}
-    return {
-        "pending_input": PendingInputResponse(
-            request_id=pending.request_id,
-            kind=pending.kind,
-            tool_call_id=pending.tool_call_id,
-            tool_name=pending.tool_name,
-            prompt=pending.prompt,
-            metadata=dict(pending.metadata),
-        )
-    }
+        return None
+    return PendingInputResponse(
+        request_id=pending.request_id,
+        kind=pending.kind,
+        tool_call_id=pending.tool_call_id,
+        tool_name=pending.tool_name,
+        prompt=pending.prompt,
+        metadata=dict(pending.metadata),
+    )
 
 
 async def _flow_response(

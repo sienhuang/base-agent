@@ -23,6 +23,7 @@ StructuredOutputMode = Literal[
 ]
 PlanReactRole = Literal["planner", "executor"]
 EventStoreName = Literal["memory", "postgres"]
+ExecutionMode = Literal["local", "postgres-worker"]
 
 _PROVIDER_NAMES = frozenset(
     {
@@ -40,6 +41,7 @@ _STRUCTURED_OUTPUT_MODES = frozenset(
     }
 )
 _EVENT_STORE_NAMES = frozenset({"memory", "postgres"})
+_EXECUTION_MODES = frozenset({"local", "postgres-worker"})
 
 _APPLICATION_ROOT = Path(__file__).resolve().parents[2]
 _DOTENV_PATH = _APPLICATION_ROOT / ".env"
@@ -71,6 +73,11 @@ class Settings:
     run_lease_seconds: float = 30.0
     run_heartbeat_interval_seconds: float = 10.0
     runtime_build_id: str | None = None
+    execution_mode: ExecutionMode = "local"
+    runtime_route: str = "default"
+    worker_poll_interval_seconds: float = 0.5
+    worker_reconcile_interval_seconds: float = 5.0
+    operator_token: str | None = None
 
     @classmethod
     def from_env(
@@ -136,6 +143,12 @@ class Settings:
             run_heartbeat_interval_seconds = float(
                 _env_value("AGENT_RUN_HEARTBEAT_SECONDS", file_values) or "10"
             )
+            worker_poll_interval_seconds = float(
+                _env_value("AGENT_WORKER_POLL_SECONDS", file_values) or "0.5"
+            )
+            worker_reconcile_interval_seconds = float(
+                _env_value("AGENT_WORKER_RECONCILE_SECONDS", file_values) or "5"
+            )
         except ValueError as exc:
             raise ValueError(
                 "Event polling and Run lease settings must be numeric"
@@ -156,6 +169,8 @@ class Settings:
                 "AGENT_RUN_HEARTBEAT_SECONDS must be positive and shorter than "
                 "AGENT_RUN_LEASE_SECONDS"
             )
+        if worker_poll_interval_seconds <= 0 or worker_reconcile_interval_seconds <= 0:
+            raise ValueError("Worker polling and reconciliation settings must be positive")
 
         raw_event_store = (
             _env_value("AGENT_EVENT_STORE", file_values) or "memory"
@@ -168,6 +183,20 @@ class Settings:
             raise ValueError(
                 "AGENT_POSTGRES_DSN is required when AGENT_EVENT_STORE=postgres"
             )
+        raw_execution_mode = (
+            _env_value("AGENT_EXECUTION_MODE", file_values) or "local"
+        ).strip().lower()
+        if raw_execution_mode not in _EXECUTION_MODES:
+            raise ValueError("AGENT_EXECUTION_MODE must be local or postgres-worker")
+        execution_mode = cast(ExecutionMode, raw_execution_mode)
+        if execution_mode == "postgres-worker" and event_store != "postgres":
+            raise ValueError("postgres-worker execution requires AGENT_EVENT_STORE=postgres")
+        operator_token = _optional_env("AGENT_OPERATOR_TOKEN", file_values)
+        runtime_route = (
+            _env_value("AGENT_RUNTIME_ROUTE", file_values) or "default"
+        ).strip()
+        if not runtime_route:
+            raise ValueError("AGENT_RUNTIME_ROUTE must not be blank")
         postgres_schema = (
             _env_value("AGENT_POSTGRES_SCHEMA", file_values) or "base_agent"
         ).strip()
@@ -222,6 +251,11 @@ class Settings:
             run_lease_seconds=run_lease_seconds,
             run_heartbeat_interval_seconds=run_heartbeat_interval_seconds,
             runtime_build_id=_optional_env("AGENT_RUNTIME_BUILD_ID", file_values),
+            execution_mode=execution_mode,
+            runtime_route=runtime_route,
+            worker_poll_interval_seconds=worker_poll_interval_seconds,
+            worker_reconcile_interval_seconds=worker_reconcile_interval_seconds,
+            operator_token=operator_token,
         )
 
     def for_plan_react_role(self, role: PlanReactRole) -> Settings:

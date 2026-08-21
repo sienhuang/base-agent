@@ -31,8 +31,10 @@ class FinishReason(StrEnum):
 
 class RunStatus(StrEnum):
     CREATED = "created"
+    QUEUED = "queued"
     RUNNING = "running"
     WAITING = "waiting"
+    RECOVERY_REQUIRED = "recovery_required"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
