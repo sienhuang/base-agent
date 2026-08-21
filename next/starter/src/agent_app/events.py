@@ -12,6 +12,7 @@ from base_agent import (
 )
 from base_agent.events import EventStore, InMemoryEventStore
 from base_agent.execution import ExecutionStore, InMemoryExecutionStore
+from base_agent.flow_store import FlowRunStore, InMemoryFlowRunStore
 
 from agent_app.config import Settings
 
@@ -21,6 +22,7 @@ class EventStoreRuntime:
     store: EventStore
     checkpoints: CheckpointStore
     runs: RunStore
+    flows: FlowRunStore
     executions: ExecutionStore
 
     async def start(self) -> None:
@@ -39,11 +41,17 @@ def build_event_store_runtime(settings: Settings) -> EventStoreRuntime:
     if settings.event_store == "memory":
         events = InMemoryEventStore()
         runs = InMemoryRunStore()
+        flows = InMemoryFlowRunStore()
         return EventStoreRuntime(
             events,
             InMemoryCheckpointStore(),
             runs,
-            InMemoryExecutionStore(runs, event_store=events),
+            flows,
+            InMemoryExecutionStore(
+                runs,
+                flow_store=flows,
+                event_store=events,
+            ),
         )
     if settings.postgres_dsn is None:
         raise ValueError(
@@ -65,9 +73,11 @@ def build_event_store_runtime(settings: Settings) -> EventStoreRuntime:
         schema=settings.postgres_schema,
         poll_interval=settings.event_poll_interval_seconds,
     )
+    executions = PostgresExecutionStore.from_event_store(event_store)
     return EventStoreRuntime(
         event_store,
         PostgresCheckpointStore.from_event_store(event_store),
         PostgresRunStore.from_event_store(event_store),
-        PostgresExecutionStore.from_event_store(event_store),
+        executions.flows,
+        executions,
     )

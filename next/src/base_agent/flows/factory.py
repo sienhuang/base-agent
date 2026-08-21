@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from base_agent.agent import Agent
 from base_agent.artifacts import ArtifactRef, ArtifactSpec
 from base_agent.events import EventStore
+from base_agent.flows.checkpoints import CheckpointWriter
 from base_agent.flows.planning import PlannerReActFlow, PlanningLimits
 from base_agent.flows.sequential import SequentialFlow, Stage
 from base_agent.observability import Observer
@@ -23,6 +24,7 @@ class Flow:
         forward_child_events: bool = False,
         artifact_specs: Sequence[ArtifactSpec | ArtifactRef] = (),
         artifacts: Sequence[ArtifactSpec | ArtifactRef] = (),
+        checkpoint_writer: CheckpointWriter | None = None,
     ) -> SequentialFlow:
         return SequentialFlow(
             id=id,
@@ -32,6 +34,7 @@ class Flow:
             forward_child_events=forward_child_events,
             artifact_specs=artifact_specs,
             artifacts=artifacts,
+            checkpoint_writer=checkpoint_writer,
         )
 
     @staticmethod
@@ -44,6 +47,7 @@ class Flow:
         observers: Sequence[Observer] = (),
         event_store: EventStore | None = None,
         forward_child_events: bool = False,
+        checkpoint_writer: CheckpointWriter | None = None,
     ) -> PlannerReActFlow:
         return PlannerReActFlow(
             id=id,
@@ -53,4 +57,5 @@ class Flow:
             observers=observers,
             event_store=event_store,
             forward_child_events=forward_child_events,
+            checkpoint_writer=checkpoint_writer,
         )

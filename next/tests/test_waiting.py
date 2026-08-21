@@ -13,8 +13,10 @@ from base_agent import (
     CheckpointNotFoundError,
     Confirmation,
     Flow,
+    FlowCheckpoint,
     FlowStatus,
     InMemoryCheckpointStore,
+    InMemoryFlowRunStore,
     PlannerDecision,
     RunStatus,
     SideEffect,
@@ -42,6 +44,14 @@ def _definition(*tools: str) -> AgentDefinition:
         max_model_turns=2,
         max_tool_calls_per_turn=4,
     )
+
+
+def _flow_checkpoint_writer(store: InMemoryFlowRunStore):
+    async def write(checkpoint: FlowCheckpoint) -> FlowCheckpoint:
+        expected = checkpoint.revision - 1 or None
+        return await store.save(checkpoint, expected_revision=expected)
+
+    return write
 
 
 async def test_tool_input_waits_and_resumes_the_same_run() -> None:
@@ -608,6 +618,155 @@ async def test_planner_react_flow_can_wait_again_after_resume() -> None:
     assert second_wait_event_kinds[-2:] == ["flow.resumed", "flow.waiting"]
 
     completed = await flow.resume(second_wait.flow_run_id, "2025")
+
+    assert completed.status is FlowStatus.SUCCEEDED
+    assert completed.output == "report ready"
+    assert [child.run.status for child in completed.child_runs] == [
+        RunStatus.SUCCEEDED,
+        RunStatus.SUCCEEDED,
+        RunStatus.SUCCEEDED,
+    ]
+
+
+async def test_sequential_flow_resumes_from_a_recreated_flow_checkpoint() -> None:
+    @tool
+    async def ask() -> WaitForInput:
+        return WaitForInput("Region?")
+
+    model = FakeModel(
+        [
+            ModelResponse(
+                tool_calls=(ToolCall(id="ask-restored-flow", name="ask", arguments={}),)
+            ),
+            ModelResponse(content="query ready"),
+        ]
+    )
+    agent_checkpoints = InMemoryCheckpointStore()
+    flow_checkpoints = InMemoryFlowRunStore()
+
+    def build_flow():
+        query = Agent(
+            _definition("ask"),
+            model=model,
+            tools=(ask,),
+            checkpoint_store=agent_checkpoints,
+        )
+        report = Agent(
+            AgentDefinition(
+                id="restored-report",
+                version="1.0.0",
+                instructions="Report.",
+            ),
+            model=FakeModel.text("report ready"),
+        )
+        return Flow.sequence(
+            id="restored-sequential",
+            stages=(
+                Stage(name="query", agent=query),
+                Stage(name="report", agent=report, input_from="query"),
+            ),
+            checkpoint_writer=_flow_checkpoint_writer(flow_checkpoints),
+        )
+
+    waiting = await build_flow().run("Build")
+    checkpoint = await flow_checkpoints.load(waiting.flow_run_id)
+    recreated = build_flow()
+    await recreated.restore_checkpoint(checkpoint)
+    completed = await recreated.resume(waiting.flow_run_id, "APAC")
+
+    assert completed.status is FlowStatus.SUCCEEDED
+    assert completed.output == "report ready"
+    assert [stage.name for stage in completed.stages] == ["query", "report"]
+
+
+async def test_planner_react_resumes_from_a_recreated_flow_checkpoint() -> None:
+    @tool
+    async def ask() -> WaitForInput:
+        return WaitForInput("Region?")
+
+    planner_model = FakeModel(
+        [
+            ModelResponse(
+                content=json.dumps(
+                    {
+                        "action": "create",
+                        "goal": "Build report",
+                        "steps": [{"description": "Analyze region"}],
+                        "reason": "one step",
+                        "final_output": None,
+                    }
+                )
+            ),
+            ModelResponse(
+                content=json.dumps(
+                    {
+                        "action": "complete",
+                        "goal": "Build report",
+                        "steps": [],
+                        "reason": "done",
+                        "final_output": "report ready",
+                    }
+                )
+            ),
+        ]
+    )
+    executor_model = FakeModel(
+        [
+            ModelResponse(
+                tool_calls=(ToolCall(id="ask-restored-plan", name="ask", arguments={}),)
+            ),
+            ModelResponse(
+                content=json.dumps(
+                    {
+                        "success": True,
+                        "summary": "analyzed",
+                        "output": "APAC",
+                        "error": None,
+                        "artifact_ids": [],
+                    }
+                )
+            ),
+        ]
+    )
+    agent_checkpoints = InMemoryCheckpointStore()
+    flow_checkpoints = InMemoryFlowRunStore()
+
+    def build_flow():
+        planner = Agent(
+            AgentDefinition(
+                id="restored-planner",
+                version="1.0.0",
+                instructions="Plan.",
+                response_model=PlannerDecision,
+            ),
+            model=planner_model,
+            checkpoint_store=agent_checkpoints,
+        )
+        executor = Agent(
+            AgentDefinition(
+                id="restored-executor",
+                version="1.0.0",
+                instructions="Execute.",
+                tools=("ask",),
+                max_model_turns=2,
+                response_model=StepOutcome,
+            ),
+            model=executor_model,
+            tools=(ask,),
+            checkpoint_store=agent_checkpoints,
+        )
+        return Flow.planner_react(
+            id="restored-plan-react",
+            planner=planner,
+            executor=executor,
+            checkpoint_writer=_flow_checkpoint_writer(flow_checkpoints),
+        )
+
+    waiting = await build_flow().run("Build")
+    checkpoint = await flow_checkpoints.load(waiting.flow_run_id)
+    recreated = build_flow()
+    await recreated.restore_checkpoint(checkpoint)
+    completed = await recreated.resume(waiting.flow_run_id, "APAC")
 
     assert completed.status is FlowStatus.SUCCEEDED
     assert completed.output == "report ready"

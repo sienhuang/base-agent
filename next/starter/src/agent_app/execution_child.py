@@ -64,6 +64,14 @@ async def execute_child(payload: ChildExecutionInput) -> ChildExecutionResult:
                     "use a compatible AGENT_RUNTIME_ROUTE"
                 ),
             )
+        if (
+            payload.request.operation is ExecutionOperation.RECOVER
+            and RecoveryStrategy(
+                payload.request.payload["recovery_strategy"]
+            )
+            is RecoveryStrategy.RESTART
+        ):
+            await runtime.checkpoints.delete(payload.run.run_id)
         result = await _execute_operation(agent, payload)
         checkpoint_revision: int | None = None
         pending_input: dict[str, Any] | None = None

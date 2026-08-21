@@ -61,8 +61,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         run_store=event_runtime.runs,
         run_lease_seconds=resolved_settings.run_lease_seconds,
         run_heartbeat_interval_seconds=resolved_settings.run_heartbeat_interval_seconds,
-        runtime_build_id=resolved_settings.runtime_build_id,
+        runtime_build_id=(
+            resolved_settings.runtime_build_id or agent.snapshot.fingerprint
+        ),
         execution_store=event_runtime.executions,
+        flow_store=event_runtime.flows,
         execution_mode=(
             "queued"
             if resolved_settings.execution_mode == "postgres-worker"

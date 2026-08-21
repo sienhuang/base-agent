@@ -30,6 +30,7 @@ dev = [
 agent-app = "agent_app.cli:main"
 agent-server = "agent_app.asgi:main"
 agent-worker = "agent_app.worker:main"
+execution-worker = "agent_app.worker:main"
 
 [build-system]
 requires = ["hatchling>=1.27"]

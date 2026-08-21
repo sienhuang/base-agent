@@ -22,7 +22,8 @@ src/agent_app/
 ├── cli.py                 # 命令行入口
 ├── asgi.py                # 只构造 Agent；HTTP 实现来自 base_agent.server
 ├── worker.py              # PostgreSQL Execution Worker composition root
-├── execution_child.py     # 每个 Attempt 的隔离子进程协议
+├── execution_child.py     # Agent Handler 的隔离子进程协议
+├── flow_execution_child.py # Flow Handler 的隔离子进程协议
 ├── assets.py              # Prompt asset loader
 ├── tools.py               # 应用拥有的类型化 Tools
 ├── skills/                # 应用拥有的 Skill catalog
@@ -236,11 +237,13 @@ AGENT_RUNTIME_BUILD_ID=release-2026-08-20
 
 `AGENT_POSTGRES_SCHEMA` 是 PostgreSQL namespace，不是另一份配置文件。FastAPI 启动时会在该
 schema 中创建 `base_agent_event_sequences`、`base_agent_events`、
-`base_agent_checkpoints`、`base_agent_runs`、`base_agent_execution_requests`、
+`base_agent_checkpoints`、`base_agent_runs`、`base_agent_flow_runs`、
+`base_agent_flow_checkpoints`、`base_agent_execution_requests`、
 `base_agent_execution_attempts` 和 `base_agent_recovery_decisions`，关闭时释放 Starter 自己创建的
 连接池。DSN、schema
 和轮询间隔由 Starter 读取；EventStore 注入普通 Agent、Planner、Executor 和 Flow，共享同一
-Engine 的 CheckpointStore 注入所有 Agent，RunStore 则作为顶层普通 Agent Run 的状态权威。
+Engine 的 CheckpointStore 注入所有 Agent；RunStore/FlowRunStore 分别作为顶层 Agent/Flow 的
+状态权威。
 
 `AGENT_RUN_LEASE_SECONDS` 是本地 Executor 对 `RUNNING` Run 的所有权期限，
 `AGENT_RUN_HEARTBEAT_SECONDS` 必须更短。每次心跳都用 lease token 做 fencing；服务故障后，超过
@@ -248,10 +251,10 @@ Engine 的 CheckpointStore 注入所有 Agent，RunStore 则作为顶层普通 A
 重放模型或 Tool。`AGENT_RUNTIME_BUILD_ID` 建议填写镜像 digest、Git SHA 或发布号；未填写时使用
 Agent snapshot fingerprint。RunRecord 同时保存两者，但当前等待恢复仍要求 snapshot 完全一致。
 
-### 使用独立 Agent Worker
+### 使用独立 Execution Worker
 
-本地模式仍是默认值。要让 FastAPI 只提交普通 Agent Run，并由独立 Supervisor 执行，在 API 和
-Worker 使用的同一份 `.env` 中增加：
+本地模式仍是默认值。要让 FastAPI 只提交 Agent Run/Flow Run，并由独立 Supervisor 执行，在
+API 和 Worker 使用的同一份 `.env` 中增加：
 
 ```dotenv
 AGENT_EVENT_STORE=postgres
@@ -271,18 +274,19 @@ AGENT_OPERATOR_TOKEN=replace-with-a-long-random-secret \
   uv run --project next/starter --extra postgres \
   agent-server --host 127.0.0.1 --port 8000
 
-uv run --project next/starter --extra postgres agent-worker
+uv run --project next/starter --extra postgres execution-worker
 ```
 
-`POST /v1/runs` 此时返回 `queued`。Worker 通过 PostgreSQL claim request，为每个 Attempt 启动
-独立 `agent-execution-child` 进程；Supervisor 在 child 外续租，所以 child 内同步阻塞的 Tool
-不会阻塞 heartbeat。child Event 会携带 `execution_attempt_id`，PostgreSQL EventStore 在同一事务
-校验 fencing token 后才接受 Event。
+`agent-worker` 作为兼容入口仍可使用。`POST /v1/runs` 和 `POST /v1/flows/plan-react` 此时都返回
+`queued`。同一个 Worker 从同一张 request 表领取任务，再按 `target_kind=agent_run|flow_run`
+分派给 Agent 或 Flow Handler；每个 Attempt 启动隔离 child。Supervisor 在 child 外续租，所以
+child 内同步阻塞的 Tool 不会阻塞 heartbeat。child Event 会携带 `execution_attempt_id`，
+PostgreSQL EventStore 在同一事务校验 fencing token 后才接受 Event。
 
-调用方重试提交时应复用 `Idempotency-Key` 请求头；相同 key 和相同输入返回同一个 Run，相同
-key 但不同输入返回 `409`。
+调用方重试 Agent 或 Flow 提交时应复用 `Idempotency-Key` 请求头；相同 key 和相同输入返回同一个
+逻辑任务，相同 key 但不同输入返回 `409`。
 
-Worker 正常停止会把活动 Run 转成 `recovery_required(reason=worker_shutdown)`；异常退出则由任一
+Worker 正常停止会把活动 Agent/Flow 转成 `recovery_required(reason=worker_shutdown)`；异常退出则由任一
 Worker 的周期 reconciler 在 lease 真正过期后转成
 `recovery_required(reason=owner_lease_expired)`，不会自动重跑。恢复上下文直接查询原接口：
 
@@ -303,9 +307,11 @@ curl http://127.0.0.1:8000/v1/operator/runs/RUN_ID/recovery-decisions \
 ```
 
 `resume`/`confirm` 仍只用于 `waiting`，不能替代 Operator recovery decision。第一版独立 Worker
-只覆盖顶层普通 Agent Run；`plan-react` Flow 仍在 API 进程本地执行，待 FlowRunStore 和 Plan/Stage
-checkpoint 完成后再接同一执行面。Starter 的 `LocalArtifactStore` 也要求 API、Worker child 能看到
-同一路径；多节点生产部署应换成共享 ArtifactStore。
+已经覆盖顶层 Agent Run 和 `plan-react` Flow：Flow 在 Plan/Step 安全边界写入 FlowCheckpoint，
+WAITING 时同时保存父 Flow cursor 与等待中的 child Run ID。Operator 可通过
+`/v1/operator/flows/{flow_run_id}/recovery-decisions` 选择 `from_checkpoint` 或 `restart`。
+Starter 的 `LocalArtifactStore` 仍要求 API、Worker child 能看到同一路径；多节点生产部署应换成
+共享 ArtifactStore。
 
 启动服务并分别提交普通 Run 和 Planner-ReAct Flow：
 
@@ -334,6 +340,11 @@ SELECT run_id, status, revision, lease_owner, lease_expires_at,
        runtime_build_id, snapshot_fingerprint, updated_at
 FROM base_agent.base_agent_runs
 WHERE run_id = '<agent-run-id>';
+
+SELECT flow_run_id, flow_name, flow_kind, status, revision,
+       checkpoint_revision, current_attempt_id, updated_at
+FROM base_agent.base_agent_flow_runs
+WHERE flow_run_id = '<flow-run-id>';
 ```
 
 也可以运行真实 PostgreSQL 集成测试。测试会经 FastAPI 创建一个普通 Run 和一个
@@ -346,16 +357,12 @@ BASE_AGENT_NEXT_TEST_POSTGRES_DSN='postgresql://agent:password@127.0.0.1:5432/ag
   pytest tests/test_postgres_events.py -q
 ```
 
-`RunRegistry` 仍只保留当前进程的 Handle，但普通 Agent Run 的状态、取消请求、所有者和结果由
-PostgreSQL RunStore 管理；EventStore 负责历史与 SSE。服务重启后，已完成和 `WAITING` 的普通 Run
-可以直接查询，`WAITING` 可凭 PostgreSQL checkpoint 在新进程继续或取消。故障时遗留的
-`RUNNING` 在租约到期后变为 `BLOCKED`，由人工检查副作用后决定后续操作，不会自动拉起。部署前
-创建、只有 Event/checkpoint 的旧版 `WAITING` Run 会在首次访问时自动补建 RunRecord。
-
-FlowRunRegistry 仍是进程内执行所有者，Flow 读路由继续用 Event 投影恢复 Plan、子 Run 和
-Artifact。把 Run ID 用在 Flow 路由（或反过来）会返回 404。父 Planner-ReAct Flow 的调度位置
-尚未写入独立 FlowRunStore，因此这一版只解决顶层普通 Agent Run；Flow 的跨进程执行恢复仍是
-下一阶段工作。
+本地模式的 Registry 仍只保留当前进程 Handle；queued 模式下普通 Agent 与 Flow 分别由
+PostgreSQL RunStore/FlowRunStore 管理状态、取消请求和结果，EventStore 负责历史与 SSE。
+服务重启后，已完成和 `WAITING` 的 Agent/Flow 都可以直接查询；`WAITING` 分别凭 Agent checkpoint
+与 Flow checkpoint 在新 child 中继续。故障遗留的 `RUNNING` 在租约到期后进入
+`RECOVERY_REQUIRED`，由人工检查副作用后决定 `restart`/`from_checkpoint`/取消/失败，不会自动
+拉起。把 Run ID 用在 Flow 路由（或反过来）仍返回 404。
 
 提交并查询 Run：
 

@@ -62,6 +62,18 @@ from base_agent.execution import (
     _derived_idempotency_key,
     _validate_recovery_intent,
 )
+from base_agent.flow_store import (
+    FlowCheckpoint,
+    FlowCheckpointConflictError,
+    FlowCheckpointNotFoundError,
+    FlowRunAlreadyExistsError,
+    FlowRunRecord,
+    FlowRunRecordNotFoundError,
+    FlowTransitionError,
+    flow_checkpoint_json,
+    flow_record_json,
+)
+from base_agent.flows.models import FlowStatus
 from base_agent.models import Event, RunStatus
 from base_agent.run_store import (
     AgentRunRecord,
@@ -81,18 +93,24 @@ _TERMINAL_EVENT_KINDS = frozenset(
         "flow.failed",
         "flow.cancelled",
         "flow.waiting",
+        "flow.blocked",
+        "flow.recovery_required",
         "run.succeeded",
         "run.failed",
         "run.cancelled",
         "run.waiting",
         "run.blocked",
         "run.interrupted",
+        "run.recovery_required",
     }
 )
 _PERMANENT_TERMINAL_EVENT_KINDS = _TERMINAL_EVENT_KINDS - {
     "flow.waiting",
+    "flow.blocked",
+    "flow.recovery_required",
     "run.waiting",
     "run.blocked",
+    "run.recovery_required",
 }
 
 
@@ -107,6 +125,8 @@ class PostgresEventTables:
     events: Table
     checkpoints: Table
     runs: Table
+    flow_runs: Table
+    flow_checkpoints: Table
     execution_requests: Table
     execution_attempts: Table
     recovery_decisions: Table
@@ -159,6 +179,38 @@ def build_postgres_event_tables(schema: str | None = None) -> PostgresEventTable
         Column("lease_owner", String(512), nullable=True, index=True),
         Column("lease_expires_at", DateTime(timezone=True), nullable=True, index=True),
         Column("heartbeat_at", DateTime(timezone=True), nullable=True),
+        Column("payload", JSONB, nullable=False),
+        Column("created_at", DateTime(timezone=True), nullable=False),
+        Column("updated_at", DateTime(timezone=True), nullable=False),
+    )
+    flow_runs = Table(
+        "base_agent_flow_runs",
+        metadata,
+        Column("flow_run_id", String(256), primary_key=True),
+        Column("flow_name", String(256), nullable=False, index=True),
+        Column("flow_id", String(256), nullable=False, index=True),
+        Column("flow_kind", String(32), nullable=False, index=True),
+        Column("definition_fingerprint", String(128), nullable=False, index=True),
+        Column("runtime_build_id", String(256), nullable=False, index=True),
+        Column("runtime_route", String(256), nullable=False, index=True),
+        Column("status", String(32), nullable=False, index=True),
+        Column("revision", Integer, nullable=False),
+        Column("cancel_requested", Boolean, nullable=False),
+        Column("current_request_id", String(64), nullable=True, index=True),
+        Column("current_attempt_id", String(64), nullable=True, index=True),
+        Column("checkpoint_revision", Integer, nullable=True),
+        Column("payload", JSONB, nullable=False),
+        Column("created_at", DateTime(timezone=True), nullable=False),
+        Column("updated_at", DateTime(timezone=True), nullable=False),
+    )
+    flow_checkpoints = Table(
+        "base_agent_flow_checkpoints",
+        metadata,
+        Column("flow_run_id", String(256), primary_key=True),
+        Column("flow_id", String(256), nullable=False, index=True),
+        Column("flow_kind", String(32), nullable=False, index=True),
+        Column("definition_fingerprint", String(128), nullable=False, index=True),
+        Column("revision", Integer, nullable=False),
         Column("payload", JSONB, nullable=False),
         Column("created_at", DateTime(timezone=True), nullable=False),
         Column("updated_at", DateTime(timezone=True), nullable=False),
@@ -232,6 +284,8 @@ def build_postgres_event_tables(schema: str | None = None) -> PostgresEventTable
         events=events,
         checkpoints=checkpoints,
         runs=runs,
+        flow_runs=flow_runs,
+        flow_checkpoints=flow_checkpoints,
         execution_requests=execution_requests,
         execution_attempts=execution_attempts,
         recovery_decisions=recovery_decisions,
@@ -324,8 +378,6 @@ class PostgresEventStore:
         turn: int | None = None,
     ) -> Event:
         """Validate an Attempt token and append its Event in one transaction."""
-        if run_id != lease.target_id:
-            raise ExecutionLeaseLostError("Attempt lease target does not match Event run_id")
         normalized_payload = _json_payload(payload or {})
         async with self.engine.begin() as connection:
             statement = (
@@ -344,10 +396,45 @@ class PostgresEventStore:
                 attempt.status not in _ACTIVE_EXECUTION_ATTEMPT_STATUSES
                 or attempt.owner_id != lease.owner_id
                 or attempt.fencing_token != lease.fencing_token
+                or attempt.request_id != lease.request_id
+                or attempt.target_id != lease.target_id
                 or attempt.lease_expires_at <= now
             ):
                 raise ExecutionLeaseLostError(
                     f"ExecutionAttempt lease '{lease.attempt_id}' is no longer live"
+                )
+            target_table = (
+                self.tables.runs
+                if attempt.target_kind is ExecutionTargetKind.AGENT_RUN
+                else self.tables.flow_runs
+            )
+            target_column = (
+                target_table.c.run_id
+                if attempt.target_kind is ExecutionTargetKind.AGENT_RUN
+                else target_table.c.flow_run_id
+            )
+            target_payload = (
+                await connection.execute(
+                    select(target_table.c.payload)
+                    .where(target_column == attempt.target_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if target_payload is None:
+                raise ExecutionLeaseLostError("Execution target no longer exists")
+            target = (
+                AgentRunRecord.model_validate(target_payload)
+                if attempt.target_kind is ExecutionTargetKind.AGENT_RUN
+                else FlowRunRecord.model_validate(target_payload)
+            )
+            _validate_current_attempt_target(attempt, target)
+            is_flow_child_event = (
+                attempt.target_kind is ExecutionTargetKind.FLOW_RUN
+                and normalized_payload.get("execution_target_id") == lease.target_id
+            )
+            if run_id != lease.target_id and not is_flow_child_event:
+                raise ExecutionLeaseLostError(
+                    "Attempt lease target does not match Event run_id"
                 )
             sequence = await self._append_event(
                 connection,
@@ -1041,6 +1128,217 @@ class PostgresRunStore:
         return AgentRunRecord.model_validate(payload)
 
 
+class PostgresFlowRunStore:
+    """PostgreSQL lifecycle and strategy checkpoint store for top-level Flows."""
+
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        schema: str | None = None,
+        owns_engine: bool = False,
+    ) -> None:
+        self.engine = engine
+        self.tables = build_postgres_event_tables(schema)
+        self.schema = schema
+        self._owns_engine = owns_engine
+
+    @classmethod
+    def from_event_store(cls, event_store: PostgresEventStore) -> PostgresFlowRunStore:
+        return cls(event_store.engine, schema=event_store.schema)
+
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        *,
+        schema: str | None = None,
+        **engine_options: Any,
+    ) -> PostgresFlowRunStore:
+        if not url.strip():
+            raise ValueError("PostgreSQL URL must not be blank")
+        return cls(
+            create_async_engine(_asyncpg_url(url), **engine_options),
+            schema=schema,
+            owns_engine=True,
+        )
+
+    async def create_schema(self) -> None:
+        async with self.engine.begin() as connection:
+            if self.schema is not None:
+                await connection.execute(CreateSchema(self.schema, if_not_exists=True))
+            await connection.run_sync(self.tables.metadata.create_all)
+
+    async def close(self) -> None:
+        if self._owns_engine:
+            await self.engine.dispose()
+
+    async def create(self, record: FlowRunRecord) -> FlowRunRecord:
+        payload = flow_record_json(record)
+        statement = (
+            postgresql_insert(self.tables.flow_runs)
+            .values(**_flow_run_columns(record, payload))
+            .on_conflict_do_nothing(
+                index_elements=[self.tables.flow_runs.c.flow_run_id]
+            )
+            .returning(self.tables.flow_runs.c.flow_run_id)
+        )
+        async with self.engine.begin() as connection:
+            inserted = (await connection.execute(statement)).scalar_one_or_none()
+        if inserted is None:
+            raise FlowRunAlreadyExistsError(
+                f"Flow Run '{record.flow_run_id}' already exists"
+            )
+        return FlowRunRecord.model_validate(payload)
+
+    async def get(self, flow_run_id: str) -> FlowRunRecord:
+        statement = select(self.tables.flow_runs.c.payload).where(
+            self.tables.flow_runs.c.flow_run_id == flow_run_id
+        )
+        async with self.engine.connect() as connection:
+            payload = (await connection.execute(statement)).scalar_one_or_none()
+        if payload is None:
+            raise FlowRunRecordNotFoundError(
+                f"Flow Run '{flow_run_id}' was not found"
+            )
+        return FlowRunRecord.model_validate(payload)
+
+    async def transition(
+        self,
+        flow_run_id: str,
+        *,
+        expected_statuses: Collection[FlowStatus],
+        status: FlowStatus,
+        expected_revision: int | None = None,
+        updates: Mapping[str, Any] | None = None,
+    ) -> FlowRunRecord:
+        async with self.engine.begin() as connection:
+            current = await self._locked_record(connection, flow_run_id)
+            if current.status not in expected_statuses:
+                raise FlowTransitionError(
+                    f"Flow Run '{flow_run_id}' with status '{current.status.value}' "
+                    f"cannot transition to '{status.value}'"
+                )
+            if expected_revision is not None and current.revision != expected_revision:
+                raise FlowTransitionError(
+                    f"Flow Run '{flow_run_id}' revision changed from "
+                    f"{expected_revision} to {current.revision}"
+                )
+            now = await _database_now(connection)
+            updated = FlowRunRecord.model_validate(
+                {
+                    **current.model_dump(mode="json"),
+                    "status": status,
+                    "revision": current.revision + 1,
+                    "updated_at": now,
+                    **dict(updates or {}),
+                }
+            )
+            await self._write_record(connection, updated)
+        return updated
+
+    async def save(
+        self,
+        checkpoint: FlowCheckpoint,
+        *,
+        expected_revision: int | None,
+    ) -> FlowCheckpoint:
+        normalized = FlowCheckpoint.model_validate(flow_checkpoint_json(checkpoint))
+        async with self.engine.begin() as connection:
+            run = await self._locked_record(connection, checkpoint.flow_run_id)
+            if (
+                run.flow_id != checkpoint.flow_id
+                or run.flow_kind is not checkpoint.flow_kind
+                or run.definition_fingerprint != checkpoint.definition_fingerprint
+            ):
+                raise FlowCheckpointConflictError(
+                    "Flow checkpoint does not match its pinned Flow definition"
+                )
+            statement = (
+                select(self.tables.flow_checkpoints.c.payload)
+                .where(
+                    self.tables.flow_checkpoints.c.flow_run_id
+                    == checkpoint.flow_run_id
+                )
+                .with_for_update()
+            )
+            payload = (await connection.execute(statement)).scalar_one_or_none()
+            current = (
+                None if payload is None else FlowCheckpoint.model_validate(payload)
+            )
+            current_revision = current.revision if current is not None else None
+            if current_revision != expected_revision:
+                raise FlowCheckpointConflictError(
+                    f"Flow checkpoint '{checkpoint.flow_run_id}' revision changed from "
+                    f"{expected_revision} to {current_revision}"
+                )
+            expected_next = 1 if current is None else current.revision + 1
+            if checkpoint.revision != expected_next:
+                raise FlowCheckpointConflictError(
+                    f"Flow checkpoint revision must advance to {expected_next}"
+                )
+            if current is None:
+                await connection.execute(
+                    postgresql_insert(self.tables.flow_checkpoints).values(
+                        **_flow_checkpoint_columns(normalized)
+                    )
+                )
+            else:
+                await connection.execute(
+                    update(self.tables.flow_checkpoints)
+                    .where(
+                        self.tables.flow_checkpoints.c.flow_run_id
+                        == checkpoint.flow_run_id
+                    )
+                    .values(**_flow_checkpoint_columns(normalized))
+                )
+        return normalized
+
+    async def load(self, flow_run_id: str) -> FlowCheckpoint:
+        statement = select(self.tables.flow_checkpoints.c.payload).where(
+            self.tables.flow_checkpoints.c.flow_run_id == flow_run_id
+        )
+        async with self.engine.connect() as connection:
+            payload = (await connection.execute(statement)).scalar_one_or_none()
+        if payload is None:
+            raise FlowCheckpointNotFoundError(
+                f"Flow checkpoint '{flow_run_id}' was not found"
+            )
+        return FlowCheckpoint.model_validate(payload)
+
+    async def delete(self, flow_run_id: str) -> None:
+        async with self.engine.begin() as connection:
+            await connection.execute(
+                delete(self.tables.flow_checkpoints).where(
+                    self.tables.flow_checkpoints.c.flow_run_id == flow_run_id
+                )
+            )
+
+    async def _locked_record(
+        self,
+        connection: Any,
+        flow_run_id: str,
+    ) -> FlowRunRecord:
+        statement = (
+            select(self.tables.flow_runs.c.payload)
+            .where(self.tables.flow_runs.c.flow_run_id == flow_run_id)
+            .with_for_update()
+        )
+        payload = (await connection.execute(statement)).scalar_one_or_none()
+        if payload is None:
+            raise FlowRunRecordNotFoundError(
+                f"Flow Run '{flow_run_id}' was not found"
+            )
+        return FlowRunRecord.model_validate(payload)
+
+    async def _write_record(self, connection: Any, record: FlowRunRecord) -> None:
+        await connection.execute(
+            update(self.tables.flow_runs)
+            .where(self.tables.flow_runs.c.flow_run_id == record.flow_run_id)
+            .values(**_flow_run_columns(record))
+        )
+
+
 class PostgresExecutionStore:
     """PostgreSQL queue and Attempt leases with database-time fencing."""
 
@@ -1056,6 +1354,7 @@ class PostgresExecutionStore:
         self.schema = schema
         self._owns_engine = owns_engine
         self.runs = PostgresRunStore(engine, schema=schema)
+        self.flows = PostgresFlowRunStore(engine, schema=schema)
 
     @classmethod
     def from_event_store(
@@ -1209,6 +1508,157 @@ class PostgresExecutionStore:
             )
         return queued, request
 
+    async def enqueue_flow(
+        self,
+        record: FlowRunRecord,
+        *,
+        operation: ExecutionOperation,
+        payload: Mapping[str, Any],
+        idempotency_key: str,
+    ) -> tuple[FlowRunRecord, ExecutionRequest]:
+        if operation is not ExecutionOperation.EXECUTE:
+            raise ValueError("a new Flow Run requires the execute operation")
+        async with self.engine.begin() as connection:
+            existing = await self._request_by_key(connection, idempotency_key)
+            if existing is not None:
+                self._validate_request_intent(
+                    existing,
+                    record.flow_run_id,
+                    operation,
+                    payload,
+                    target_kind=ExecutionTargetKind.FLOW_RUN,
+                )
+                return (
+                    await self.flows._locked_record(connection, record.flow_run_id),
+                    existing,
+                )
+            now = await _database_now(connection)
+            request = ExecutionRequest(
+                target_kind=ExecutionTargetKind.FLOW_RUN,
+                target_id=record.flow_run_id,
+                operation=operation,
+                payload=_finite_json_mapping(payload),
+                runtime_route=record.runtime_route,
+                idempotency_key=idempotency_key,
+                expected_target_revision=record.revision + 1,
+                available_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            queued = FlowRunRecord.model_validate(
+                {
+                    **record.model_dump(mode="json"),
+                    "status": FlowStatus.QUEUED,
+                    "revision": record.revision + 1,
+                    "current_request_id": request.request_id,
+                    "current_attempt_id": None,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+            inserted_request = (
+                await connection.execute(
+                    postgresql_insert(self.tables.execution_requests)
+                    .values(**_execution_request_columns(request))
+                    .on_conflict_do_nothing(
+                        index_elements=[self.tables.execution_requests.c.idempotency_key]
+                    )
+                    .returning(self.tables.execution_requests.c.request_id)
+                )
+            ).scalar_one_or_none()
+            if inserted_request is None:
+                concurrent = await self._request_by_key(connection, idempotency_key)
+                if concurrent is None:
+                    raise ExecutionRequestConflictError(
+                        "idempotent ExecutionRequest disappeared during submission"
+                    )
+                self._validate_request_intent(
+                    concurrent,
+                    record.flow_run_id,
+                    operation,
+                    payload,
+                    target_kind=ExecutionTargetKind.FLOW_RUN,
+                )
+                return (
+                    await self.flows._locked_record(connection, record.flow_run_id),
+                    concurrent,
+                )
+            inserted = (
+                await connection.execute(
+                    postgresql_insert(self.tables.flow_runs)
+                    .values(**_flow_run_columns(queued))
+                    .on_conflict_do_nothing(
+                        index_elements=[self.tables.flow_runs.c.flow_run_id]
+                    )
+                    .returning(self.tables.flow_runs.c.flow_run_id)
+                )
+            ).scalar_one_or_none()
+            if inserted is None:
+                raise FlowRunAlreadyExistsError(
+                    f"Flow Run '{record.flow_run_id}' already exists"
+                )
+        return queued, request
+
+    async def enqueue_flow_continuation(
+        self,
+        flow_run_id: str,
+        *,
+        operation: ExecutionOperation,
+        payload: Mapping[str, Any],
+        idempotency_key: str,
+    ) -> tuple[FlowRunRecord, ExecutionRequest]:
+        if operation not in {ExecutionOperation.RESUME, ExecutionOperation.CONFIRM}:
+            raise ValueError("Flow continuation operation must be resume or confirm")
+        async with self.engine.begin() as connection:
+            existing = await self._request_by_key(connection, idempotency_key)
+            if existing is not None:
+                self._validate_request_intent(
+                    existing,
+                    flow_run_id,
+                    operation,
+                    payload,
+                    target_kind=ExecutionTargetKind.FLOW_RUN,
+                )
+                return (
+                    await self.flows._locked_record(connection, flow_run_id),
+                    existing,
+                )
+            run = await self.flows._locked_record(connection, flow_run_id)
+            if run.status is not FlowStatus.WAITING:
+                raise FlowTransitionError(
+                    f"Flow Run '{flow_run_id}' cannot continue from "
+                    f"status '{run.status.value}'"
+                )
+            now = await _database_now(connection)
+            request = ExecutionRequest(
+                target_kind=ExecutionTargetKind.FLOW_RUN,
+                target_id=flow_run_id,
+                operation=operation,
+                payload=_finite_json_mapping(payload),
+                runtime_route=run.runtime_route,
+                idempotency_key=idempotency_key,
+                expected_target_revision=run.revision + 1,
+                available_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            queued = FlowRunRecord.model_validate(
+                {
+                    **run.model_dump(mode="json"),
+                    "status": FlowStatus.QUEUED,
+                    "revision": run.revision + 1,
+                    "current_request_id": request.request_id,
+                    "updated_at": now,
+                }
+            )
+            await self.flows._write_record(connection, queued)
+            await connection.execute(
+                postgresql_insert(self.tables.execution_requests).values(
+                    **_execution_request_columns(request)
+                )
+            )
+        return queued, request
+
     async def claim_next(
         self,
         *,
@@ -1216,14 +1666,21 @@ class PostgresExecutionStore:
         runtime_route: str,
         runtime_build_id: str,
         lease_seconds: float,
+        target_kinds: Collection[ExecutionTargetKind] = (
+            ExecutionTargetKind.AGENT_RUN,
+        ),
     ) -> ClaimedExecution | None:
         _validate_run_lease(owner_id, lease_seconds)
+        supported = frozenset(target_kinds)
+        if not supported:
+            raise ValueError("Execution Worker must support at least one target kind")
         async with self.engine.begin() as connection:
             statement = (
                 select(self.tables.execution_requests.c.record)
                 .where(
-                    self.tables.execution_requests.c.target_kind
-                    == ExecutionTargetKind.AGENT_RUN.value,
+                    self.tables.execution_requests.c.target_kind.in_(
+                        tuple(item.value for item in supported)
+                    ),
                     self.tables.execution_requests.c.status
                     == ExecutionRequestStatus.PENDING.value,
                     self.tables.execution_requests.c.runtime_route == runtime_route,
@@ -1237,12 +1694,16 @@ class PostgresExecutionStore:
             if payload is None:
                 return None
             request = ExecutionRequest.model_validate(payload)
-            run = await self.runs._locked_record(connection, request.target_id)
+            target = await self._locked_target(
+                connection,
+                request.target_kind,
+                request.target_id,
+            )
             now = await _database_now(connection)
             if (
-                run.status is not RunStatus.QUEUED
-                or run.current_request_id != request.request_id
-                or run.revision != request.expected_target_revision
+                target.status.value != "queued"
+                or target.current_request_id != request.request_id
+                or target.revision != request.expected_target_revision
             ):
                 discarded = request.model_copy(
                     update={
@@ -1262,8 +1723,9 @@ class PostgresExecutionStore:
                             )
                         ).where(
                             self.tables.execution_attempts.c.target_kind
-                            == ExecutionTargetKind.AGENT_RUN.value,
-                            self.tables.execution_attempts.c.target_id == run.run_id,
+                            == request.target_kind.value,
+                            self.tables.execution_attempts.c.target_id
+                            == request.target_id,
                         )
                     )
                 ).scalar_one()
@@ -1271,7 +1733,8 @@ class PostgresExecutionStore:
             token = str(uuid4())
             expires_at = now + timedelta(seconds=lease_seconds)
             attempt = ExecutionAttempt(
-                target_id=run.run_id,
+                target_kind=request.target_kind,
+                target_id=request.target_id,
                 request_id=request.request_id,
                 attempt_number=attempt_number,
                 owner_id=owner_id,
@@ -1288,17 +1751,18 @@ class PostgresExecutionStore:
                     "updated_at": now,
                 }
             )
-            running = AgentRunRecord.model_validate(
-                {
-                    **run.model_dump(mode="json"),
-                    "status": RunStatus.RUNNING,
-                    "revision": run.revision + 1,
+            running = self._updated_target(
+                target,
+                status="running",
+                now=now,
+                updates={
                     "current_attempt_id": attempt.attempt_id,
                     "recovery_reason_code": None,
                     "recovery_detected_at": None,
                     "error": None,
-                    "updated_at": now,
-                }
+                    "pending_input": None,
+                    "waiting_child_run_id": None,
+                },
             )
             await connection.execute(
                 postgresql_insert(self.tables.execution_attempts).values(
@@ -1306,11 +1770,11 @@ class PostgresExecutionStore:
                 )
             )
             await self._write_request(connection, claimed_request)
-            await self._write_run(connection, running)
+            await self._write_target(connection, running)
             await _append_event_in_transaction(
                 connection,
                 self.tables,
-                run.run_id,
+                request.target_id,
                 "execution.attempt.claimed",
                 {
                     "execution_attempt_id": attempt.attempt_id,
@@ -1327,12 +1791,12 @@ class PostgresExecutionStore:
             lease=ExecutionLease(
                 attempt_id=attempt.attempt_id,
                 request_id=request.request_id,
-                target_id=run.run_id,
+                target_id=request.target_id,
                 owner_id=owner_id,
                 fencing_token=token,
                 expires_at=expires_at,
             ),
-            run=running,
+            target=running,
         )
 
     async def mark_started(
@@ -1345,6 +1809,12 @@ class PostgresExecutionStore:
             attempt = await self._locked_attempt(connection, lease.attempt_id)
             now = await _database_now(connection)
             self._validate_owned_attempt(attempt, lease, now)
+            target = await self._locked_target(
+                connection,
+                attempt.target_kind,
+                lease.target_id,
+            )
+            _validate_current_attempt_target(attempt, target)
             started = attempt.model_copy(
                 update={
                     "status": ExecutionAttemptStatus.RUNNING,
@@ -1369,6 +1839,12 @@ class PostgresExecutionStore:
             attempt = ExecutionAttempt.model_validate(payload)
             now = await _database_now(connection)
             self._validate_owned_attempt(attempt, lease, now)
+            target = await self._locked_target(
+                connection,
+                attempt.target_kind,
+                lease.target_id,
+            )
+            _validate_current_attempt_target(attempt, target)
 
     async def renew(
         self,
@@ -1381,6 +1857,12 @@ class PostgresExecutionStore:
             attempt = await self._locked_attempt(connection, lease.attempt_id)
             now = await _database_now(connection)
             self._validate_owned_attempt(attempt, lease, now)
+            target = await self._locked_target(
+                connection,
+                attempt.target_kind,
+                lease.target_id,
+            )
+            _validate_current_attempt_target(attempt, target)
             expires_at = now + timedelta(seconds=lease_seconds)
             renewed = attempt.model_copy(
                 update={
@@ -1390,50 +1872,54 @@ class PostgresExecutionStore:
                 }
             )
             await self._write_attempt(connection, renewed)
-            run = await self.runs._locked_record(connection, lease.target_id)
         return AttemptHeartbeat(
             lease=lease.model_copy(update={"expires_at": expires_at}),
-            cancel_requested=run.cancel_requested,
+            cancel_requested=target.cancel_requested,
         )
 
     async def settle(
         self,
         lease: ExecutionLease,
         *,
-        status: RunStatus,
+        status: RunStatus | FlowStatus,
         output: Any | None = None,
         text: str | None = None,
         error: str | None = None,
         pending_input: Mapping[str, Any] | None = None,
         checkpoint_revision: int | None = None,
-    ) -> AgentRunRecord:
+        waiting_child_run_id: str | None = None,
+    ) -> AgentRunRecord | FlowRunRecord:
         attempt_status = {
-            RunStatus.WAITING: ExecutionAttemptStatus.SUSPENDED,
-            RunStatus.SUCCEEDED: ExecutionAttemptStatus.SUCCEEDED,
-            RunStatus.FAILED: ExecutionAttemptStatus.FAILED,
-            RunStatus.CANCELLED: ExecutionAttemptStatus.CANCELLED,
-        }.get(status)
+            "waiting": ExecutionAttemptStatus.SUSPENDED,
+            "succeeded": ExecutionAttemptStatus.SUCCEEDED,
+            "failed": ExecutionAttemptStatus.FAILED,
+            "cancelled": ExecutionAttemptStatus.CANCELLED,
+        }.get(status.value)
         if attempt_status is None:
-            raise RunTransitionError(f"Attempt cannot settle logical Run as '{status.value}'")
-        if status is RunStatus.WAITING and checkpoint_revision is None:
+            raise RunTransitionError(
+                f"Attempt cannot settle logical target as '{status.value}'"
+            )
+        if status.value == "waiting" and checkpoint_revision is None:
             raise RunTransitionError("WAITING settlement requires checkpoint_revision")
-        if status is not RunStatus.WAITING and checkpoint_revision is not None:
+        if status.value != "waiting" and checkpoint_revision is not None:
             raise RunTransitionError("only WAITING settlement may retain a checkpoint")
         async with self.engine.begin() as connection:
             attempt = await self._locked_attempt(connection, lease.attempt_id)
             now = await _database_now(connection)
             self._validate_owned_attempt(attempt, lease, now)
-            run = await self.runs._locked_record(connection, lease.target_id)
+            target = await self._locked_target(
+                connection,
+                attempt.target_kind,
+                lease.target_id,
+            )
             if (
-                run.status is not RunStatus.RUNNING
-                or run.current_attempt_id != attempt.attempt_id
+                target.status.value != "running"
+                or target.current_attempt_id != attempt.attempt_id
             ):
-                raise ExecutionLeaseLostError("Attempt is no longer current for the Run")
-            settled = AgentRunRecord.model_validate(
-                {
-                    **run.model_dump(mode="json"),
-                    "status": status,
-                    "revision": run.revision + 1,
+                raise ExecutionLeaseLostError(
+                    "Attempt is no longer current for its target"
+                )
+            updates: dict[str, Any] = {
                     "current_attempt_id": None,
                     "checkpoint_revision": checkpoint_revision,
                     "pending_input": (
@@ -1441,11 +1927,22 @@ class PostgresExecutionStore:
                         if pending_input is not None
                         else None
                     ),
-                    "output": _finite_json_value(output),
-                    "text": text,
                     "error": error,
-                    "updated_at": now,
-                }
+            }
+            if attempt.target_kind is ExecutionTargetKind.AGENT_RUN:
+                updates.update(output=_finite_json_value(output), text=text)
+            else:
+                updates.update(
+                    output=text if text is not None else _postgres_flow_output(output),
+                    waiting_child_run_id=waiting_child_run_id,
+                )
+                if status.value != "waiting":
+                    updates["checkpoint_stage"] = None
+            settled = self._updated_target(
+                target,
+                status=status.value,
+                now=now,
+                updates=updates,
             )
             ended = attempt.model_copy(
                 update={
@@ -1463,22 +1960,35 @@ class PostgresExecutionStore:
             )
             await self._write_attempt(connection, ended)
             await self._write_request(connection, completed)
-            await self._write_run(connection, settled)
+            await self._write_target(connection, settled)
             await _append_event_in_transaction(
                 connection,
                 self.tables,
-                run.run_id,
-                _distributed_terminal_event_kind(status),
+                request.target_id,
+                _distributed_terminal_event_kind(request.target_kind, status.value),
                 _distributed_terminal_event_payload(
                     attempt.attempt_id,
-                    status=status,
+                    target_kind=request.target_kind,
+                    status=status.value,
                     output=output,
                     text=text,
                     error=error,
                     checkpoint_revision=checkpoint_revision,
+                    pending_input=pending_input,
+                    waiting_child_run_id=waiting_child_run_id,
                 ),
                 turn=None,
             )
+            if (
+                request.target_kind is ExecutionTargetKind.FLOW_RUN
+                and status.value in {"succeeded", "failed", "cancelled"}
+            ):
+                await connection.execute(
+                    delete(self.tables.flow_checkpoints).where(
+                        self.tables.flow_checkpoints.c.flow_run_id
+                        == request.target_id
+                    )
+                )
         return settled
 
     async def interrupt(
@@ -1486,7 +1996,7 @@ class PostgresExecutionStore:
         lease: ExecutionLease,
         *,
         reason_code: str,
-    ) -> AgentRunRecord:
+    ) -> AgentRunRecord | FlowRunRecord:
         async with self.engine.begin() as connection:
             attempt = await self._locked_attempt(connection, lease.attempt_id)
             now = await _database_now(connection)
@@ -1505,14 +2015,23 @@ class PostgresExecutionStore:
         *,
         reason_code: str,
         error: str,
-    ) -> AgentRunRecord:
+    ) -> AgentRunRecord | FlowRunRecord:
         async with self.engine.begin() as connection:
             attempt = await self._locked_attempt(connection, lease.attempt_id)
             now = await _database_now(connection)
             self._validate_owned_attempt(attempt, lease, now)
-            run = await self.runs._locked_record(connection, lease.target_id)
-            if run.status is not RunStatus.RUNNING or run.current_attempt_id != attempt.attempt_id:
-                raise ExecutionLeaseLostError("Attempt is no longer current for the Run")
+            target = await self._locked_target(
+                connection,
+                attempt.target_kind,
+                lease.target_id,
+            )
+            if (
+                target.status.value != "running"
+                or target.current_attempt_id != attempt.attempt_id
+            ):
+                raise ExecutionLeaseLostError(
+                    "Attempt is no longer current for its target"
+                )
             ended = attempt.model_copy(
                 update={
                     "status": ExecutionAttemptStatus.FAILED,
@@ -1525,25 +2044,24 @@ class PostgresExecutionStore:
             blocked_request = request.model_copy(
                 update={"status": ExecutionRequestStatus.BLOCKED, "updated_at": now}
             )
-            blocked = AgentRunRecord.model_validate(
-                {
-                    **run.model_dump(mode="json"),
-                    "status": RunStatus.BLOCKED,
-                    "revision": run.revision + 1,
+            blocked = self._updated_target(
+                target,
+                status="blocked",
+                now=now,
+                updates={
                     "current_attempt_id": None,
                     "recovery_reason_code": reason_code,
                     "recovery_detected_at": now,
                     "error": error,
-                    "updated_at": now,
-                }
+                },
             )
             await self._write_attempt(connection, ended)
             await self._write_request(connection, blocked_request)
-            await self._write_run(connection, blocked)
+            await self._write_target(connection, blocked)
             await _append_event_in_transaction(
                 connection,
                 self.tables,
-                run.run_id,
+                request.target_id,
                 "execution.request.blocked",
                 {
                     "execution_attempt_id": attempt.attempt_id,
@@ -1555,8 +2073,12 @@ class PostgresExecutionStore:
             await _append_event_in_transaction(
                 connection,
                 self.tables,
-                run.run_id,
-                "run.blocked",
+                request.target_id,
+                (
+                    "run.blocked"
+                    if request.target_kind is ExecutionTargetKind.AGENT_RUN
+                    else "flow.blocked"
+                ),
                 {
                     "execution_attempt_id": attempt.attempt_id,
                     "reason_code": reason_code,
@@ -1585,7 +2107,7 @@ class PostgresExecutionStore:
             transitions: list[RecoveryTransition] = []
             for payload in payloads:
                 attempt = ExecutionAttempt.model_validate(payload)
-                run = await self._recover_attempt(
+                target = await self._recover_attempt(
                     connection,
                     attempt,
                     status=ExecutionAttemptStatus.LEASE_EXPIRED,
@@ -1593,16 +2115,23 @@ class PostgresExecutionStore:
                     now=now,
                 )
                 refreshed = await self._locked_attempt(connection, attempt.attempt_id)
-                transitions.append(RecoveryTransition(run=run, attempt=refreshed))
+                transitions.append(
+                    RecoveryTransition(target=target, attempt=refreshed)
+                )
         return tuple(transitions)
 
-    async def latest_attempt(self, run_id: str) -> ExecutionAttempt | None:
+    async def latest_attempt(
+        self,
+        target_id: str,
+        *,
+        target_kind: ExecutionTargetKind = ExecutionTargetKind.AGENT_RUN,
+    ) -> ExecutionAttempt | None:
         statement = (
             select(self.tables.execution_attempts.c.record)
             .where(
                 self.tables.execution_attempts.c.target_kind
-                == ExecutionTargetKind.AGENT_RUN.value,
-                self.tables.execution_attempts.c.target_id == run_id,
+                == target_kind.value,
+                self.tables.execution_attempts.c.target_id == target_id,
             )
             .order_by(desc(self.tables.execution_attempts.c.attempt_number))
             .limit(1)
@@ -1611,13 +2140,21 @@ class PostgresExecutionStore:
             payload = (await connection.execute(statement)).scalar_one_or_none()
         return None if payload is None else ExecutionAttempt.model_validate(payload)
 
-    async def request_cancel(self, run_id: str) -> AgentRunRecord:
+    async def request_cancel(
+        self,
+        target_id: str,
+        *,
+        target_kind: ExecutionTargetKind = ExecutionTargetKind.AGENT_RUN,
+    ) -> AgentRunRecord | FlowRunRecord:
         async with self.engine.begin() as connection:
-            run = await self.runs._locked_record(connection, run_id)
+            target = await self._locked_target(connection, target_kind, target_id)
             now = await _database_now(connection)
-            if run.status is RunStatus.QUEUED:
-                if run.current_request_id is not None:
-                    request = await self._locked_request(connection, run.current_request_id)
+            if target.status.value == "queued":
+                if target.current_request_id is not None:
+                    request = await self._locked_request(
+                        connection,
+                        target.current_request_id,
+                    )
                     cancelled_request = request.model_copy(
                         update={
                             "status": ExecutionRequestStatus.CANCELLED,
@@ -1625,74 +2162,88 @@ class PostgresExecutionStore:
                         }
                     )
                     await self._write_request(connection, cancelled_request)
-                cancelled = AgentRunRecord.model_validate(
-                    {
-                        **run.model_dump(mode="json"),
-                        "status": RunStatus.CANCELLED,
-                        "revision": run.revision + 1,
-                        "cancel_requested": True,
-                        "error": "run cancellation requested",
-                        "updated_at": now,
-                    }
-                )
-                await self._write_run(connection, cancelled)
-                await _append_event_in_transaction(
-                    connection,
-                    self.tables,
-                    run_id,
-                    "run.cancelled",
-                    {"error": cancelled.error, "source": "execution_store"},
-                    turn=None,
-                )
-                return cancelled
-            if run.status is RunStatus.RUNNING:
-                if run.cancel_requested:
-                    return run
-                requested = run.model_copy(
-                    update={
-                        "cancel_requested": True,
-                        "revision": run.revision + 1,
-                        "updated_at": now,
-                    }
-                )
-                await self._write_run(connection, requested)
-                return requested
-            if run.status in {
-                RunStatus.WAITING,
-                RunStatus.RECOVERY_REQUIRED,
-                RunStatus.BLOCKED,
-            }:
-                cancelled = AgentRunRecord.model_validate(
-                    {
-                        **run.model_dump(mode="json"),
-                        "status": RunStatus.CANCELLED,
-                        "revision": run.revision + 1,
+                cancelled = self._updated_target(
+                    target,
+                    status="cancelled",
+                    now=now,
+                    updates={
                         "cancel_requested": True,
                         "checkpoint_revision": None,
+                        "checkpoint_stage": None,
+                        "waiting_child_run_id": None,
                         "pending_input": None,
-                        "error": "run cancellation requested",
-                        "updated_at": now,
-                    }
+                        "error": "execution cancellation requested",
+                    },
                 )
-                await self._write_run(connection, cancelled)
+                await self._write_target(connection, cancelled)
                 await _append_event_in_transaction(
                     connection,
                     self.tables,
-                    run_id,
-                    "run.cancelled",
+                    target_id,
+                    (
+                        "run.cancelled"
+                        if target_kind is ExecutionTargetKind.AGENT_RUN
+                        else "flow.cancelled"
+                    ),
                     {"error": cancelled.error, "source": "execution_store"},
                     turn=None,
                 )
+                if target_kind is ExecutionTargetKind.FLOW_RUN:
+                    await self._delete_flow_checkpoint(connection, target_id)
                 return cancelled
-            if run.status is RunStatus.CANCELLED:
-                return run
-            raise RunTransitionError(
-                f"Run '{run_id}' already reached status '{run.status.value}'"
+            if target.status.value == "running":
+                if target.cancel_requested:
+                    return target
+                requested = self._updated_target(
+                    target,
+                    status="running",
+                    now=now,
+                    updates={
+                        "cancel_requested": True,
+                    },
+                )
+                await self._write_target(connection, requested)
+                return requested
+            if target.status.value in {"waiting", "recovery_required", "blocked"}:
+                cancelled = self._updated_target(
+                    target,
+                    status="cancelled",
+                    now=now,
+                    updates={
+                        "cancel_requested": True,
+                        "checkpoint_revision": None,
+                        "checkpoint_stage": None,
+                        "waiting_child_run_id": None,
+                        "pending_input": None,
+                        "error": "execution cancellation requested",
+                    },
+                )
+                await self._write_target(connection, cancelled)
+                await _append_event_in_transaction(
+                    connection,
+                    self.tables,
+                    target_id,
+                    (
+                        "run.cancelled"
+                        if target_kind is ExecutionTargetKind.AGENT_RUN
+                        else "flow.cancelled"
+                    ),
+                    {"error": cancelled.error, "source": "execution_store"},
+                    turn=None,
+                )
+                if target_kind is ExecutionTargetKind.FLOW_RUN:
+                    await self._delete_flow_checkpoint(connection, target_id)
+                return cancelled
+            if target.status.value == "cancelled":
+                return target
+            raise FlowTransitionError(
+                f"execution target '{target_id}' already reached "
+                f"status '{target.status.value}'"
             )
 
     async def decide_recovery(
         self,
-        run_id: str,
+        target_id: str,
         *,
         decision: RecoveryDecision,
         strategy: RecoveryStrategy | None,
@@ -1700,51 +2251,86 @@ class PostgresExecutionStore:
         reason_code: str,
         expected_revision: int,
         idempotency_key: str,
-    ) -> tuple[AgentRunRecord, RecoveryDecisionRecord]:
+        target_kind: ExecutionTargetKind = ExecutionTargetKind.AGENT_RUN,
+    ) -> tuple[AgentRunRecord | FlowRunRecord, RecoveryDecisionRecord]:
         async with self.engine.begin() as connection:
             existing = await self._decision_by_key(connection, idempotency_key)
             if existing is not None:
                 _validate_recovery_intent(
                     existing,
-                    run_id=run_id,
+                    run_id=target_id,
                     decision=decision,
                     strategy=strategy,
                     subject_id=subject_id,
                     reason_code=reason_code,
                     expected_revision=expected_revision,
                 )
-                return await self.runs._locked_record(connection, run_id), existing
-            run = await self.runs._locked_record(connection, run_id)
+                if existing.target_kind is not target_kind:
+                    raise ExecutionRequestConflictError(
+                        "recovery idempotency key targets another execution kind"
+                    )
+                return (
+                    await self._locked_target(connection, target_kind, target_id),
+                    existing,
+                )
+            target = await self._locked_target(connection, target_kind, target_id)
             concurrent = await self._decision_by_key(connection, idempotency_key)
             if concurrent is not None:
                 _validate_recovery_intent(
                     concurrent,
-                    run_id=run_id,
+                    run_id=target_id,
                     decision=decision,
                     strategy=strategy,
                     subject_id=subject_id,
                     reason_code=reason_code,
                     expected_revision=expected_revision,
                 )
-                return run, concurrent
-            if run.status not in {RunStatus.RECOVERY_REQUIRED, RunStatus.BLOCKED}:
-                raise RunTransitionError(
-                    f"Run '{run_id}' does not require an Operator recovery decision"
+                if concurrent.target_kind is not target_kind:
+                    raise ExecutionRequestConflictError(
+                        "recovery idempotency key targets another execution kind"
+                    )
+                return target, concurrent
+            if target.status.value not in {"recovery_required", "blocked"}:
+                raise FlowTransitionError(
+                    f"execution target '{target_id}' does not require an "
+                    "Operator recovery decision"
                 )
-            if run.revision != expected_revision:
-                raise RunTransitionError(
-                    f"Run '{run_id}' revision changed from {expected_revision} to {run.revision}"
+            if target.revision != expected_revision:
+                raise FlowTransitionError(
+                    f"execution target '{target_id}' revision changed from "
+                    f"{expected_revision} to {target.revision}"
                 )
             if decision is RecoveryDecision.RETRY and strategy is None:
                 raise ValueError("retry recovery decision requires a strategy")
             if decision is not RecoveryDecision.RETRY and strategy is not None:
                 raise ValueError("only retry recovery decision accepts a strategy")
-            if strategy is RecoveryStrategy.FROM_STAGE:
+            if (
+                target_kind is ExecutionTargetKind.AGENT_RUN
+                and strategy is RecoveryStrategy.FROM_STAGE
+            ):
                 raise ValueError("Agent Run recovery does not support from_stage")
-            if strategy is RecoveryStrategy.FROM_CHECKPOINT and run.checkpoint_revision is None:
-                raise RunTransitionError("Run has no checkpoint to recover from")
+            if (
+                strategy in {
+                    RecoveryStrategy.FROM_CHECKPOINT,
+                    RecoveryStrategy.FROM_STAGE,
+                }
+                and target.checkpoint_revision is None
+            ):
+                raise FlowTransitionError(
+                    "execution target has no checkpoint to recover from"
+                )
+            if (
+                strategy is RecoveryStrategy.FROM_STAGE
+                and isinstance(target, FlowRunRecord)
+                and target.checkpoint_stage is None
+            ):
+                raise FlowTransitionError("Flow Run has no durable Stage checkpoint")
             now = await _database_now(connection)
-            latest = await self._latest_attempt_locked(connection, run_id)
+            latest = await self._latest_attempt_locked(
+                connection,
+                target_id,
+                target_kind=target_kind,
+            )
             created_request: ExecutionRequest | None = None
             if decision is RecoveryDecision.RETRY:
                 source_operation = (
@@ -1755,7 +2341,9 @@ class PostgresExecutionStore:
                 original_statement = (
                     select(self.tables.execution_requests.c.record)
                     .where(
-                        self.tables.execution_requests.c.target_id == run_id,
+                        self.tables.execution_requests.c.target_kind
+                        == target_kind.value,
+                        self.tables.execution_requests.c.target_id == target_id,
                         *(
                             (
                                 self.tables.execution_requests.c.operation
@@ -1764,7 +2352,7 @@ class PostgresExecutionStore:
                             if source_operation is not None
                             else (
                                 self.tables.execution_requests.c.request_id
-                                == run.current_request_id,
+                                == target.current_request_id,
                             )
                         ),
                     )
@@ -1776,7 +2364,7 @@ class PostgresExecutionStore:
                 ).scalar_one_or_none()
                 if original_payload is None:
                     raise ExecutionRequestConflictError(
-                        f"original execute request for Run '{run_id}' was not found"
+                        f"original execute request for target '{target_id}' was not found"
                     )
                 original = ExecutionRequest.model_validate(original_payload)
                 request_payload = dict(original.payload)
@@ -1784,27 +2372,50 @@ class PostgresExecutionStore:
                 request_payload["recovery_strategy"] = strategy.value
                 request_payload["recovery_operation"] = original.operation.value
                 created_request = ExecutionRequest(
-                    target_id=run_id,
+                    target_kind=target_kind,
+                    target_id=target_id,
                     operation=ExecutionOperation.RECOVER,
                     payload=request_payload,
-                    runtime_route=run.runtime_route,
+                    runtime_route=target.runtime_route,
                     idempotency_key=_derived_idempotency_key("recovery", idempotency_key),
-                    expected_target_revision=run.revision + 1,
+                    expected_target_revision=target.revision + 1,
                     available_at=now,
                     created_at=now,
                     updated_at=now,
                 )
-                updated = AgentRunRecord.model_validate(
-                    {
-                        **run.model_dump(mode="json"),
-                        "status": RunStatus.QUEUED,
-                        "revision": run.revision + 1,
+                updated = self._updated_target(
+                    target,
+                    status="queued",
+                    now=now,
+                    updates={
                         "current_request_id": created_request.request_id,
                         "current_attempt_id": None,
                         "cancel_requested": False,
-                        "updated_at": now,
-                    }
+                        **(
+                            {
+                                "checkpoint_revision": None,
+                                "pending_input": None,
+                            }
+                            if strategy is RecoveryStrategy.RESTART
+                            else {}
+                        ),
+                        **(
+                            {
+                                "checkpoint_stage": None,
+                                "plan_revision": None,
+                                "waiting_child_run_id": None,
+                            }
+                            if target_kind is ExecutionTargetKind.FLOW_RUN
+                            and strategy is RecoveryStrategy.RESTART
+                            else {}
+                        ),
+                    },
                 )
+                if (
+                    target_kind is ExecutionTargetKind.FLOW_RUN
+                    and strategy is RecoveryStrategy.RESTART
+                ):
+                    await self._delete_flow_checkpoint(connection, target_id)
                 await connection.execute(
                     postgresql_insert(self.tables.execution_requests).values(
                         **_execution_request_columns(created_request)
@@ -1812,25 +2423,27 @@ class PostgresExecutionStore:
                 )
             else:
                 target_status = (
-                    RunStatus.CANCELLED
+                    "cancelled"
                     if decision is RecoveryDecision.CANCEL
-                    else RunStatus.FAILED
+                    else "failed"
                 )
-                updated = AgentRunRecord.model_validate(
-                    {
-                        **run.model_dump(mode="json"),
-                        "status": target_status,
-                        "revision": run.revision + 1,
+                updated = self._updated_target(
+                    target,
+                    status=target_status,
+                    now=now,
+                    updates={
                         "current_attempt_id": None,
                         "cancel_requested": decision is RecoveryDecision.CANCEL,
                         "checkpoint_revision": None,
+                        "checkpoint_stage": None,
+                        "waiting_child_run_id": None,
                         "pending_input": None,
                         "error": reason_code,
-                        "updated_at": now,
-                    }
+                    },
                 )
             record = RecoveryDecisionRecord(
-                target_id=run_id,
+                target_kind=target_kind,
+                target_id=target_id,
                 source_attempt_id=latest.attempt_id if latest is not None else None,
                 decision=decision,
                 strategy=strategy,
@@ -1843,7 +2456,7 @@ class PostgresExecutionStore:
                 ),
                 created_at=now,
             )
-            await self._write_run(connection, updated)
+            await self._write_target(connection, updated)
             await connection.execute(
                 postgresql_insert(self.tables.recovery_decisions).values(
                     **_recovery_decision_columns(record)
@@ -1853,11 +2466,15 @@ class PostgresExecutionStore:
                 await _append_event_in_transaction(
                     connection,
                     self.tables,
-                    run_id,
-                    _distributed_terminal_event_kind(updated.status),
+                    target_id,
+                    _distributed_terminal_event_kind(
+                        target_kind,
+                        updated.status.value,
+                    ),
                     _distributed_terminal_event_payload(
                         latest.attempt_id if latest is not None else None,
-                        status=updated.status,
+                        target_kind=target_kind,
+                        status=updated.status.value,
                         output=None,
                         text="",
                         error=updated.error,
@@ -1865,7 +2482,99 @@ class PostgresExecutionStore:
                     ),
                     turn=None,
                 )
+                if target_kind is ExecutionTargetKind.FLOW_RUN:
+                    await self._delete_flow_checkpoint(connection, target_id)
         return updated, record
+
+    async def save_flow_checkpoint(
+        self,
+        lease: ExecutionLease,
+        checkpoint: FlowCheckpoint,
+    ) -> FlowCheckpoint:
+        async with self.engine.begin() as connection:
+            attempt = await self._locked_attempt(connection, lease.attempt_id)
+            now = await _database_now(connection)
+            self._validate_owned_attempt(attempt, lease, now)
+            if attempt.target_kind is not ExecutionTargetKind.FLOW_RUN:
+                raise ExecutionLeaseLostError(
+                    "an Agent Attempt cannot write a Flow checkpoint"
+                )
+            if checkpoint.flow_run_id != attempt.target_id:
+                raise ValueError("Flow checkpoint targets another Flow Run")
+            target = await self.flows._locked_record(connection, attempt.target_id)
+            if (
+                target.status is not FlowStatus.RUNNING
+                or target.current_attempt_id != attempt.attempt_id
+            ):
+                raise ExecutionLeaseLostError(
+                    "Attempt is no longer current for the Flow Run"
+                )
+            if (
+                target.flow_id != checkpoint.flow_id
+                or target.flow_kind is not checkpoint.flow_kind
+                or target.definition_fingerprint != checkpoint.definition_fingerprint
+            ):
+                raise FlowCheckpointConflictError(
+                    "Flow checkpoint does not match its pinned Flow definition"
+                )
+            statement = (
+                select(self.tables.flow_checkpoints.c.payload)
+                .where(
+                    self.tables.flow_checkpoints.c.flow_run_id
+                    == checkpoint.flow_run_id
+                )
+                .with_for_update()
+            )
+            payload = (await connection.execute(statement)).scalar_one_or_none()
+            current = (
+                None if payload is None else FlowCheckpoint.model_validate(payload)
+            )
+            current_revision = current.revision if current is not None else None
+            if current_revision != target.checkpoint_revision:
+                raise FlowCheckpointConflictError(
+                    f"Flow checkpoint revision changed from "
+                    f"{target.checkpoint_revision} to {current_revision}"
+                )
+            expected_next = 1 if current is None else current.revision + 1
+            if checkpoint.revision != expected_next:
+                raise FlowCheckpointConflictError(
+                    f"Flow checkpoint revision must advance to {expected_next}"
+                )
+            normalized = FlowCheckpoint.model_validate(
+                flow_checkpoint_json(checkpoint)
+            )
+            if current is None:
+                await connection.execute(
+                    postgresql_insert(self.tables.flow_checkpoints).values(
+                        **_flow_checkpoint_columns(normalized)
+                    )
+                )
+            else:
+                await connection.execute(
+                    update(self.tables.flow_checkpoints)
+                    .where(
+                        self.tables.flow_checkpoints.c.flow_run_id
+                        == checkpoint.flow_run_id
+                    )
+                    .values(**_flow_checkpoint_columns(normalized))
+                )
+            updated = self._updated_target(
+                target,
+                status="running",
+                now=now,
+                updates={
+                    "checkpoint_revision": normalized.revision,
+                    "checkpoint_stage": normalized.stage,
+                    "plan_revision": normalized.plan_revision,
+                    "waiting_child_run_id": normalized.waiting_child_run_id,
+                },
+            )
+            assert isinstance(updated, FlowRunRecord)
+            await self.flows._write_record(connection, updated)
+        return normalized
+
+    async def load_flow_checkpoint(self, flow_run_id: str) -> FlowCheckpoint:
+        return await self.flows.load(flow_run_id)
 
     async def _recover_attempt(
         self,
@@ -1875,7 +2584,7 @@ class PostgresExecutionStore:
         status: ExecutionAttemptStatus,
         reason_code: str,
         now: datetime,
-    ) -> AgentRunRecord:
+    ) -> AgentRunRecord | FlowRunRecord:
         ended = attempt.model_copy(
             update={
                 "status": status,
@@ -1893,26 +2602,32 @@ class PostgresExecutionStore:
             }
         )
         await self._write_request(connection, interrupted)
-        run = await self.runs._locked_record(connection, attempt.target_id)
-        if run.status is not RunStatus.RUNNING or run.current_attempt_id != attempt.attempt_id:
-            return run
-        recovery = AgentRunRecord.model_validate(
-            {
-                **run.model_dump(mode="json"),
-                "status": RunStatus.RECOVERY_REQUIRED,
-                "revision": run.revision + 1,
+        target = await self._locked_target(
+            connection,
+            attempt.target_kind,
+            attempt.target_id,
+        )
+        if (
+            target.status.value != "running"
+            or target.current_attempt_id != attempt.attempt_id
+        ):
+            return target
+        recovery = self._updated_target(
+            target,
+            status="recovery_required",
+            now=now,
+            updates={
                 "current_attempt_id": None,
                 "recovery_reason_code": reason_code,
                 "recovery_detected_at": now,
                 "error": "Execution ownership was lost; Operator decision is required",
-                "updated_at": now,
-            }
+            },
         )
-        await self._write_run(connection, recovery)
+        await self._write_target(connection, recovery)
         await _append_event_in_transaction(
             connection,
             self.tables,
-            run.run_id,
+            attempt.target_id,
             (
                 "execution.attempt.lease_expired"
                 if status is ExecutionAttemptStatus.LEASE_EXPIRED
@@ -1929,8 +2644,12 @@ class PostgresExecutionStore:
         await _append_event_in_transaction(
             connection,
             self.tables,
-            run.run_id,
-            "run.recovery_required",
+            attempt.target_id,
+            (
+                "run.recovery_required"
+                if attempt.target_kind is ExecutionTargetKind.AGENT_RUN
+                else "flow.recovery_required"
+            ),
             {
                 "execution_attempt_id": attempt.attempt_id,
                 "reason_code": reason_code,
@@ -1991,11 +2710,16 @@ class PostgresExecutionStore:
     async def _latest_attempt_locked(
         self,
         connection: Any,
-        run_id: str,
+        target_id: str,
+        *,
+        target_kind: ExecutionTargetKind,
     ) -> ExecutionAttempt | None:
         statement = (
             select(self.tables.execution_attempts.c.record)
-            .where(self.tables.execution_attempts.c.target_id == run_id)
+            .where(
+                self.tables.execution_attempts.c.target_kind == target_kind.value,
+                self.tables.execution_attempts.c.target_id == target_id,
+            )
             .order_by(desc(self.tables.execution_attempts.c.attempt_number))
             .limit(1)
         )
@@ -2014,6 +2738,8 @@ class PostgresExecutionStore:
             attempt.status not in _ACTIVE_EXECUTION_ATTEMPT_STATUSES
             or attempt.owner_id != lease.owner_id
             or attempt.fencing_token != lease.fencing_token
+            or attempt.request_id != lease.request_id
+            or attempt.target_id != lease.target_id
         ):
             raise ExecutionLeaseLostError(
                 f"ExecutionAttempt lease '{lease.attempt_id}' is no longer owned"
@@ -2029,9 +2755,12 @@ class PostgresExecutionStore:
         target_id: str,
         operation: ExecutionOperation,
         payload: Mapping[str, Any],
+        *,
+        target_kind: ExecutionTargetKind = ExecutionTargetKind.AGENT_RUN,
     ) -> None:
         if (
-            request.target_id != target_id
+            request.target_kind is not target_kind
+            or request.target_id != target_id
             or request.operation is not operation
             or request.payload != _finite_json_mapping(payload)
         ):
@@ -2042,6 +2771,62 @@ class PostgresExecutionStore:
             update(self.tables.runs)
             .where(self.tables.runs.c.run_id == record.run_id)
             .values(**_run_columns(record))
+        )
+
+    async def _locked_target(
+        self,
+        connection: Any,
+        target_kind: ExecutionTargetKind,
+        target_id: str,
+    ) -> AgentRunRecord | FlowRunRecord:
+        if target_kind is ExecutionTargetKind.AGENT_RUN:
+            return await self.runs._locked_record(connection, target_id)
+        return await self.flows._locked_record(connection, target_id)
+
+    async def _write_target(
+        self,
+        connection: Any,
+        record: AgentRunRecord | FlowRunRecord,
+    ) -> None:
+        if isinstance(record, AgentRunRecord):
+            await self._write_run(connection, record)
+        else:
+            await self.flows._write_record(connection, record)
+
+    @staticmethod
+    def _updated_target(
+        target: AgentRunRecord | FlowRunRecord,
+        *,
+        status: str,
+        now: datetime,
+        updates: Mapping[str, Any],
+    ) -> AgentRunRecord | FlowRunRecord:
+        values = {
+            "status": status,
+            "revision": target.revision + 1,
+            "updated_at": now,
+            **dict(updates),
+        }
+        if isinstance(target, AgentRunRecord):
+            for name in ("checkpoint_stage", "plan_revision", "waiting_child_run_id"):
+                values.pop(name, None)
+            return AgentRunRecord.model_validate(
+                {**target.model_dump(mode="json"), **values}
+            )
+        values.pop("text", None)
+        return FlowRunRecord.model_validate(
+            {**target.model_dump(mode="json"), **values}
+        )
+
+    async def _delete_flow_checkpoint(
+        self,
+        connection: Any,
+        flow_run_id: str,
+    ) -> None:
+        await connection.execute(
+            delete(self.tables.flow_checkpoints).where(
+                self.tables.flow_checkpoints.c.flow_run_id == flow_run_id
+            )
         )
 
     async def _write_request(self, connection: Any, record: ExecutionRequest) -> None:
@@ -2100,34 +2885,59 @@ async def _append_event_in_transaction(
     return sequence
 
 
-def _distributed_terminal_event_kind(status: RunStatus) -> str:
-    return {
-        RunStatus.WAITING: "run.waiting",
-        RunStatus.SUCCEEDED: "run.succeeded",
-        RunStatus.FAILED: "run.failed",
-        RunStatus.CANCELLED: "run.cancelled",
-    }[status]
+def _distributed_terminal_event_kind(
+    target_kind: ExecutionTargetKind,
+    status: str,
+) -> str:
+    if status not in {"waiting", "succeeded", "failed", "cancelled"}:
+        raise ValueError(f"unsupported terminal execution status '{status}'")
+    prefix = "run" if target_kind is ExecutionTargetKind.AGENT_RUN else "flow"
+    return f"{prefix}.{status}"
 
 
 def _distributed_terminal_event_payload(
     attempt_id: str | None,
     *,
-    status: RunStatus,
+    target_kind: ExecutionTargetKind,
+    status: str,
     output: Any | None,
     text: str | None,
     error: str | None,
     checkpoint_revision: int | None,
+    pending_input: Mapping[str, Any] | None = None,
+    waiting_child_run_id: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     if attempt_id is not None:
         payload["execution_attempt_id"] = attempt_id
-    if status is RunStatus.SUCCEEDED:
-        payload.update(output=_finite_json_value(output), text=text or "")
-    elif status in {RunStatus.FAILED, RunStatus.CANCELLED}:
-        payload.update(error=error, text=text or "")
+    if status == "succeeded":
+        if target_kind is ExecutionTargetKind.AGENT_RUN:
+            payload.update(output=_finite_json_value(output), text=text or "")
+        else:
+            payload["output"] = text if text is not None else _postgres_flow_output(output)
+    elif status in {"failed", "cancelled"}:
+        payload["error"] = error
+        if target_kind is ExecutionTargetKind.AGENT_RUN:
+            payload["text"] = text or ""
     else:
         payload["checkpoint_revision"] = checkpoint_revision
+        if pending_input is not None:
+            normalized = _finite_json_mapping(pending_input)
+            input_kind = normalized.pop("kind", None)
+            payload.update(normalized)
+            payload["input_kind"] = input_kind
+        if waiting_child_run_id is not None:
+            payload["agent_run_id"] = waiting_child_run_id
     return payload
+
+
+def _postgres_flow_output(value: Any | None) -> str | None:
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        output = value.get("output")
+        return output if isinstance(output, str) else None
+    raise ValueError("Flow output must be a string or an object containing output")
 
 
 async def _database_now(connection: Any) -> datetime:
@@ -2225,11 +3035,61 @@ def _run_columns(
     }
 
 
+def _flow_run_columns(
+    record: FlowRunRecord,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "flow_run_id": record.flow_run_id,
+        "flow_name": record.flow_name,
+        "flow_id": record.flow_id,
+        "flow_kind": record.flow_kind.value,
+        "definition_fingerprint": record.definition_fingerprint,
+        "runtime_build_id": record.runtime_build_id,
+        "runtime_route": record.runtime_route,
+        "status": record.status.value,
+        "revision": record.revision,
+        "cancel_requested": record.cancel_requested,
+        "current_request_id": record.current_request_id,
+        "current_attempt_id": record.current_attempt_id,
+        "checkpoint_revision": record.checkpoint_revision,
+        "payload": payload if payload is not None else flow_record_json(record),
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+    }
+
+
+def _flow_checkpoint_columns(record: FlowCheckpoint) -> dict[str, Any]:
+    return {
+        "flow_run_id": record.flow_run_id,
+        "flow_id": record.flow_id,
+        "flow_kind": record.flow_kind.value,
+        "definition_fingerprint": record.definition_fingerprint,
+        "revision": record.revision,
+        "payload": flow_checkpoint_json(record),
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+    }
+
+
 def _validate_run_lease(owner_id: str, lease_seconds: float) -> None:
     if not owner_id.strip():
         raise ValueError("Run lease owner_id must not be blank")
     if lease_seconds <= 0:
         raise ValueError("Run lease_seconds must be greater than zero")
+
+
+def _validate_current_attempt_target(
+    attempt: ExecutionAttempt,
+    target: AgentRunRecord | FlowRunRecord,
+) -> None:
+    if (
+        target.status.value != "running"
+        or target.current_attempt_id != attempt.attempt_id
+    ):
+        raise ExecutionLeaseLostError(
+            "ExecutionAttempt is no longer current for its target"
+        )
 
 
 def _validate_owned_run(record: AgentRunRecord, lease: RunLease, now: datetime) -> None:

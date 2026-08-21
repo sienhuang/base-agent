@@ -51,6 +51,7 @@ def test_starter_composes_sdk_http_adapter(monkeypatch) -> None:
         "/v1/flows/{flow_run_id}/confirm",
         "/v1/flows/{flow_run_id}/events",
         "/v1/flows/{flow_run_id}/events/stream",
+        "/v1/operator/flows/{flow_run_id}/recovery-decisions",
     }
     assert callable(built.state.run_registry.get)
     assert built.state.flow_registry.names == ("plan-react",)

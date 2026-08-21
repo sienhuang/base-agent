@@ -6,6 +6,7 @@ import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from base_agent.agent import Agent
@@ -18,6 +19,14 @@ from base_agent.artifacts import (
     artifact_spec,
 )
 from base_agent.events import EventEmitter, EventStore, InMemoryEventStore
+from base_agent.flow_store import FlowCheckpoint, FlowKind
+from base_agent.flows.checkpoints import (
+    CheckpointWriter,
+    callable_identity,
+    definition_fingerprint,
+    restore_dataclass,
+    strict_json_value,
+)
 from base_agent.flows.handle import FlowRunHandle
 from base_agent.flows.models import FlowStatus
 from base_agent.governance import ToolConfirmation
@@ -119,6 +128,8 @@ class _SequentialFlowState:
     waiting_stage: Stage | None = None
     waiting_run: RunResult | None = None
     waiting_attempt: int | None = None
+    checkpoint_revision: int | None = None
+    checkpoint_created_at: datetime | None = None
 
 
 class SequentialFlow:
@@ -132,6 +143,7 @@ class SequentialFlow:
         forward_child_events: bool = False,
         artifact_specs: Sequence[ArtifactSpec | ArtifactRef] = (),
         artifacts: Sequence[ArtifactSpec | ArtifactRef] = (),
+        checkpoint_writer: CheckpointWriter | None = None,
     ) -> None:
         if not id.strip():
             raise ValueError("flow id must not be blank")
@@ -150,6 +162,7 @@ class SequentialFlow:
                 raise ValueError("the first Stage can only read the user input")
             known_names.add(stage.name)
         self.id = id
+        self.kind = FlowKind.SEQUENTIAL
         self.stages = tuple(stages)
         self.event_store = event_store if event_store is not None else InMemoryEventStore()
         self.forward_child_events = forward_child_events
@@ -162,6 +175,36 @@ class SequentialFlow:
         if len(set(spec_names)) != len(spec_names):
             raise ValueError("Flow ArtifactSpec names must be unique")
         self.artifact_specs = tuple(declared_specs)
+        self.checkpoint_writer = checkpoint_writer
+        self.definition_fingerprint = definition_fingerprint(
+            {
+                "flow_id": self.id,
+                "flow_kind": FlowKind.SEQUENTIAL.value,
+                "stages": [
+                    {
+                        "name": stage.name,
+                        "agent_snapshot": stage.agent.snapshot.fingerprint,
+                        "prompt": stage.prompt,
+                        "input_from": stage.input_from,
+                        "handoff": callable_identity(stage.handoff),
+                        "verify": callable_identity(stage.verify),
+                        "retry": {
+                            "max_attempts": stage.retry.max_attempts,
+                            "feedback_verification_failure": (
+                                stage.retry.feedback_verification_failure
+                            ),
+                        },
+                        "artifacts": [
+                            strict_json_value(item) for item in stage.artifacts
+                        ],
+                    }
+                    for stage in self.stages
+                ],
+                "artifact_specs": [
+                    strict_json_value(item) for item in self.artifact_specs
+                ],
+            }
+        )
         self._observers = tuple(observers)
         self._waiting_states: dict[str, _SequentialFlowState] = {}
         self._waiting_lock = asyncio.Lock()
@@ -207,6 +250,19 @@ class SequentialFlow:
         except BaseException:
             await self._restore_waiting_state(state)
             raise
+
+    async def restore_checkpoint(self, checkpoint: FlowCheckpoint) -> None:
+        """Restore one persisted safe boundary into this Flow instance."""
+        state = self._state_from_checkpoint(checkpoint)
+        async with self._waiting_lock:
+            self._waiting_states[state.flow_run_id] = state
+
+    async def recover(self, checkpoint: FlowCheckpoint) -> FlowResult:
+        """Continue from the next durable Stage boundary without replaying prior Stages."""
+        state = self._state_from_checkpoint(checkpoint)
+        if state.waiting_run is not None:
+            raise ValueError("a WAITING Flow checkpoint requires resume or confirm")
+        return await self._execute(state)
 
     async def confirm(
         self,
@@ -391,6 +447,7 @@ class SequentialFlow:
                         request_id=(pending.request_id if pending is not None else None),
                         input_kind=(pending.kind.value if pending is not None else None),
                     )
+                    await self._persist_checkpoint(state)
                     return await self._result(state, FlowStatus.WAITING)
                 state.waiting_stage = None
                 state.waiting_run = None
@@ -470,6 +527,7 @@ class SequentialFlow:
                             error=verification_error,
                             evidence=evidence_payload,
                         )
+                        await self._persist_checkpoint(state)
                         continue
                     state.stage_results.append(result)
                     return await self._failed_result(
@@ -507,6 +565,7 @@ class SequentialFlow:
                 state.next_stage_index = index + 1
                 state.next_attempt = 1
                 state.retry_feedback = None
+                await self._persist_checkpoint(state)
                 break
 
         await state.emitter.emit(
@@ -515,6 +574,156 @@ class SequentialFlow:
             child_runs=_sequential_child_runs(state),
         )
         return await self._result(state, FlowStatus.SUCCEEDED)
+
+    async def _persist_checkpoint(self, state: _SequentialFlowState) -> None:
+        writer = self.checkpoint_writer
+        if writer is None:
+            return
+        now = datetime.now(UTC)
+        created_at = state.checkpoint_created_at or now
+        next_revision = (state.checkpoint_revision or 0) + 1
+        next_stage = (
+            self.stages[state.next_stage_index].name
+            if state.next_stage_index < len(self.stages)
+            else None
+        )
+        checkpoint = FlowCheckpoint(
+            flow_run_id=state.flow_run_id,
+            flow_id=self.id,
+            flow_kind=FlowKind.SEQUENTIAL,
+            definition_fingerprint=self.definition_fingerprint,
+            revision=next_revision,
+            cursor={
+                "prompt": state.prompt,
+                "stream": state.stream,
+                "stage_results": strict_json_value(state.stage_results),
+                "stage_attempts": strict_json_value(state.stage_attempts),
+                "handoffs": strict_json_value(state.handoffs),
+                "accepted_artifacts": strict_json_value(state.accepted_artifacts),
+                "artifact_bindings": strict_json_value(state.artifact_bindings),
+                "started": state.started,
+                "next_stage_index": state.next_stage_index,
+                "next_attempt": state.next_attempt,
+                "retry_feedback": state.retry_feedback,
+                "waiting_stage": (
+                    state.waiting_stage.name
+                    if state.waiting_stage is not None
+                    else None
+                ),
+                "waiting_run": (
+                    strict_json_value(state.waiting_run)
+                    if state.waiting_run is not None
+                    else None
+                ),
+                "waiting_attempt": state.waiting_attempt,
+            },
+            stage=next_stage or (
+                state.waiting_stage.name
+                if state.waiting_stage is not None
+                else None
+            ),
+            waiting_child_run_id=(
+                state.waiting_run.run_id if state.waiting_run is not None else None
+            ),
+            created_at=created_at,
+            updated_at=now,
+        )
+        saved = await writer(checkpoint)
+        state.checkpoint_revision = saved.revision
+        state.checkpoint_created_at = saved.created_at
+
+    def _state_from_checkpoint(
+        self,
+        checkpoint: FlowCheckpoint,
+    ) -> _SequentialFlowState:
+        if (
+            checkpoint.flow_id != self.id
+            or checkpoint.flow_kind is not FlowKind.SEQUENTIAL
+            or checkpoint.definition_fingerprint != self.definition_fingerprint
+        ):
+            raise ValueError("Flow checkpoint does not match this Sequential Flow")
+        cursor = checkpoint.cursor
+        prompt = cursor.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Sequential Flow checkpoint has no prompt")
+        stage_results = [
+            restore_dataclass(StageResult, item)
+            for item in _checkpoint_list(cursor, "stage_results")
+        ]
+        stage_attempts = [
+            restore_dataclass(StageResult, item)
+            for item in _checkpoint_list(cursor, "stage_attempts")
+        ]
+        waiting_stage_name = cursor.get("waiting_stage")
+        waiting_stage = (
+            next(
+                (stage for stage in self.stages if stage.name == waiting_stage_name),
+                None,
+            )
+            if isinstance(waiting_stage_name, str)
+            else None
+        )
+        if isinstance(waiting_stage_name, str) and waiting_stage is None:
+            raise ValueError(
+                f"Sequential Flow checkpoint references unknown Stage "
+                f"'{waiting_stage_name}'"
+            )
+        waiting_payload = cursor.get("waiting_run")
+        waiting_run = (
+            restore_dataclass(RunResult, waiting_payload)
+            if waiting_payload is not None
+            else None
+        )
+        if (waiting_stage is None) != (waiting_run is None):
+            raise ValueError("Sequential Flow checkpoint has incomplete waiting state")
+        if (
+            waiting_run is not None
+            and checkpoint.waiting_child_run_id != waiting_run.run_id
+        ):
+            raise ValueError("Sequential Flow checkpoint waiting child is inconsistent")
+        if waiting_run is None and checkpoint.waiting_child_run_id is not None:
+            raise ValueError("Sequential Flow checkpoint has an unexpected waiting child")
+        return _SequentialFlowState(
+            flow_run_id=checkpoint.flow_run_id,
+            prompt=prompt,
+            emitter=EventEmitter(
+                checkpoint.flow_run_id,
+                self.event_store,
+                self._observers,
+            ),
+            stream=bool(cursor.get("stream", False)),
+            stage_results=stage_results,
+            stage_attempts=stage_attempts,
+            handoffs=_checkpoint_string_mapping(cursor, "handoffs"),
+            accepted_artifacts=[
+                restore_dataclass(Artifact, item)
+                for item in _checkpoint_list(cursor, "accepted_artifacts")
+            ],
+            artifact_bindings=[
+                restore_dataclass(ArtifactBinding, item)
+                for item in _checkpoint_list(cursor, "artifact_bindings")
+            ],
+            started=bool(cursor.get("started", True)),
+            next_stage_index=_checkpoint_non_negative_int(
+                cursor,
+                "next_stage_index",
+            ),
+            next_attempt=_checkpoint_positive_int(cursor, "next_attempt"),
+            retry_feedback=(
+                cursor["retry_feedback"]
+                if isinstance(cursor.get("retry_feedback"), str)
+                else None
+            ),
+            waiting_stage=waiting_stage,
+            waiting_run=waiting_run,
+            waiting_attempt=(
+                _checkpoint_positive_int(cursor, "waiting_attempt")
+                if cursor.get("waiting_attempt") is not None
+                else None
+            ),
+            checkpoint_revision=checkpoint.revision,
+            checkpoint_created_at=checkpoint.created_at,
+        )
 
     async def _claim_waiting_state(self, flow_run_id: str) -> _SequentialFlowState:
         async with self._waiting_lock:
@@ -707,6 +916,46 @@ class SequentialFlow:
 
 def _sequential_output(state: _SequentialFlowState) -> str:
     return state.stage_results[-1].handoff if state.stage_results else ""
+
+
+def _checkpoint_list(cursor: Mapping[str, object], name: str) -> list[object]:
+    value = cursor.get(name, [])
+    if not isinstance(value, list):
+        raise ValueError(f"Sequential Flow checkpoint '{name}' must be a list")
+    return value
+
+
+def _checkpoint_string_mapping(
+    cursor: Mapping[str, object],
+    name: str,
+) -> dict[str, str]:
+    value = cursor.get(name, {})
+    if not isinstance(value, dict) or any(
+        not isinstance(key, str) or not isinstance(item, str)
+        for key, item in value.items()
+    ):
+        raise ValueError(
+            f"Sequential Flow checkpoint '{name}' must map strings to strings"
+        )
+    return dict(value)
+
+
+def _checkpoint_non_negative_int(cursor: Mapping[str, object], name: str) -> int:
+    value = cursor.get(name)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(
+            f"Sequential Flow checkpoint '{name}' must be a non-negative integer"
+        )
+    return value
+
+
+def _checkpoint_positive_int(cursor: Mapping[str, object], name: str) -> int:
+    value = cursor.get(name)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(
+            f"Sequential Flow checkpoint '{name}' must be a positive integer"
+        )
+    return value
 
 
 def _require_waiting_stage(state: _SequentialFlowState) -> Stage:

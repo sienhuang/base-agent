@@ -175,10 +175,10 @@ checkpoint 会保留，但当前单一 Runtime 会因 fingerprint 不一致拒�
 Runtime 路由方向记录在 [`ARCHITECTURE.md`](ARCHITECTURE.md#已知限制-next-run-001滚动发布后旧-waiting-run-无法直接恢复)，当前不放宽安全校验。
 
 Sequential 和 Planner-ReAct Flow 会把子 Run 的等待传播为 `FlowStatus.WAITING`，并可用
-`flow.resume(...)` / `flow.confirm(...)` 继续。第一版父 Flow continuation 保存在执行进程中；
-Agent checkpoint 已可跨进程恢复，但服务重启后还不能通过父 `flow_run_id` 恢复 Flow 调度位置。
-此时仍可通过 `waiting_child_run_id` 恢复子 Agent，完整父 Flow 跨进程恢复需要后续持久化
-FlowCheckpoint/FlowRunStore。
+`flow.resume(...)` / `flow.confirm(...)` 继续。两种内建策略现在都能在安全边界写入
+`FlowCheckpoint`：Sequential 保存 Stage index/result/handoff/Artifact，Planner-ReAct 保存 Plan
+revision、Step review 状态和等待中的 child Run。`FlowRunStore` 保存顶层状态，Flow 定义指纹不匹配
+时拒绝恢复；配置持久 Store 与 queued execution 后，服务重启仍可通过父 `flow_run_id` 继续。
 
 ## Planner–ReAct Flow
 
@@ -268,10 +268,9 @@ handle = flow.start("Research the topic", stream=True)
 
 Planner 与 Executor 的 Memory scope 必须分别通过 `planner_memory_scope` 和
 `executor_memory_scope` 显式传入。Plan 是 Flow 领域状态，不会作为 Memory 或 Message
-隐式共享。`FlowRunHandle` 和父 Flow continuation 仍然属于启动它的进程；HTTP 读取层可以通过
-共享 EventStore 在 Registry miss 时恢复 Plan、WAITING/终态和事件访问。Agent WAITING 已有
-持久化 checkpoint 和 lease；父 Flow 的跨进程续跑、跨进程取消和工作分配仍需要共享
-FlowRunStore/FlowCheckpoint 与 owner lease。
+隐式共享。本地模式下 `FlowRunHandle` 仍属于启动进程；queued 模式则由共享
+`FlowRunStore/FlowCheckpoint`、ExecutionRequest/Attempt lease 和 fencing token 持有控制状态，
+HTTP 进程不保存活动 Flow task。两种模式都使用 EventStore 恢复 Plan、WAITING/终态和事件访问。
 
 ## ContextPolicy
 
@@ -456,11 +455,13 @@ app = AgentApplication(
 | `GET` | `/v1/runs/{run_id}/events/stream` | 先回放、再通过 SSE 实时跟随。 |
 | `POST` | `/v1/flows/{flow_name}` | 后台启动已注册 Flow，立即返回 `202`。 |
 | `GET` | `/v1/flows/{flow_run_id}` | 返回 Flow 状态、Plan 和子 Run 关联。 |
-| `POST` | `/v1/flows/{flow_run_id}/resume` | 在原执行进程继续等待中的子 Run 和 Flow。 |
-| `POST` | `/v1/flows/{flow_run_id}/confirm` | 在原执行进程确认等待中的子 Tool。 |
+| `POST` | `/v1/flows/{flow_run_id}/resume` | 继续等待中的子 Run 和父 Flow；queued 模式写入 continuation request。 |
+| `POST` | `/v1/flows/{flow_run_id}/confirm` | 确认等待中的子 Tool；queued 模式校验并复用 request_id。 |
 | `POST` | `/v1/flows/{flow_run_id}/cancel` | 取消 Flow 及当前活动子 Run。 |
 | `GET` | `/v1/flows/{flow_run_id}/events` | 回放 Flow Event 和可选的关联子 Run Event。 |
 | `GET` | `/v1/flows/{flow_run_id}/events/stream` | 通过 SSE 回放并跟随 Flow。 |
+| `POST` | `/v1/operator/runs/{run_id}/recovery-decisions` | 授权 Operator 提交 Agent recovery decision。 |
+| `POST` | `/v1/operator/flows/{flow_run_id}/recovery-decisions` | 授权 Operator 提交 Flow recovery decision。 |
 
 SSE 帧把 `Event.sequence` 同时作为 `id` 和断线续传游标：
 
@@ -472,12 +473,11 @@ data: {"sequence":8,"kind":"run.succeeded","run_id":"...","turn":1,"payload":{..
 
 客户端可用 `?after_sequence=5`、`?last_event_id=5` 或 `Last-Event-ID: 5` 只接收 sequence
 大于 5 的 Event；Header 优先于 `last_event_id`，再与 `after_sequence` 取较大值。连接空闲时
-默认每 15 秒发送一次 SSE comment 心跳，Run/Flow 终态事件发出后流自然关闭。Run 与 Flow
-registry 仍只保存当前进程的活动 Handle；配置共享 EventStore 后，重启或请求落到另一 Worker
-时，历史和 SSE 会从持久 Event 回放。普通顶层 Agent Run 另由共享 RunStore 保存状态、结果、
-取消请求和本地 Executor lease；故障遗留的 `RUNNING` 在 lease 过期后 fail-closed 为
-`BLOCKED`，不会自动重放。Agent `WAITING` 可以由共享 CheckpointStore 跨进程继续。父 Flow
-continuation、FlowRunStore、外部任务队列和自动保留期仍未实现。
+默认每 15 秒发送一次 SSE comment 心跳，Run/Flow 终态事件发出后流自然关闭。本地 registry
+只保存当前进程的活动 Handle；queued 模式的 Agent/Flow 分别由 RunStore/FlowRunStore 保存权威
+状态，并共享 ExecutionRequest、ExecutionAttempt、lease、fencing 与 recovery decision。重启或
+请求落到另一 API Pod 时，状态直接读取 control store，历史和 SSE 从 EventStore 回放。Worker
+失联只进入 `RECOVERY_REQUIRED`，不会自动重放；`WAITING` 由持久 checkpoint 跨进程继续。
 
 Planner-ReAct 使用与普通 Agent 相同的 `message.created` 表示原始用户消息，并在成功时发送
 `message.completed`（payload 含最终 `content`），随后发送 `flow.succeeded` 关闭 SSE。启用
@@ -494,9 +494,9 @@ Skill Package 的目录、Tool 贡献、Script 执行边界和 snapshot 契约�
 迁入门槛见 [`MIGRATION.md`](MIGRATION.md)。
 
 API/Executor 分离、Supervisor/Child 隔离、ExecutionAttempt 状态细分、周期性 lease
-reconcile 和人工恢复接口见 [`EXECUTOR_DESIGN.md`](EXECUTOR_DESIGN.md)。普通 Agent Run 的
-第一条 PostgreSQL Worker 纵向链路已经实现，默认仍使用兼容的 `LocalRunExecutor`；FlowRunStore、
-Stage 级恢复和副作用证据仍按该文档的后续阶段推进。
+reconcile 和人工恢复接口见 [`EXECUTOR_DESIGN.md`](EXECUTOR_DESIGN.md)。同一个
+`ExecutionWorker` 已可按 `target_kind` 分派 Agent/Flow Handler；二者共享 PostgreSQL 执行面，
+默认仍使用兼容的本地执行模式。副作用证据、并发/背压和 checkpoint migration 仍按后续阶段推进。
 
 当前 Provider 契约、OpenAI-compatible Adapter、错误分类和验收命令见
 [`PROVIDERS.md`](PROVIDERS.md)。
@@ -523,6 +523,8 @@ Stage 级恢复和副作用证据仍按该文档的后续阶段推进。
 - 进程内 `Agent.start()`、`RunHandle`、显式取消、Event 快照回放和实时订阅；
 - Server 边界的 `AgentRunRecord`、内存/PostgreSQL RunStore，以及带 heartbeat/fencing 的
   `LocalRunExecutor`；过期 `RUNNING` 转为 `BLOCKED`，不自动重放；
+- 内存/PostgreSQL `FlowRunStore/FlowCheckpoint`，以及 Agent/Flow 共用的 queued
+  `ExecutionWorker`、Attempt lease、fencing 和 Operator recovery；
 - 默认内存 `EventStore`、可替换持久历史和可选 `EventStream` 契约；
 - 可选 `base_agent.server` FastAPI Run 提交、状态查询与取消；
 - 有序只读 Event；

@@ -28,10 +28,19 @@ _RUN_ROOT_KINDS = frozenset(
         "run.cancelled",
         "run.blocked",
         "run.interrupted",
+        "run.recovery_required",
     }
 )
 _FLOW_ROOT_KINDS = frozenset(
-    {"flow.started", "flow.waiting", "flow.succeeded", "flow.failed", "flow.cancelled"}
+    {
+        "flow.started",
+        "flow.waiting",
+        "flow.succeeded",
+        "flow.failed",
+        "flow.cancelled",
+        "flow.blocked",
+        "flow.recovery_required",
+    }
 )
 _RUN_TERMINAL_STATUSES = {
     "run.waiting": RunStatus.WAITING,
@@ -40,12 +49,15 @@ _RUN_TERMINAL_STATUSES = {
     "run.cancelled": RunStatus.CANCELLED,
     "run.blocked": RunStatus.BLOCKED,
     "run.interrupted": RunStatus.INTERRUPTED,
+    "run.recovery_required": RunStatus.RECOVERY_REQUIRED,
 }
 _FLOW_TERMINAL_STATUSES = {
     "flow.waiting": FlowStatus.WAITING,
     "flow.succeeded": FlowStatus.SUCCEEDED,
     "flow.failed": FlowStatus.FAILED,
     "flow.cancelled": FlowStatus.CANCELLED,
+    "flow.blocked": FlowStatus.BLOCKED,
+    "flow.recovery_required": FlowStatus.RECOVERY_REQUIRED,
 }
 
 
@@ -215,6 +227,8 @@ def _flow_plan(
         FlowStatus.SUCCEEDED: "succeeded",
         FlowStatus.FAILED: "failed",
         FlowStatus.CANCELLED: "cancelled",
+        FlowStatus.BLOCKED: "running",
+        FlowStatus.RECOVERY_REQUIRED: "running",
     }[status]
     return plan
 

@@ -1,14 +1,5 @@
-"""Values shared by application-facing Flow implementations."""
+"""Compatibility export for values shared by application-facing Flows."""
 
-from enum import StrEnum
+from base_agent.flow_status import FlowStatus
 
-
-class FlowStatus(StrEnum):
-    QUEUED = "queued"
-    RUNNING = "running"
-    WAITING = "waiting"
-    RECOVERY_REQUIRED = "recovery_required"
-    BLOCKED = "blocked"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
+__all__ = ["FlowStatus"]

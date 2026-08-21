@@ -299,9 +299,9 @@ AgentDefinition(
    和 Artifact、Resource 的其他持久 Adapter 仍按真实部署需求迁入。
 
 Worker、Lease、Operator API 和分布式恢复不进入 Harness 主路径。MTBI 长任务与 Kubernetes
-滚动发布已经证明独立执行面的实际需求，普通 Agent Run 已按
-[`EXECUTOR_DESIGN.md`](EXECUTOR_DESIGN.md) 增加可选 PostgreSQL Worker Adapter；默认本地 Agent
-API 仍不要求开发者理解 Worker、Attempt 或 lease，Flow 的持久恢复仍是后续阶段。
+滚动发布已经证明独立执行面的实际需求，Agent 与 Flow 已按
+[`EXECUTOR_DESIGN.md`](EXECUTOR_DESIGN.md) 接入同一个可选 PostgreSQL Execution Worker；默认
+本地 API 仍不要求开发者理解 Worker、Attempt 或 lease。
 
 ### 本地持久 Run 管理（兼容模式）
 
@@ -315,14 +315,14 @@ API 仍不要求开发者理解 Worker、Attempt 或 lease，Flow 的持久恢�
 5. `WAITING` 继续使用现有 checkpoint lease；相同 snapshot 的新进程可恢复。
 
 该兼容模式仍是“API 与本地执行同进程”，不由其他 Worker 扫描领取；它适合开发和单进程部署。
-可选生产 Adapter 已把普通 Agent Run 的提交与执行解耦，并提供显式 Operator
-retry/cancel/fail；父 Flow 仍没有 FlowRunStore/FlowCheckpoint，因此 Flow 还不能作为完整的
-多副本弹性执行平台。
+可选生产 Adapter 已把 Agent/Flow 的提交与执行解耦，FlowRunStore/FlowCheckpoint 保存父 Flow
+状态与安全恢复 cursor，并提供显式 Operator retry/cancel/fail。Agent 与 Flow 共享 execution
+request/attempt/recovery 表，同一个 Worker 按 `target_kind` 选择 Handler。
 
 生产 Adapter 把 API、Executor Supervisor 和 Execution Child 拆成独立进程，并把逻辑 Run、
 ExecutionRequest、ExecutionAttempt 与 RecoveryDecision 分开。lease 归 Attempt；失联只转为
 `RECOVERY_REQUIRED`，由受信任 Operator 接口决定 retry/cancel/fail。完整状态机、PostgreSQL
-模型、fencing、graceful shutdown，以及尚未实现的 Flow 分阶段迁移见
+模型、fencing、graceful shutdown，以及后续生产强化阶段见
 [`EXECUTOR_DESIGN.md`](EXECUTOR_DESIGN.md)。
 
 ### 已知限制 NEXT-RUN-001：滚动发布后旧 WAITING Run 无法直接恢复

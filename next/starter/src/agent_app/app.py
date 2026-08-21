@@ -19,6 +19,7 @@ from base_agent.flows import (
     PlanningLimits,
     StepOutcome,
 )
+from base_agent.flows.checkpoints import CheckpointWriter
 from base_agent.governance import ConfirmationPolicy
 from base_agent.observability import Observer
 from base_agent.providers import ModelProvider
@@ -115,6 +116,7 @@ def build_plan_react_flow(
     artifact_store: ArtifactStore,
     event_store: EventStore | None = None,
     checkpoint_store: CheckpointStore | None = None,
+    flow_checkpoint_writer: CheckpointWriter | None = None,
 ) -> PlannerReActFlow:
     """Compose Planner and Executor Agents with independently selectable Providers."""
     provider = model or OfflineProvider()
@@ -151,6 +153,7 @@ def build_plan_react_flow(
         observers=observers,
         forward_child_events=True,
         event_store=event_store,
+        checkpoint_writer=flow_checkpoint_writer,
     )
 
 

@@ -200,6 +200,10 @@ class FlowResponse(BaseModel):
     plan: dict[str, Any] | None = None
     child_runs: tuple[FlowChildRunResponse, ...] = ()
     artifacts: tuple[ArtifactResponse, ...] = ()
+    recovery: RecoveryResponse | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     pending_input: PendingInputResponse | None = Field(
         default=None,
         exclude_if=lambda value: value is None,

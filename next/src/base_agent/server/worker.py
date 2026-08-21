@@ -10,7 +10,8 @@ import socket
 import sys
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
-from typing import Any, Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import Any, Protocol, cast, runtime_checkable
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -21,11 +22,16 @@ from base_agent.execution import (
     ExecutionLease,
     ExecutionLeaseLostError,
     ExecutionStore,
+    ExecutionTargetKind,
 )
+from base_agent.flows.models import FlowStatus
 from base_agent.models import Event, RunStatus
 
 _CHILD_TERMINAL_EVENTS = frozenset(
     {"run.waiting", "run.succeeded", "run.failed", "run.cancelled"}
+)
+_CHILD_FLOW_TERMINAL_EVENTS = frozenset(
+    {"flow.waiting", "flow.succeeded", "flow.failed", "flow.cancelled"}
 )
 
 
@@ -40,6 +46,7 @@ class ChildExecutionResult(BaseModel):
     error: str | None = None
     pending_input: dict[str, Any] | None = None
     checkpoint_revision: int | None = None
+    waiting_child_run_id: str | None = None
 
     @field_validator("status")
     @classmethod
@@ -91,10 +98,16 @@ class FencedEventStore:
     ) -> Event:
         enriched = dict(payload or {})
         enriched.setdefault("execution_attempt_id", self.lease.attempt_id)
+        enriched.setdefault("execution_target_id", self.lease.target_id)
         persisted_kind = (
             f"execution.child.{kind.removeprefix('run.')}"
-            if kind in _CHILD_TERMINAL_EVENTS
-            else kind
+            if kind in _CHILD_TERMINAL_EVENTS and run_id == self.lease.target_id
+            else (
+                f"execution.child.flow.{kind.removeprefix('flow.')}"
+                if kind in _CHILD_FLOW_TERMINAL_EVENTS
+                and run_id == self.lease.target_id
+                else kind
+            )
         )
         if isinstance(self.store, _FencedEventSink):
             return await self.store.emit_fenced(
@@ -116,14 +129,139 @@ class FencedEventStore:
         return await self.store.list(run_id, after_sequence=after_sequence)
 
 
+@runtime_checkable
+class ExecutionHandler(Protocol):
+    """Target-specific child protocol and logical settlement adapter."""
+
+    target_kind: ExecutionTargetKind
+    child_command: tuple[str, ...]
+
+    def child_input(
+        self,
+        claimed: ClaimedExecution,
+        lease: ExecutionLease,
+    ) -> Mapping[str, Any]: ...
+
+    async def settle(
+        self,
+        store: ExecutionStore,
+        lease: ExecutionLease,
+        result: ChildExecutionResult,
+    ) -> None: ...
+
+    async def cancel(self, store: ExecutionStore, lease: ExecutionLease) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AgentExecutionHandler:
+    """Dispatch one Agent Run to an isolated Agent child process."""
+
+    child_command: tuple[str, ...]
+    target_kind: ExecutionTargetKind = ExecutionTargetKind.AGENT_RUN
+
+    def __init__(self, child_command: Sequence[str]) -> None:
+        if not child_command:
+            raise ValueError("Agent child_command must not be empty")
+        object.__setattr__(self, "child_command", tuple(child_command))
+        object.__setattr__(self, "target_kind", ExecutionTargetKind.AGENT_RUN)
+
+    def child_input(
+        self,
+        claimed: ClaimedExecution,
+        lease: ExecutionLease,
+    ) -> Mapping[str, Any]:
+        return {
+            "request": claimed.request.model_dump(mode="json"),
+            "attempt": claimed.attempt.model_dump(mode="json"),
+            "run": claimed.run.model_dump(mode="json"),
+            "lease": lease.model_dump(mode="json"),
+        }
+
+    async def settle(
+        self,
+        store: ExecutionStore,
+        lease: ExecutionLease,
+        result: ChildExecutionResult,
+    ) -> None:
+        await store.settle(
+            lease,
+            status=result.status,
+            output=result.output,
+            text=result.text,
+            error=result.error,
+            pending_input=result.pending_input,
+            checkpoint_revision=result.checkpoint_revision,
+        )
+
+    async def cancel(self, store: ExecutionStore, lease: ExecutionLease) -> None:
+        await store.settle(
+            lease,
+            status=RunStatus.CANCELLED,
+            text="",
+            error="run cancellation requested",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FlowExecutionHandler:
+    """Dispatch one Flow Run through the same Supervisor and Attempt lease."""
+
+    child_command: tuple[str, ...]
+    target_kind: ExecutionTargetKind = ExecutionTargetKind.FLOW_RUN
+
+    def __init__(self, child_command: Sequence[str]) -> None:
+        if not child_command:
+            raise ValueError("Flow child_command must not be empty")
+        object.__setattr__(self, "child_command", tuple(child_command))
+        object.__setattr__(self, "target_kind", ExecutionTargetKind.FLOW_RUN)
+
+    def child_input(
+        self,
+        claimed: ClaimedExecution,
+        lease: ExecutionLease,
+    ) -> Mapping[str, Any]:
+        return {
+            "request": claimed.request.model_dump(mode="json"),
+            "attempt": claimed.attempt.model_dump(mode="json"),
+            "flow": claimed.target.model_dump(mode="json"),
+            "lease": lease.model_dump(mode="json"),
+        }
+
+    async def settle(
+        self,
+        store: ExecutionStore,
+        lease: ExecutionLease,
+        result: ChildExecutionResult,
+    ) -> None:
+        await store.settle(
+            lease,
+            status=FlowStatus(result.status.value),
+            output=result.output,
+            text=result.text,
+            error=result.error,
+            pending_input=result.pending_input,
+            checkpoint_revision=result.checkpoint_revision,
+            waiting_child_run_id=result.waiting_child_run_id,
+        )
+
+    async def cancel(self, store: ExecutionStore, lease: ExecutionLease) -> None:
+        await store.settle(
+            lease,
+            status=FlowStatus.CANCELLED,
+            text="",
+            error="flow cancellation requested",
+        )
+
+
 class ExecutionWorker:
-    """Claim queued Agent Runs, supervise child processes, and maintain Attempt leases."""
+    """Supervise registered execution target handlers with shared Attempt leases."""
 
     def __init__(
         self,
         execution_store: ExecutionStore,
         *,
-        child_command: Sequence[str],
+        child_command: Sequence[str] | None = None,
+        handlers: Sequence[ExecutionHandler] = (),
         runtime_route: str = "default",
         runtime_build_id: str,
         owner_id: str | None = None,
@@ -134,8 +272,22 @@ class ExecutionWorker:
         child_env_remove: Sequence[str] = (),
         child_env_overrides: Mapping[str, str] | None = None,
     ) -> None:
-        if not child_command:
-            raise ValueError("child_command must not be empty")
+        if child_command is not None and handlers:
+            raise ValueError("provide child_command or handlers, not both")
+        resolved_handlers: tuple[ExecutionHandler, ...]
+        if handlers:
+            resolved_handlers = tuple(handlers)
+        elif child_command is not None:
+            resolved_handlers = (
+                cast(ExecutionHandler, AgentExecutionHandler(child_command)),
+            )
+        else:
+            resolved_handlers = ()
+        if not resolved_handlers:
+            raise ValueError("ExecutionWorker requires at least one handler")
+        handler_kinds = [handler.target_kind for handler in resolved_handlers]
+        if len(set(handler_kinds)) != len(handler_kinds):
+            raise ValueError("ExecutionWorker handler target kinds must be unique")
         if not runtime_route.strip() or not runtime_build_id.strip():
             raise ValueError("runtime route and build ID must not be blank")
         if lease_seconds <= 0:
@@ -145,7 +297,9 @@ class ExecutionWorker:
         if poll_interval_seconds <= 0 or reconcile_interval_seconds <= 0:
             raise ValueError("poll and reconcile intervals must be greater than zero")
         self.execution_store = execution_store
-        self.child_command = tuple(child_command)
+        self.handlers = {
+            handler.target_kind: handler for handler in resolved_handlers
+        }
         self.runtime_route = runtime_route
         self.runtime_build_id = runtime_build_id
         self.owner_id = owner_id or (
@@ -181,6 +335,7 @@ class ExecutionWorker:
                 runtime_route=self.runtime_route,
                 runtime_build_id=self.runtime_build_id,
                 lease_seconds=self.lease_seconds,
+                target_kinds=self.handlers,
             )
             if claimed is None:
                 with suppress(TimeoutError):
@@ -199,6 +354,7 @@ class ExecutionWorker:
             runtime_route=self.runtime_route,
             runtime_build_id=self.runtime_build_id,
             lease_seconds=self.lease_seconds,
+            target_kinds=self.handlers,
         )
         if claimed is None:
             return False
@@ -236,12 +392,13 @@ class ExecutionWorker:
             raise
 
     async def _execute(self, claimed: ClaimedExecution) -> None:
+        handler = self.handlers[claimed.request.target_kind]
         child_environment = os.environ.copy()
         for name in self.child_env_remove:
             child_environment.pop(name, None)
         child_environment.update(self.child_env_overrides)
         process = await asyncio.create_subprocess_exec(
-            *self.child_command,
+            *handler.child_command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -254,12 +411,7 @@ class ExecutionWorker:
         try:
             await self.execution_store.mark_started(lease, child_pid=process.pid)
             child_input = json.dumps(
-                {
-                    "request": claimed.request.model_dump(mode="json"),
-                    "attempt": claimed.attempt.model_dump(mode="json"),
-                    "run": claimed.run.model_dump(mode="json"),
-                    "lease": lease.model_dump(mode="json"),
-                },
+                handler.child_input(claimed, lease),
                 ensure_ascii=False,
                 allow_nan=False,
                 separators=(",", ":"),
@@ -276,6 +428,7 @@ class ExecutionWorker:
                     await self._settle_child(
                         claimed,
                         current_lease,
+                        handler,
                         process.returncode,
                         stdout,
                         stderr,
@@ -296,12 +449,7 @@ class ExecutionWorker:
                     communicate.cancel()
                     with suppress(asyncio.CancelledError):
                         await communicate
-                    await self.execution_store.settle(
-                        current_lease,
-                        status=RunStatus.CANCELLED,
-                        text="",
-                        error="run cancellation requested",
-                    )
+                    await handler.cancel(self.execution_store, current_lease)
                     return
         except asyncio.CancelledError:
             await _terminate_process(process)
@@ -319,6 +467,7 @@ class ExecutionWorker:
         self,
         claimed: ClaimedExecution,
         lease: ExecutionLease,
+        handler: ExecutionHandler,
         returncode: int | None,
         stdout: bytes,
         stderr: bytes,
@@ -349,15 +498,7 @@ class ExecutionWorker:
                 error=result.error or "compatible Runtime is unavailable",
             )
             return
-        await self.execution_store.settle(
-            lease,
-            status=result.status,
-            output=result.output,
-            text=result.text,
-            error=result.error,
-            pending_input=result.pending_input,
-            checkpoint_revision=result.checkpoint_revision,
-        )
+        await handler.settle(self.execution_store, lease, result)
 
     async def _interrupt_child(
         self,

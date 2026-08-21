@@ -100,6 +100,30 @@ async def test_attempt_lease_expiry_requires_an_explicit_recovery_decision() -> 
     assert repeated_decision == decision
 
 
+async def test_expired_attempt_cannot_be_marked_started() -> None:
+    clock = MutableClock()
+    runs = InMemoryRunStore(clock=clock)
+    executions = InMemoryExecutionStore(runs, clock=clock)
+    await executions.enqueue_run(
+        _record(),
+        operation=ExecutionOperation.EXECUTE,
+        payload={"prompt": "work"},
+        idempotency_key="submit-expired-start",
+    )
+    claimed = await executions.claim_next(
+        owner_id="worker-1",
+        runtime_route="default",
+        runtime_build_id="build-1",
+        lease_seconds=30,
+    )
+    assert claimed is not None
+
+    clock.advance(31)
+
+    with pytest.raises(ExecutionLeaseLostError):
+        await executions.mark_started(claimed.lease, child_pid=123)
+
+
 async def test_existing_run_get_includes_recovery_projection_and_decision_post() -> None:
     clock = MutableClock()
     events = InMemoryEventStore()

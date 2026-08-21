@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from typing import cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from base_agent.agent import Agent
@@ -123,7 +124,10 @@ class QueuedRunExecutor:
 
     async def cancel(self, run_id: str) -> AgentRunRecord:
         self._validate_owner(await self.run_store.get(run_id))
-        return await self.execution_store.request_cancel(run_id)
+        return cast(
+            AgentRunRecord,
+            await self.execution_store.request_cancel(run_id),
+        )
 
     async def latest_attempt(self, run_id: str) -> ExecutionAttempt | None:
         self._validate_owner(await self.run_store.get(run_id))
@@ -141,14 +145,17 @@ class QueuedRunExecutor:
         idempotency_key: str,
     ) -> tuple[AgentRunRecord, RecoveryDecisionRecord]:
         self._validate_owner(await self.run_store.get(run_id))
-        return await self.execution_store.decide_recovery(
-            run_id,
-            decision=decision,
-            strategy=strategy,
-            subject_id=subject_id,
-            reason_code=reason_code,
-            expected_revision=expected_revision,
-            idempotency_key=idempotency_key,
+        return cast(
+            tuple[AgentRunRecord, RecoveryDecisionRecord],
+            await self.execution_store.decide_recovery(
+                run_id,
+                decision=decision,
+                strategy=strategy,
+                subject_id=subject_id,
+                reason_code=reason_code,
+                expected_revision=expected_revision,
+                idempotency_key=idempotency_key,
+            ),
         )
 
     def _validate_owner(self, record: AgentRunRecord) -> None:

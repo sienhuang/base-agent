@@ -128,12 +128,11 @@ Redis、PostgreSQL、embedding 或摘要模型。
   客户端断开不会取消 Run；提交 resume/confirm 后用 waiting Event 的 sequence 重新连接即可
   跟随后续事件。
 
-Server 的 Run/Flow Handle 仍在当前进程中，但配置共享 EventStore 后，历史路由不再依赖 Handle：
-Registry miss 时会先校验持久历史属于 Agent Run 还是 Flow Run，再投影 Plan、子 Run 关联和
-Artifact。JSON 历史与终态 SSE 因此可以跨服务重启访问。普通顶层 Agent Run 的状态和取消请求
-由独立 RunStore 管理，LocalRunExecutor 用 heartbeat 续租；过期 `RUNNING` 转为 `BLOCKED` 并以
-`run.blocked` 结束本次 SSE，不会自动重放。Agent 的等待恢复由 CheckpointStore lease 提供，
-Flow 的状态权威和崩溃恢复仍未迁移到 FlowRunStore。
+本地模式的 Run/Flow Handle 仍在当前进程中，但配置共享 EventStore 后，历史路由不再依赖
+Handle：Registry miss 时会先校验持久历史属于 Agent Run 还是 Flow Run，再投影 Plan、子 Run
+关联和 Artifact。queued 模式分别以 RunStore/FlowRunStore 为状态权威，并共享
+ExecutionRequest/Attempt lease 与 fencing；JSON 历史与终态 SSE 可以跨服务重启访问。Agent 的
+等待恢复由 CheckpointStore 提供，Flow 的等待与安全编排边界由 FlowCheckpoint 提供。
 
 `RunHandle.cancel()` 取消后台 Task，并在清理完成后写入唯一的 `run.cancelled` 终态 Event。
 如果取消发生在 Tool 执行期间，Harness 会先写入 `tool.completed(status=cancelled)`，避免留下
@@ -188,7 +187,8 @@ flow = Flow.sequence(id="analysis", stages=stages, event_store=events)
 ```
 
 `create_schema()` 同时创建 `base_agent_event_sequences`、`base_agent_events`、
-`base_agent_checkpoints` 和 `base_agent_runs`。Checkpoint 行保存有限 JSON 状态、revision、lease owner/token 和
+`base_agent_checkpoints`、`base_agent_runs`、`base_agent_flow_runs`、
+`base_agent_flow_checkpoints` 和共享 execution/recovery 表。Checkpoint 行保存有限 JSON 状态、revision、lease owner/token 和
 过期时间；`claim()` 使用数据库条件更新保证同一 Run 同时只有一个 continuation，
 `release()` / `complete()` 必须携带同一个 fencing token。Tool 的幂等键仍保持
 `run_id:tool_call_id`，checkpoint 不保存 Resource 连接或 Artifact 二进制。
@@ -200,12 +200,11 @@ flow = Flow.sequence(id="analysis", stages=stages, event_store=events)
 `AgentApplication(event_store=events, run_store=runs)` 会把 EventStore 和 RunStore 交给 HTTP
 执行/读取层。RunRecord 保存状态、结果、取消请求、Agent/version/snapshot/runtime build，以及
 LocalRunExecutor 的 lease owner/token/heartbeat。服务重启
-后，`GET /runs/{id}`、`GET /flows/{id}`、历史 JSON 和 SSE 可以从 Event 重建；新的终态 Event
-会携带完整输出投影，旧 Event 则从最终 Message、Plan/Step 和 Artifact 事件尽力重建。这里恢复
-的 Flow 状态仍是只读投影；普通顶层 Agent Run 以 RunRecord 为状态权威。处于 `run.waiting` 的
-Agent 可以由新的 Agent 实例通过同一 CheckpointStore 执行 `resume()` / `confirm()`。执行 owner
-失联后，过期 `RUNNING` 转成 `BLOCKED` 并写入 `run.blocked`；运行中的 Tool 不会自动重放。父
-Flow 调度位置尚未跨进程 checkpoint，仍需要 FlowRunStore/FlowCheckpoint。
+后，`GET /runs/{id}`、`GET /flows/{id}`、历史 JSON 和 SSE 可以从 control record 与 Event
+恢复；新的终态 Event 会携带完整输出投影，旧 Event 则从最终 Message、Plan/Step 和 Artifact
+事件尽力重建。queued 模式下普通 Agent Run 以 RunRecord、父 Flow 以 FlowRunRecord 为状态权威；
+两者的 `WAITING` 都可以由新 Execution Child 通过 checkpoint 执行 `resume()` / `confirm()`。
+执行 owner 失联后只进入 `RECOVERY_REQUIRED` 并等待 Operator decision；运行中的 Tool 不会自动重放。
 
 ## Redis 演进方向
 

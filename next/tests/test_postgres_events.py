@@ -42,6 +42,8 @@ def test_postgres_event_schema_and_configuration_are_validated() -> None:
     assert tables.events.name == "base_agent_events"
     assert tables.checkpoints.name == "base_agent_checkpoints"
     assert tables.runs.name == "base_agent_runs"
+    assert tables.flow_runs.name == "base_agent_flow_runs"
+    assert tables.flow_checkpoints.name == "base_agent_flow_checkpoints"
     assert tables.execution_requests.name == "base_agent_execution_requests"
     assert tables.execution_attempts.name == "base_agent_execution_attempts"
     assert tables.recovery_decisions.name == "base_agent_recovery_decisions"

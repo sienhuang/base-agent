@@ -1,8 +1,10 @@
 # 独立 Executor、ExecutionAttempt 与人工恢复设计
 
-实现状态（2026-08-20）：Phase A 与顶层普通 Agent Run 的 Phase B 纵向链路已落地；FlowRunStore、
-Flow Worker、共享 Artifact receipt、side-effect evidence 与 bounded concurrency 仍属于后续阶段。
-默认执行模式继续是 `LocalRunExecutor`。
+实现状态（2026-08-21）：Phase A、Phase B 与 Phase C 第一版已落地。Agent/Flow 共用
+ExecutionRequest、ExecutionAttempt、lease、fencing 与 recovery decision；同一个
+`ExecutionWorker` 按 `target_kind` 分派 Agent/Flow Handler，不再建设独立 flow-worker 基础设施。
+共享 Artifact receipt、side-effect evidence、bounded concurrency 和 checkpoint migration 仍属于
+后续阶段。默认执行模式继续是本地模式。
 
 ## 1. 目标与明确决策
 
@@ -24,7 +26,7 @@ Flow Worker、共享 Artifact receipt、side-effect evidence 与 bounded concurr
 - lease 过期只进入 `RECOVERY_REQUIRED`，不自动 retry；
 - 继续、取消或确认失败由受信任 Operator 接口显式提交；
 - 同一 Run/Flow 恢复时保留原 ID，创建新的 `attempt_id`；
-- 普通 Agent Run 先落地，Flow 在持久 Stage/Plan checkpoint 就绪后接入同一执行面；
+- Agent 与 Flow 使用同一执行面；`runtime_route` 只用于部署层资源隔离，不改变框架模型；
 - `LocalRunExecutor` 保留为零基础设施默认实现，但不作为长任务跨 Pod 恢复方案。
 
 本文不承诺 arbitrary Python stack continuation、exactly-once Tool 执行或 Kubernetes
@@ -532,8 +534,9 @@ analysis Attempt 中断
 如果 SQL 子进程中断且没有完整、验证通过的 CSV，则只能由 Operator 选择重新运行 query；框架
 不能把部分文件当成成功 checkpoint。
 
-Planner-ReAct 必须先把 Plan、Step 和当前 planner/executor child 位置迁移到 FlowRunStore，
-否则只能整 Flow restart，不能声称支持安全的 Step 级恢复。
+当前 Planner-ReAct checkpoint 已保存 Plan revision、Step review 状态和等待中的 child Run；
+Sequential checkpoint 保存 Stage index/result/handoff/Artifact。`from_stage` 只适用于有明确 Stage
+边界的 Sequential Flow；Planner-ReAct 使用 `from_checkpoint` 或 `restart`。
 
 ## 11. 取消、超时和副作用
 
@@ -564,11 +567,13 @@ POST /runs → 当前进程立即创建并执行
 
 ```text
 POST /runs → CREATED + ExecutionRequest → QUEUED
-agent-worker → claim → RUNNING
+execution-worker → claim → target_kind Handler → RUNNING
 ```
 
 两种模式共享逻辑状态、Event 和 HTTP response，不要求普通 Agent 开发者理解 queue、Attempt
-或 lease。`agent-server` 与计划新增的 `agent-worker` 只在应用 composition root 选择 Adapter。
+或 lease。一个 Worker 进程可同时领取 Agent 与 Flow；若生产部署需要资源隔离，可用不同
+`runtime_route` 部署专用 Worker，这是部署选择，不是框架强制。Starter 同时保留
+`execution-worker` 与兼容的 `agent-worker` 命令入口。
 
 ## 13. 分阶段实现
 
@@ -581,9 +586,9 @@ agent-worker → claim → RUNNING
 5. 增加周期性 reconciler，但只标记人工恢复状态；
 6. 保持 `LocalRunExecutor` 行为兼容。
 
-### Phase B：独立 Agent Run Worker
+### Phase B：独立 Execution Worker
 
-1. 增加 `agent-worker` 入口和 Runtime version registry；
+1. 增加 Worker 入口和 Runtime version registry；
 2. FastAPI 分布式模式只入队；
 3. Supervisor claim/heartbeat/cancel/settle；
 4. 每 Attempt 一个 Child process 和 IPC；
@@ -592,11 +597,13 @@ agent-worker → claim → RUNNING
 
 ### Phase C：Flow 持久化与恢复
 
-1. FlowRunStore/FlowCheckpoint；
-2. Sequential Stage index/result/Artifact checkpoint；
-3. 父 Flow 统一恢复 child；
-4. Planner-ReAct Plan revision/Step/child 位置持久化；
-5. `/v1/operator/flows/.../recovery-decisions`。
+1. [x] FlowRunStore/FlowCheckpoint；
+2. [x] Sequential Stage index/result/Artifact checkpoint；
+3. [x] 父 Flow 统一恢复 child；
+4. [x] Planner-ReAct Plan revision/Step/child 位置持久化；
+5. [x] `/v1/operator/flows/.../recovery-decisions`；
+6. [x] 通用 ExecutionWorker 按 target_kind 分派 Handler；
+7. [ ] 对已验证 Artifact receipt 与副作用证据做更细粒度恢复门禁。
 
 ### Phase D：生产强化
 

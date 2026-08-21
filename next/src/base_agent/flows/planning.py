@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal
 from uuid import uuid4
@@ -15,6 +16,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from base_agent.agent import Agent
 from base_agent.artifacts import Artifact
 from base_agent.events import EventEmitter, EventStore, InMemoryEventStore
+from base_agent.flow_store import FlowCheckpoint, FlowKind
+from base_agent.flows.checkpoints import (
+    CheckpointWriter,
+    definition_fingerprint,
+    restore_dataclass,
+    strict_json_value,
+)
 from base_agent.flows.handle import FlowRunHandle
 from base_agent.flows.models import FlowStatus
 from base_agent.governance import ToolConfirmation
@@ -189,7 +197,8 @@ class PlannerReActResult:
 class _ActiveChild:
     role: ChildRunRole
     phase: Literal["create", "review", "execute"]
-    handle: RunHandle
+    run_id: str
+    handle: RunHandle | None
     flow_run_id: str
     plan_id: str
     source_plan_revision: int | None
@@ -202,7 +211,7 @@ class _ActiveChild:
             role=self.role,
             phase=self.phase,
             flow_run_id=self.flow_run_id,
-            agent_run_id=self.handle.run_id,
+            agent_run_id=self.run_id,
             plan_id=self.plan_id,
             source_plan_revision=self.source_plan_revision,
             target_plan_revision=self.target_plan_revision,
@@ -237,6 +246,8 @@ class _FlowRunState:
     review_artifacts: tuple[Artifact, ...] = ()
     waiting_active: _ActiveChild | None = None
     waiting_run: RunResult | None = None
+    checkpoint_revision: int | None = None
+    checkpoint_created_at: datetime | None = None
 
 
 class _FlowExecutionError(RuntimeError):
@@ -260,6 +271,7 @@ class PlannerReActFlow:
         observers: Sequence[Observer] = (),
         event_store: EventStore | None = None,
         forward_child_events: bool = False,
+        checkpoint_writer: CheckpointWriter | None = None,
     ) -> None:
         if not id.strip():
             raise ValueError("PlannerReActFlow id must not be blank")
@@ -276,11 +288,22 @@ class PlannerReActFlow:
         ):
             raise ValueError("Executor Agent response_model must be StepOutcome")
         self.id = id
+        self.kind = FlowKind.PLANNER_REACT
         self.planner = planner
         self.executor = executor
         self.limits = limits if limits is not None else PlanningLimits()
         self.event_store = event_store if event_store is not None else InMemoryEventStore()
         self.forward_child_events = forward_child_events
+        self.checkpoint_writer = checkpoint_writer
+        self.definition_fingerprint = definition_fingerprint(
+            {
+                "flow_id": self.id,
+                "flow_kind": FlowKind.PLANNER_REACT.value,
+                "planner_snapshot": self.planner.snapshot.fingerprint,
+                "executor_snapshot": self.executor.snapshot.fingerprint,
+                "limits": strict_json_value(self.limits),
+            }
+        )
         self._observers = tuple(observers)
         self._waiting_states: dict[str, _FlowRunState] = {}
         self._waiting_lock = asyncio.Lock()
@@ -293,6 +316,7 @@ class PlannerReActFlow:
         on_event: Observer | None = None,
         planner_memory_scope: MemoryScope | None = None,
         executor_memory_scope: MemoryScope | None = None,
+        flow_run_id: str | None = None,
     ) -> PlannerReActResult:
         """Run to completion; cancellation from the caller propagates after child cleanup."""
         state = self._new_state(
@@ -301,6 +325,7 @@ class PlannerReActFlow:
             planner_memory_scope=planner_memory_scope,
             executor_memory_scope=executor_memory_scope,
             stream=stream,
+            flow_run_id=flow_run_id,
         )
         return await self._execute(state)
 
@@ -312,7 +337,7 @@ class PlannerReActFlow:
             await self._forward_child_event(state, active, event)
         try:
             run = await agent.resume(
-                active.handle.run_id,
+                active.run_id,
                 user_input,
                 on_event=(forward_child_event if self.forward_child_events else None),
             )
@@ -330,6 +355,17 @@ class PlannerReActFlow:
             await self._restore_waiting_state(state)
             raise
 
+    async def restore_checkpoint(self, checkpoint: FlowCheckpoint) -> None:
+        state = self._state_from_checkpoint(checkpoint)
+        async with self._waiting_lock:
+            self._waiting_states[state.flow_run_id] = state
+
+    async def recover(self, checkpoint: FlowCheckpoint) -> PlannerReActResult:
+        state = self._state_from_checkpoint(checkpoint)
+        if state.waiting_run is not None:
+            raise ValueError("a WAITING Flow checkpoint requires resume or confirm")
+        return await self._execute(state)
+
     async def confirm(
         self,
         flow_run_id: str,
@@ -342,7 +378,7 @@ class PlannerReActFlow:
             await self._forward_child_event(state, active, event)
         try:
             run = await agent.confirm(
-                active.handle.run_id,
+                active.run_id,
                 confirmation,
                 on_event=(forward_child_event if self.forward_child_events else None),
             )
@@ -368,6 +404,7 @@ class PlannerReActFlow:
         on_event: Observer | None = None,
         planner_memory_scope: MemoryScope | None = None,
         executor_memory_scope: MemoryScope | None = None,
+        flow_run_id: str | None = None,
     ) -> FlowRunHandle[PlannerReActResult]:
         """Start one process-local Flow and expose Events and cancellation."""
         state = self._new_state(
@@ -376,6 +413,7 @@ class PlannerReActFlow:
             planner_memory_scope=planner_memory_scope,
             executor_memory_scope=executor_memory_scope,
             stream=stream,
+            flow_run_id=flow_run_id,
         )
 
         async def operation() -> PlannerReActResult:
@@ -399,21 +437,25 @@ class PlannerReActFlow:
         planner_memory_scope: MemoryScope | None,
         executor_memory_scope: MemoryScope | None,
         stream: bool,
+        flow_run_id: str | None,
     ) -> _FlowRunState:
         if not prompt.strip():
             raise ValueError("flow prompt must not be blank")
-        flow_run_id = str(uuid4())
+        resolved_flow_run_id = flow_run_id or str(uuid4())
+        if not resolved_flow_run_id.strip():
+            raise ValueError("flow_run_id must not be blank")
         observers = self._observers if on_event is None else (*self._observers, on_event)
-        return _FlowRunState(
-            flow_run_id=flow_run_id,
+        state = _FlowRunState(
+            flow_run_id=resolved_flow_run_id,
             plan_id=str(uuid4()),
             prompt=prompt,
-            emitter=EventEmitter(flow_run_id, self.event_store, observers),
+            emitter=EventEmitter(resolved_flow_run_id, self.event_store, observers),
             planner_memory_scope=planner_memory_scope,
             executor_memory_scope=executor_memory_scope,
             user_message_id=str(uuid4()),
             stream=stream,
         )
+        return state
 
     async def _execute(
         self,
@@ -468,6 +510,7 @@ class PlannerReActFlow:
                         plan=state.plan.model_dump(mode="json"),
                     )
                     state.phase = "execute"
+                    await self._persist_checkpoint(state)
                     continue
 
                 if state.phase == "execute":
@@ -496,6 +539,7 @@ class PlannerReActFlow:
                     state.review_executor_run_id = executor_run_id
                     state.review_artifacts = selected_artifacts
                     state.phase = "review"
+                    await self._persist_checkpoint(state)
                     continue
 
                 step_index = _require_step_index(state)
@@ -536,6 +580,7 @@ class PlannerReActFlow:
                     self._set_last_planner_target(state, _require_plan(state).revision)
                     self._clear_review(state)
                     state.phase = "execute"
+                    await self._persist_checkpoint(state)
                     continue
                 if decision.action is PlannerAction.REVISE:
                     source_revision = _require_plan(state).revision
@@ -551,6 +596,7 @@ class PlannerReActFlow:
                     )
                     self._clear_review(state)
                     state.phase = "execute"
+                    await self._persist_checkpoint(state)
                     continue
                 if decision.action is PlannerAction.COMPLETE:
                     self._set_last_planner_target(state, _require_plan(state).revision)
@@ -608,6 +654,7 @@ class PlannerReActFlow:
                 tool_call_id=(pending.tool_call_id if pending is not None else None),
                 metadata=(dict(pending.metadata) if pending is not None else {}),
             )
+            await self._persist_checkpoint(state)
             return await self._result(state, FlowStatus.WAITING)
         except asyncio.CancelledError:
             await self._cancel_active_child(state)
@@ -647,7 +694,7 @@ class PlannerReActFlow:
                 plan_id=state.plan_id,
                 source_plan_revision=source_revision,
                 target_plan_revision=target_revision,
-                agent_run_id=active.handle.run_id,
+                agent_run_id=active.run_id,
             )
             run = await self._wait_for_active_child(state)
         else:
@@ -714,7 +761,7 @@ class PlannerReActFlow:
                 plan_revision=plan.revision,
                 step_id=step.id,
                 attempt=attempt,
-                agent_run_id=active.handle.run_id,
+                agent_run_id=active.run_id,
             )
             run = await self._wait_for_active_child(state)
         else:
@@ -853,6 +900,7 @@ class PlannerReActFlow:
             active_event = _ActiveChild(
                 role=role,
                 phase=phase,
+                run_id=handle.run_id,
                 handle=handle,
                 flow_run_id=state.flow_run_id,
                 plan_id=state.plan_id,
@@ -882,6 +930,7 @@ class PlannerReActFlow:
         active = _ActiveChild(
             role=role,
             phase=phase,
+            run_id=handle.run_id,
             handle=handle,
             flow_run_id=state.flow_run_id,
             plan_id=state.plan_id,
@@ -939,7 +988,7 @@ class PlannerReActFlow:
         active = state.active_child
         if active is None:
             raise RuntimeError("Flow has no active child Run")
-        run = await active.handle.wait()
+        run = await _require_active_handle(active).wait()
         state.child_runs.append(active.finish(run))
         state.active_child = None
         if run.status is RunStatus.WAITING:
@@ -972,6 +1021,153 @@ class PlannerReActFlow:
         state.waiting_active = None
         state.waiting_run = None
 
+    async def _persist_checkpoint(self, state: _FlowRunState) -> None:
+        writer = self.checkpoint_writer
+        if writer is None:
+            return
+        now = datetime.now(UTC)
+        created_at = state.checkpoint_created_at or now
+        checkpoint = FlowCheckpoint(
+            flow_run_id=state.flow_run_id,
+            flow_id=self.id,
+            flow_kind=FlowKind.PLANNER_REACT,
+            definition_fingerprint=self.definition_fingerprint,
+            revision=(state.checkpoint_revision or 0) + 1,
+            cursor={
+                "plan_id": state.plan_id,
+                "prompt": state.prompt,
+                "planner_memory_scope": _memory_scope_payload(
+                    state.planner_memory_scope
+                ),
+                "executor_memory_scope": _memory_scope_payload(
+                    state.executor_memory_scope
+                ),
+                "user_message_id": state.user_message_id,
+                "stream": state.stream,
+                "plan": (
+                    state.plan.model_dump(mode="json")
+                    if state.plan is not None
+                    else None
+                ),
+                "output": state.output,
+                "error": state.error,
+                "child_runs": strict_json_value(state.child_runs),
+                "selected_artifacts": strict_json_value(state.selected_artifacts),
+                "started": state.started,
+                "phase": state.phase,
+                "current_step_index": state.current_step_index,
+                "review_outcome": (
+                    state.review_outcome.model_dump(mode="json")
+                    if state.review_outcome is not None
+                    else None
+                ),
+                "review_executor_run_id": state.review_executor_run_id,
+                "review_artifacts": strict_json_value(state.review_artifacts),
+                "waiting_active": _active_child_payload(state.waiting_active),
+                "waiting_run": (
+                    strict_json_value(state.waiting_run)
+                    if state.waiting_run is not None
+                    else None
+                ),
+            },
+            plan_revision=(state.plan.revision if state.plan is not None else None),
+            waiting_child_run_id=(
+                state.waiting_run.run_id if state.waiting_run is not None else None
+            ),
+            created_at=created_at,
+            updated_at=now,
+        )
+        saved = await writer(checkpoint)
+        state.checkpoint_revision = saved.revision
+        state.checkpoint_created_at = saved.created_at
+
+    def _state_from_checkpoint(self, checkpoint: FlowCheckpoint) -> _FlowRunState:
+        if (
+            checkpoint.flow_id != self.id
+            or checkpoint.flow_kind is not FlowKind.PLANNER_REACT
+            or checkpoint.definition_fingerprint != self.definition_fingerprint
+        ):
+            raise ValueError("Flow checkpoint does not match this Planner/ReAct Flow")
+        cursor = checkpoint.cursor
+        plan_id = _checkpoint_string(cursor, "plan_id")
+        prompt = _checkpoint_string(cursor, "prompt")
+        user_message_id = _checkpoint_string(cursor, "user_message_id")
+        phase = cursor.get("phase")
+        if phase not in {"create", "execute", "review"}:
+            raise ValueError("Planner/ReAct checkpoint has an invalid phase")
+        plan_payload = cursor.get("plan")
+        review_payload = cursor.get("review_outcome")
+        waiting_payload = cursor.get("waiting_run")
+        state = _FlowRunState(
+            flow_run_id=checkpoint.flow_run_id,
+            plan_id=plan_id,
+            prompt=prompt,
+            emitter=EventEmitter(
+                checkpoint.flow_run_id,
+                self.event_store,
+                self._observers,
+            ),
+            planner_memory_scope=_restore_memory_scope(
+                cursor.get("planner_memory_scope")
+            ),
+            executor_memory_scope=_restore_memory_scope(
+                cursor.get("executor_memory_scope")
+            ),
+            user_message_id=user_message_id,
+            stream=bool(cursor.get("stream", False)),
+            plan=(Plan.model_validate(plan_payload) if plan_payload is not None else None),
+            output=_checkpoint_optional_string(cursor, "output") or "",
+            error=_checkpoint_optional_string(cursor, "error"),
+            child_runs=[
+                restore_dataclass(FlowChildRun, item)
+                for item in _checkpoint_list(cursor, "child_runs")
+            ],
+            selected_artifacts=[
+                restore_dataclass(Artifact, item)
+                for item in _checkpoint_list(cursor, "selected_artifacts")
+            ],
+            started=bool(cursor.get("started", True)),
+            phase=phase,
+            current_step_index=_checkpoint_optional_non_negative_int(
+                cursor,
+                "current_step_index",
+            ),
+            review_outcome=(
+                StepOutcome.model_validate(review_payload)
+                if review_payload is not None
+                else None
+            ),
+            review_executor_run_id=_checkpoint_optional_string(
+                cursor,
+                "review_executor_run_id",
+            ),
+            review_artifacts=tuple(
+                restore_dataclass(Artifact, item)
+                for item in _checkpoint_list(cursor, "review_artifacts")
+            ),
+            waiting_active=_restore_active_child(cursor.get("waiting_active")),
+            waiting_run=(
+                restore_dataclass(RunResult, waiting_payload)
+                if waiting_payload is not None
+                else None
+            ),
+            checkpoint_revision=checkpoint.revision,
+            checkpoint_created_at=checkpoint.created_at,
+        )
+        if (state.waiting_active is None) != (state.waiting_run is None):
+            raise ValueError("Planner/ReAct checkpoint has an incomplete waiting child")
+        if state.waiting_active is not None and state.waiting_run is not None:
+            if (
+                state.waiting_active.flow_run_id != checkpoint.flow_run_id
+                or state.waiting_active.plan_id != plan_id
+                or state.waiting_active.run_id != state.waiting_run.run_id
+                or checkpoint.waiting_child_run_id != state.waiting_run.run_id
+            ):
+                raise ValueError("Planner/ReAct checkpoint waiting child is inconsistent")
+        elif checkpoint.waiting_child_run_id is not None:
+            raise ValueError("Planner/ReAct checkpoint has an unexpected waiting child")
+        return state
+
     @staticmethod
     def _clear_review(state: _FlowRunState) -> None:
         state.current_step_index = None
@@ -983,10 +1179,11 @@ class PlannerReActFlow:
         active = state.active_child
         if active is None:
             return
+        handle = _require_active_handle(active)
         try:
-            run = await active.handle.cancel()
+            run = await handle.cancel()
         except RunNotCancellableError:
-            run = await active.handle.wait()
+            run = await handle.wait()
         state.child_runs.append(active.finish(run))
         state.active_child = None
         state.cancelled_child = active
@@ -1067,7 +1264,7 @@ class PlannerReActFlow:
                 plan_revision=active.source_plan_revision,
                 step_id=active.step_id,
                 attempt=active.attempt,
-                agent_run_id=active.handle.run_id,
+                agent_run_id=active.run_id,
             )
         if state.plan is not None:
             await state.emitter.emit(
@@ -1140,6 +1337,141 @@ def _require_waiting_run(state: _FlowRunState) -> RunResult:
     if state.waiting_run is None:
         raise RuntimeError("waiting Planner/ReAct Flow has no child Run")
     return state.waiting_run
+
+
+def _require_active_handle(active: _ActiveChild) -> RunHandle:
+    if active.handle is None:
+        raise RuntimeError("restored Flow child has no process-local Run handle")
+    return active.handle
+
+
+def _active_child_payload(active: _ActiveChild | None) -> dict[str, object] | None:
+    if active is None:
+        return None
+    return {
+        "role": active.role.value,
+        "phase": active.phase,
+        "run_id": active.run_id,
+        "flow_run_id": active.flow_run_id,
+        "plan_id": active.plan_id,
+        "source_plan_revision": active.source_plan_revision,
+        "target_plan_revision": active.target_plan_revision,
+        "step_id": active.step_id,
+        "attempt": active.attempt,
+    }
+
+
+def _restore_active_child(payload: object) -> _ActiveChild | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise ValueError("Planner/ReAct checkpoint waiting_active must be an object")
+    role = payload.get("role")
+    phase = payload.get("phase")
+    if role not in {item.value for item in ChildRunRole}:
+        raise ValueError("Planner/ReAct checkpoint has an invalid child role")
+    if phase not in {"create", "review", "execute"}:
+        raise ValueError("Planner/ReAct checkpoint has an invalid child phase")
+    return _ActiveChild(
+        role=ChildRunRole(role),
+        phase=phase,
+        run_id=_payload_string(payload, "run_id"),
+        handle=None,
+        flow_run_id=_payload_string(payload, "flow_run_id"),
+        plan_id=_payload_string(payload, "plan_id"),
+        source_plan_revision=_payload_optional_positive_int(
+            payload,
+            "source_plan_revision",
+        ),
+        target_plan_revision=_payload_optional_positive_int(
+            payload,
+            "target_plan_revision",
+        ),
+        step_id=_payload_optional_string(payload, "step_id"),
+        attempt=_payload_optional_positive_int(payload, "attempt"),
+    )
+
+
+def _memory_scope_payload(scope: MemoryScope | None) -> list[str] | None:
+    return list(scope.namespace) if scope is not None else None
+
+
+def _restore_memory_scope(payload: object) -> MemoryScope | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, list) or not all(
+        isinstance(item, str) and item.strip() for item in payload
+    ):
+        raise ValueError("Planner/ReAct checkpoint has an invalid memory scope")
+    return MemoryScope(tuple(payload))
+
+
+def _checkpoint_list(cursor: dict[str, object], key: str) -> list[object]:
+    value = cursor.get(key, [])
+    if not isinstance(value, list):
+        raise ValueError(f"Planner/ReAct checkpoint '{key}' must be a list")
+    return value
+
+
+def _checkpoint_string(cursor: dict[str, object], key: str) -> str:
+    value = cursor.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Planner/ReAct checkpoint '{key}' must be a string")
+    return value
+
+
+def _checkpoint_optional_string(
+    cursor: dict[str, object],
+    key: str,
+) -> str | None:
+    return _payload_optional_string(cursor, key)
+
+
+def _checkpoint_optional_non_negative_int(
+    cursor: dict[str, object],
+    key: str,
+) -> int | None:
+    value = cursor.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(
+            f"Planner/ReAct checkpoint '{key}' must be a non-negative integer"
+        )
+    return value
+
+
+def _payload_string(payload: dict[str, object], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Planner/ReAct checkpoint '{key}' must be a string")
+    return value
+
+
+def _payload_optional_string(
+    payload: dict[str, object],
+    key: str,
+) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"Planner/ReAct checkpoint '{key}' must be a string")
+    return value
+
+
+def _payload_optional_positive_int(
+    payload: dict[str, object],
+    key: str,
+) -> int | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(
+            f"Planner/ReAct checkpoint '{key}' must be a positive integer"
+        )
+    return value
 
 
 def _require_step_index(state: _FlowRunState) -> int:

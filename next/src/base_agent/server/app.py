@@ -23,6 +23,12 @@ from base_agent.execution import (
     ExecutionRequestConflictError,
     ExecutionStore,
 )
+from base_agent.flow_store import (
+    FlowRunRecord,
+    FlowRunRecordNotFoundError,
+    FlowRunStore,
+    FlowTransitionError,
+)
 from base_agent.flows import (
     FlowResult,
     FlowRunHandle,
@@ -96,6 +102,7 @@ def create_http_app(
     run_heartbeat_interval_seconds: float | None = None,
     runtime_build_id: str | None = None,
     execution_store: ExecutionStore | None = None,
+    flow_store: FlowRunStore | None = None,
     execution_mode: str = "local",
     runtime_route: str = "default",
     operator_authorizer: OperatorAuthorizer | None = None,
@@ -110,9 +117,13 @@ def create_http_app(
         raise ValueError("create_http_app requires at least one Agent or Flow")
     if execution_mode not in {"local", "queued"}:
         raise ValueError("execution_mode must be local or queued")
-    if execution_mode == "queued" and (run_store is None or execution_store is None):
-        raise ValueError("queued execution requires run_store and execution_store")
     resolved_flows = dict(flows or {})
+    if execution_mode == "queued" and execution_store is None:
+        raise ValueError("queued execution requires execution_store")
+    if execution_mode == "queued" and agent is not None and run_store is None:
+        raise ValueError("queued Agent execution requires run_store")
+    if execution_mode == "queued" and resolved_flows and flow_store is None:
+        raise ValueError("queued Flow execution requires flow_store")
     _validate_event_store_ownership(event_store, agent, resolved_flows)
     resolved_run_store = run_store or (InMemoryRunStore() if agent is not None else None)
     queued_executor = (
@@ -141,7 +152,13 @@ def create_http_app(
         if agent is not None and resolved_run_store is not None
         else None
     )
-    flow_registry = InMemoryFlowRegistry(resolved_flows)
+    flow_registry = InMemoryFlowRegistry(
+        resolved_flows,
+        flow_store=(flow_store if execution_mode == "queued" else None),
+        execution_store=(execution_store if execution_mode == "queued" else None),
+        runtime_route=runtime_route,
+        runtime_build_id=runtime_build_id,
+    )
     recovery_store = event_store or _common_event_store(agent, resolved_flows)
     @asynccontextmanager
     async def execution_lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -168,6 +185,7 @@ def create_http_app(
     app.state.flow_registry = flow_registry
     app.state.event_store = recovery_store
     app.state.run_store = resolved_run_store
+    app.state.flow_store = flow_store
     app.state.execution_store = execution_store
     app.state.sse_ping_seconds = sse_ping_seconds
 
@@ -197,6 +215,16 @@ def create_http_app(
             response_model=FlowResponse,
         )
         async def get_flow(flow_run_id: str) -> FlowResponse:
+            if flow_registry.queued:
+                try:
+                    record = await flow_registry.record(flow_run_id)
+                except FlowRunRecordNotFoundError as exc:
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                return await _flow_record_response(
+                    record,
+                    recovery_store,
+                    recovery_attempt=await flow_registry.latest_attempt(flow_run_id),
+                )
             continued = flow_registry.continued_result(flow_run_id)
             if continued is not None:
                 events = await _persisted_events(
@@ -225,10 +253,19 @@ def create_http_app(
         ) -> FlowResponse:
             try:
                 result = await flow_registry.resume(flow_run_id, payload.input)
+            except FlowRunRecordNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
             except FlowRunNotFoundError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-            except (CheckpointClaimError, CheckpointConflictError, ValueError) as exc:
+            except (
+                CheckpointClaimError,
+                CheckpointConflictError,
+                FlowTransitionError,
+                ValueError,
+            ) as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if isinstance(result, FlowRunRecord):
+                return await _flow_record_response(result, recovery_store)
             events = await _persisted_events(
                 recovery_store,
                 flow_run_id,
@@ -249,10 +286,19 @@ def create_http_app(
                     flow_run_id,
                     ToolConfirmation(**payload.model_dump()),
                 )
+            except FlowRunRecordNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
             except FlowRunNotFoundError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-            except (CheckpointClaimError, CheckpointConflictError, ValueError) as exc:
+            except (
+                CheckpointClaimError,
+                CheckpointConflictError,
+                FlowTransitionError,
+                ValueError,
+            ) as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if isinstance(result, FlowRunRecord):
+                return await _flow_record_response(result, recovery_store)
             events = await _persisted_events(
                 recovery_store,
                 flow_run_id,
@@ -265,6 +311,14 @@ def create_http_app(
             response_model=FlowResponse,
         )
         async def cancel_flow(flow_run_id: str) -> FlowResponse:
+            if flow_registry.queued:
+                try:
+                    record = await flow_registry.cancel(flow_run_id)
+                except FlowRunRecordNotFoundError as exc:
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                except (FlowTransitionError, ValueError) as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                return await _flow_record_response(record, recovery_store)
             handle = _find_flow_handle(flow_registry, flow_run_id)
             if handle is None:
                 await _persisted_events(
@@ -284,6 +338,48 @@ def create_http_app(
             except FlowRunNotCancellableError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             return await _flow_response(handle)
+
+        @app.post(
+            f"{route_prefix}/operator/flows/{{flow_run_id}}/recovery-decisions",
+            response_model=FlowResponse,
+        )
+        async def decide_flow_recovery(
+            request: Request,
+            flow_run_id: str,
+            payload: RecoveryDecisionRequest,
+        ) -> FlowResponse:
+            if operator_authorizer is None:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Operator recovery authorization is not configured",
+                )
+            authorization = operator_authorizer(request, payload.subject_id)
+            if isinstance(authorization, Awaitable):
+                await authorization
+            try:
+                record, _ = await flow_registry.decide_recovery(
+                    flow_run_id,
+                    decision=payload.decision,
+                    strategy=payload.strategy,
+                    subject_id=payload.subject_id,
+                    reason_code=payload.reason_code,
+                    expected_revision=payload.expected_revision,
+                    idempotency_key=payload.idempotency_key,
+                )
+            except FlowRunRecordNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except (
+                ExecutionRequestConflictError,
+                FlowTransitionError,
+                FlowRunNotFoundError,
+                ValueError,
+            ) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return await _flow_record_response(
+                record,
+                recovery_store,
+                recovery_attempt=await flow_registry.latest_attempt(flow_run_id),
+            )
 
         @app.get(
             f"{route_prefix}/flows/{{flow_run_id}}/events",
@@ -666,9 +762,26 @@ def _validate_event_store_ownership(
 def _start_flow_endpoint(
     registry: InMemoryFlowRegistry,
     flow_name: str,
-) -> Callable[[StartFlowRequest], Awaitable[StartFlowResponse]]:
-    async def start_flow(payload: StartFlowRequest) -> StartFlowResponse:
+) -> Callable[..., Awaitable[StartFlowResponse]]:
+    async def start_flow(
+        payload: StartFlowRequest,
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key", min_length=1, max_length=256),
+        ] = None,
+    ) -> StartFlowResponse:
         try:
+            if registry.queued:
+                record = await registry.enqueue(
+                    flow_name,
+                    payload.prompt,
+                    stream=payload.stream,
+                    idempotency_key=idempotency_key,
+                )
+                return StartFlowResponse(
+                    flow_run_id=record.flow_run_id,
+                    status=record.status,
+                )
             handle = registry.start(
                 flow_name,
                 payload.prompt,
@@ -676,6 +789,10 @@ def _start_flow_endpoint(
             )
         except FlowNotRegisteredError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FlowRunRecordNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ExecutionRequestConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return StartFlowResponse(
             flow_run_id=handle.flow_run_id,
             status=handle.status,
@@ -791,10 +908,10 @@ async def _run_record_response(
 
 
 def _recovery_response(
-    record: AgentRunRecord,
+    record: AgentRunRecord | FlowRunRecord,
     attempt: ExecutionAttempt | None,
 ) -> RecoveryResponse | None:
-    if record.status not in {RunStatus.RECOVERY_REQUIRED, RunStatus.BLOCKED}:
+    if record.status.value not in {"recovery_required", "blocked"}:
         return None
     if record.recovery_reason_code is None or record.recovery_detected_at is None:
         return None
@@ -816,6 +933,43 @@ def _recovery_response(
         revision=record.revision,
         detected_at=record.recovery_detected_at,
         last_attempt=last_attempt,
+    )
+
+
+async def _flow_record_response(
+    record: FlowRunRecord,
+    event_store: EventStore | None,
+    *,
+    recovery_attempt: ExecutionAttempt | None = None,
+) -> FlowResponse:
+    events = (
+        ()
+        if event_store is None
+        else await event_store.list(record.flow_run_id)
+    )
+    projected = (
+        project_flow_response(record.flow_run_id, events)
+        if events and is_execution_history(events, "flow")
+        else None
+    )
+    pending = (
+        PendingInputResponse.model_validate(record.pending_input)
+        if record.pending_input is not None
+        else None
+    )
+    return FlowResponse(
+        flow_run_id=record.flow_run_id,
+        plan_id=(projected.plan_id if projected is not None else None),
+        status=record.status,
+        event_count=len(events),
+        output=record.output,
+        error=record.error,
+        plan=(projected.plan if projected is not None else None),
+        child_runs=(projected.child_runs if projected is not None else ()),
+        artifacts=(projected.artifacts if projected is not None else ()),
+        pending_input=pending,
+        waiting_child_run_id=record.waiting_child_run_id,
+        recovery=_recovery_response(record, recovery_attempt),
     )
 
 

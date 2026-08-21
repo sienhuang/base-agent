@@ -15,18 +15,24 @@ _TERMINAL_EVENT_KINDS = frozenset(
         "flow.failed",
         "flow.cancelled",
         "flow.waiting",
+        "flow.blocked",
+        "flow.recovery_required",
         "run.succeeded",
         "run.failed",
         "run.cancelled",
         "run.waiting",
         "run.blocked",
         "run.interrupted",
+        "run.recovery_required",
     }
 )
 _PERMANENT_TERMINAL_EVENT_KINDS = _TERMINAL_EVENT_KINDS - {
     "flow.waiting",
+    "flow.blocked",
+    "flow.recovery_required",
     "run.waiting",
     "run.blocked",
+    "run.recovery_required",
 }
 
 
@@ -100,7 +106,15 @@ class InMemoryEventStore:
                 if event.kind in _PERMANENT_TERMINAL_EVENT_KINDS:
                     return
                 if (
-                    event.kind in {"flow.waiting", "run.waiting", "run.blocked"}
+                    event.kind
+                    in {
+                        "flow.waiting",
+                        "flow.blocked",
+                        "flow.recovery_required",
+                        "run.waiting",
+                        "run.blocked",
+                        "run.recovery_required",
+                    }
                     and index == len(events) - 1
                     and terminal
                 ):

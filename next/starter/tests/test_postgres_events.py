@@ -9,7 +9,12 @@ import httpx
 import pytest
 from base_agent.events.postgres import PostgresEventStore, PostgresRunStore
 from base_agent.models import RunStatus
-from base_agent.server.worker import ExecutionWorker, default_python_child_command
+from base_agent.server.worker import (
+    AgentExecutionHandler,
+    ExecutionWorker,
+    FlowExecutionHandler,
+    default_python_child_command,
+)
 from sqlalchemy.schema import DropSchema
 
 from agent_app import asgi
@@ -58,7 +63,14 @@ async def test_queued_fastapi_and_worker_execute_in_an_isolated_child(
     application = asgi.create_app(settings)
     worker = ExecutionWorker(
         application.state.execution_store,
-        child_command=default_python_child_command("agent_app.execution_child"),
+        handlers=(
+            AgentExecutionHandler(
+                default_python_child_command("agent_app.execution_child")
+            ),
+            FlowExecutionHandler(
+                default_python_child_command("agent_app.flow_execution_child")
+            ),
+        ),
         runtime_route=settings.runtime_route,
         runtime_build_id="starter-worker-test",
         lease_seconds=2,
@@ -90,10 +102,30 @@ async def test_queued_fastapi_and_worker_execute_in_an_isolated_child(
                 completed = await client.get(f"/v1/runs/{run_id}")
                 history = await client.get(f"/v1/runs/{run_id}/events")
 
+                started_flow = await client.post(
+                    "/v1/flows/plan-react",
+                    headers={"Idempotency-Key": "isolated-flow-child-1"},
+                    json={"prompt": "calculate 4 * 30"},
+                )
+                started_flow.raise_for_status()
+                flow_run_id = started_flow.json()["flow_run_id"]
+                assert started_flow.json()["status"] == "queued"
+                assert await worker.run_once() is True
+                completed_flow = await client.get(f"/v1/flows/{flow_run_id}")
+                flow_history = await client.get(
+                    f"/v1/flows/{flow_run_id}/events"
+                )
+
         completed.raise_for_status()
         history.raise_for_status()
         kinds = [event["kind"] for event in history.json()]
         assert completed.json()["status"] == "succeeded"
+        completed_flow.raise_for_status()
+        assert completed_flow.json()["status"] == "succeeded"
+        flow_history.raise_for_status()
+        flow_kinds = [event["kind"] for event in flow_history.json()]
+        assert flow_kinds.count("flow.succeeded") == 1
+        assert "execution.child.flow.succeeded" in flow_kinds
         assert kinds.count("run.succeeded") == 1
         assert "execution.child.succeeded" in kinds
         assert all(

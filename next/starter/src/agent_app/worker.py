@@ -1,13 +1,20 @@
-"""Independent PostgreSQL Worker entry point for queued Agent Runs."""
+"""Independent PostgreSQL Worker for queued Agent and Flow executions."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import signal
+from typing import cast
 
 from base_agent import AwaitHumanConfirmations, LocalArtifactStore
-from base_agent.server.worker import ExecutionWorker, default_python_child_command
+from base_agent.server.worker import (
+    AgentExecutionHandler,
+    ExecutionHandler,
+    ExecutionWorker,
+    FlowExecutionHandler,
+    default_python_child_command,
+)
 
 from agent_app.app import build_agent
 from agent_app.config import Settings
@@ -17,7 +24,7 @@ from agent_app.provider import build_provider
 
 async def run_worker(settings: Settings) -> None:
     if settings.execution_mode != "postgres-worker":
-        raise ValueError("agent-worker requires AGENT_EXECUTION_MODE=postgres-worker")
+        raise ValueError("execution-worker requires AGENT_EXECUTION_MODE=postgres-worker")
     runtime = build_event_store_runtime(settings)
     await runtime.start()
     agent = build_agent(
@@ -29,7 +36,20 @@ async def run_worker(settings: Settings) -> None:
     )
     worker = ExecutionWorker(
         runtime.executions,
-        child_command=default_python_child_command("agent_app.execution_child"),
+        handlers=(
+            cast(
+                ExecutionHandler,
+                AgentExecutionHandler(
+                    default_python_child_command("agent_app.execution_child")
+                ),
+            ),
+            cast(
+                ExecutionHandler,
+                FlowExecutionHandler(
+                    default_python_child_command("agent_app.flow_execution_child")
+                ),
+            ),
+        ),
         runtime_route=settings.runtime_route,
         runtime_build_id=settings.runtime_build_id or agent.snapshot.fingerprint,
         lease_seconds=settings.run_lease_seconds,
@@ -61,7 +81,7 @@ async def run_worker(settings: Settings) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the Starter Agent Worker.")
+    parser = argparse.ArgumentParser(description="Run the Starter Execution Worker.")
     parser.parse_args()
     asyncio.run(run_worker(Settings.from_env()))
 
