@@ -116,7 +116,7 @@ async def _execute_operation(agent: Agent, payload: ChildExecutionInput) -> RunR
                 stream=bool(request_payload.get("stream", False)),
                 run_id=payload.run.run_id,
                 invocation=RunInvocation(
-                    invocation_id=payload.attempt.attempt_id,
+                    invocation_id=f"run:{payload.run.run_id}",
                     attempt=payload.attempt.attempt_number,
                 ),
             )

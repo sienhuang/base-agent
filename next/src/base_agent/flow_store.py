@@ -141,6 +141,7 @@ class FlowCheckpoint(BaseModel):
     stage: str | None = None
     plan_revision: int | None = Field(default=None, ge=1)
     waiting_child_run_id: str | None = None
+    artifact_ids: tuple[str, ...] = ()
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -163,6 +164,10 @@ class FlowCheckpoint(BaseModel):
     def timestamps_are_ordered(self) -> FlowCheckpoint:
         if self.updated_at < self.created_at:
             raise ValueError("Flow checkpoint updated_at cannot precede created_at")
+        if any(not artifact_id.strip() for artifact_id in self.artifact_ids):
+            raise ValueError("Flow checkpoint artifact_ids must not contain blanks")
+        if len(set(self.artifact_ids)) != len(self.artifact_ids):
+            raise ValueError("Flow checkpoint artifact_ids must be unique")
         return self
 
 

@@ -30,12 +30,13 @@ class ToolContext:
     run_id: str
     agent_id: str
     tool_call_id: str
+    operation_id: str | None = None
     artifacts: ArtifactManager | None = None
     resources: ResourceManager | None = None
 
     @property
     def idempotency_key(self) -> str:
-        return f"{self.run_id}:{self.tool_call_id}"
+        return self.operation_id or f"{self.run_id}:{self.tool_call_id}"
 
 
 @runtime_checkable

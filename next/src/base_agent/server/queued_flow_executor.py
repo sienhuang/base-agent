@@ -14,6 +14,7 @@ from base_agent.execution import (
     ExecutionTargetKind,
     RecoveryDecision,
     RecoveryDecisionRecord,
+    RecoveryEvidenceSnapshot,
     RecoveryStrategy,
 )
 from base_agent.flow_store import (
@@ -139,6 +140,13 @@ class QueuedFlowExecutor:
     async def latest_attempt(self, flow_run_id: str) -> ExecutionAttempt | None:
         await self.get(flow_run_id)
         return await self.execution_store.latest_attempt(
+            flow_run_id,
+            target_kind=ExecutionTargetKind.FLOW_RUN,
+        )
+
+    async def recovery_evidence(self, flow_run_id: str) -> RecoveryEvidenceSnapshot:
+        await self.get(flow_run_id)
+        return await self.execution_store.recovery_evidence(
             flow_run_id,
             target_kind=ExecutionTargetKind.FLOW_RUN,
         )

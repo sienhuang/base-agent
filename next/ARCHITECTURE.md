@@ -325,6 +325,13 @@ ExecutionRequest、ExecutionAttempt 与 RecoveryDecision 分开。lease 归 Atte
 模型、fencing、graceful shutdown，以及后续生产强化阶段见
 [`EXECUTOR_DESIGN.md`](EXECUTOR_DESIGN.md)。
 
+该执行面还把恢复证据作为 fencing 保护的权威事实保存：`artifact.created` 产生 pending receipt，
+FlowCheckpoint 只把 Host 接受/选择且 metadata 再校验一致的 Artifact 标记为 verified；
+`tool.started/waiting/completed` 在 Event 事务内更新 side-effect evidence。Tool operation ID 跨
+Attempt 稳定，并由 intent SHA-256 防止同一幂等 key 被不同调用复用。恢复查询按策略投影允许集合
+和 blocker：read-only、intent 一致的 idempotent 操作可重放，未被目标 checkpoint 覆盖的
+mutating/unknown 操作拒绝重放。Operator 负责选择策略，Store 在入队前执行门禁。
+
 ### 已知限制 NEXT-RUN-001：滚动发布后旧 WAITING Run 无法直接恢复
 
 状态：已记录，暂不处理。

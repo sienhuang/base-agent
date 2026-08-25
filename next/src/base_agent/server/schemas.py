@@ -5,9 +5,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from base_agent.execution import RecoveryDecision, RecoveryStrategy
+from base_agent.execution import (
+    ArtifactReceiptStatus,
+    RecoveryDecision,
+    RecoveryStrategy,
+    SideEffectStatus,
+)
 from base_agent.flows import FlowStatus
-from base_agent.governance import ToolConfirmationDecision
+from base_agent.governance import SideEffect, ToolConfirmationDecision
 from base_agent.models import PendingInputKind, RunStatus
 
 
@@ -98,6 +103,57 @@ class RecoveryAttemptResponse(BaseModel):
     reason_code: str | None = None
 
 
+class ArtifactReceiptResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str
+    name: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    producer_run_id: str
+    producer_agent_id: str
+    stage: str | None = None
+    step_id: str | None = None
+    stage_attempt: int | None = None
+    tool_call_id: str | None = None
+    location: str | None = None
+    source_artifact_ids: tuple[str, ...] = ()
+    status: ArtifactReceiptStatus
+    checkpoint_revision: int | None = None
+    verification_detail: str | None = None
+
+
+class SideEffectEvidenceResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str
+    operation_id: str
+    idempotency_key: str
+    intent_sha256: str
+    tool_call_id: str
+    tool_name: str
+    side_effect: SideEffect
+    status: SideEffectStatus
+    result_status: str | None = None
+    stage: str | None = None
+    step_id: str | None = None
+    stage_attempt: int | None = None
+    turn: int | None = None
+    checkpoint_revision: int | None = None
+    resolved_by_attempt_id: str | None = None
+
+
+class RecoveryGateBlockerResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    detail: str
+    artifact_id: str | None = None
+    evidence_id: str | None = None
+    operation_id: str | None = None
+
+
 class RecoveryResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -105,6 +161,15 @@ class RecoveryResponse(BaseModel):
     revision: int
     detected_at: datetime
     last_attempt: RecoveryAttemptResponse | None = None
+    checkpoint_revision: int | None = None
+    checkpoint_stage: str | None = None
+    allowed_strategies: tuple[RecoveryStrategy, ...] = ()
+    artifact_receipts: tuple[ArtifactReceiptResponse, ...] = ()
+    side_effect_evidence: tuple[SideEffectEvidenceResponse, ...] = ()
+    strategy_blockers: dict[
+        RecoveryStrategy,
+        tuple[RecoveryGateBlockerResponse, ...],
+    ] = Field(default_factory=dict)
 
 
 class RecoveryDecisionRequest(BaseModel):

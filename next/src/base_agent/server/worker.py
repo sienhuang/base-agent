@@ -117,7 +117,12 @@ class FencedEventStore:
                 enriched,
                 turn=turn,
             )
-        await self.execution_store.assert_live(self.lease)
+        await self.execution_store.record_event_evidence(
+            self.lease,
+            kind,
+            enriched,
+            turn=turn,
+        )
         return await self.store.emit(run_id, persisted_kind, enriched, turn=turn)
 
     async def list(

@@ -16,6 +16,7 @@ class SideEffect(StrEnum):
     READ_ONLY = "read_only"
     IDEMPOTENT = "idempotent"
     MUTATING = "mutating"
+    UNKNOWN = "unknown"
 
 
 class Confirmation(StrEnum):

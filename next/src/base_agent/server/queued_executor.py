@@ -13,6 +13,7 @@ from base_agent.execution import (
     ExecutionStore,
     RecoveryDecision,
     RecoveryDecisionRecord,
+    RecoveryEvidenceSnapshot,
     RecoveryStrategy,
 )
 from base_agent.governance import ToolConfirmation
@@ -132,6 +133,10 @@ class QueuedRunExecutor:
     async def latest_attempt(self, run_id: str) -> ExecutionAttempt | None:
         self._validate_owner(await self.run_store.get(run_id))
         return await self.execution_store.latest_attempt(run_id)
+
+    async def recovery_evidence(self, run_id: str) -> RecoveryEvidenceSnapshot:
+        self._validate_owner(await self.run_store.get(run_id))
+        return await self.execution_store.recovery_evidence(run_id)
 
     async def decide_recovery(
         self,

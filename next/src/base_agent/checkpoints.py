@@ -34,6 +34,8 @@ class PendingInputCheckpoint(BaseModel):
     tool_name: str = Field(min_length=1)
     prompt: str = Field(min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    operation_id: str | None = Field(default=None, min_length=1, max_length=256)
+    operation_index: int | None = Field(default=None, ge=0)
 
     def public(self) -> PendingInput:
         return PendingInput(

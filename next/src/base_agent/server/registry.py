@@ -11,6 +11,7 @@ from base_agent.execution import (
     ExecutionStore,
     RecoveryDecision,
     RecoveryDecisionRecord,
+    RecoveryEvidenceSnapshot,
     RecoveryStrategy,
 )
 from base_agent.flow_store import FlowRunRecord, FlowRunStore
@@ -145,6 +146,12 @@ class InMemoryRunRegistry:
         if method is None:
             return None
         return cast(ExecutionAttempt | None, await method(run_id))
+
+    async def recovery_evidence(self, run_id: str) -> RecoveryEvidenceSnapshot | None:
+        method = getattr(self.executor, "recovery_evidence", None)
+        if method is None:
+            return None
+        return cast(RecoveryEvidenceSnapshot, await method(run_id))
 
     async def decide_recovery(
         self,
@@ -301,6 +308,14 @@ class InMemoryFlowRegistry:
         if self.queued_executor is None:
             return None
         return await self.queued_executor.latest_attempt(flow_run_id)
+
+    async def recovery_evidence(
+        self,
+        flow_run_id: str,
+    ) -> RecoveryEvidenceSnapshot | None:
+        if self.queued_executor is None:
+            return None
+        return await self.queued_executor.recovery_evidence(flow_run_id)
 
     async def decide_recovery(
         self,

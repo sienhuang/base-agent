@@ -399,6 +399,11 @@ producer `RunResult` 和 Store 中用于审计，但不会进入 `PlannerReActRe
 需要跨 Stage 或 Executor Run 读取 Artifact 时，相关 Agent 必须显式使用同一个 ArtifactStore；
 框架在第一次跨 Store 授权时会直接失败，避免产生看似有效但无法读取的引用。
 
+在 queued 执行面中，`artifact.created` 先形成带 Attempt fencing 的 pending receipt；Flow 保存
+checkpoint 时由 Host 重新校验不可变 metadata，只有被 Sequential 接受或被 Planner-ReAct 选择的
+Artifact 才转为 verified receipt。恢复策略只能引用不晚于目标 checkpoint 验证的 receipt，旧
+Attempt 不能补写或篡改证据。
+
 Tool observation 预算由 `AgentDefinition.max_tool_observation_bytes` 和
 `max_run_observation_bytes` 控制，默认分别为 16 KiB 和 64 KiB。应用可以针对大型 metadata
 Tool 提高预算；这两个值会进入 HarnessSnapshot/fingerprint。单次超限内容仍会被截断，整 Run
@@ -478,6 +483,10 @@ data: {"sequence":8,"kind":"run.succeeded","run_id":"...","turn":1,"payload":{..
 状态，并共享 ExecutionRequest、ExecutionAttempt、lease、fencing 与 recovery decision。重启或
 请求落到另一 API Pod 时，状态直接读取 control store，历史和 SSE 从 EventStore 回放。Worker
 失联只进入 `RECOVERY_REQUIRED`，不会自动重放；`WAITING` 由持久 checkpoint 跨进程继续。
+恢复投影同时返回 verified Artifact receipts、Tool side-effect evidence、当前
+`allowed_strategies` 和逐策略 blockers。read-only 与稳定 intent 的 idempotent 操作可重放；未被
+目标 checkpoint 覆盖的 mutating/unknown 操作 fail closed。Operator 仍选择策略，框架只拒绝证据
+不足的提交。
 
 Planner-ReAct 使用与普通 Agent 相同的 `message.created` 表示原始用户消息，并在成功时发送
 `message.completed`（payload 含最终 `content`），随后发送 `flow.succeeded` 关闭 SSE。启用
@@ -496,7 +505,8 @@ Skill Package 的目录、Tool 贡献、Script 执行边界和 snapshot 契约�
 API/Executor 分离、Supervisor/Child 隔离、ExecutionAttempt 状态细分、周期性 lease
 reconcile 和人工恢复接口见 [`EXECUTOR_DESIGN.md`](EXECUTOR_DESIGN.md)。同一个
 `ExecutionWorker` 已可按 `target_kind` 分派 Agent/Flow Handler；二者共享 PostgreSQL 执行面，
-默认仍使用兼容的本地执行模式。副作用证据、并发/背压和 checkpoint migration 仍按后续阶段推进。
+默认仍使用兼容的本地执行模式。Artifact receipt、side-effect evidence 与细粒度恢复门禁已经
+落地；并发/背压和 checkpoint migration 仍按后续阶段推进。
 
 当前 Provider 契约、OpenAI-compatible Adapter、错误分类和验收命令见
 [`PROVIDERS.md`](PROVIDERS.md)。
@@ -525,6 +535,8 @@ reconcile 和人工恢复接口见 [`EXECUTOR_DESIGN.md`](EXECUTOR_DESIGN.md)。
   `LocalRunExecutor`；过期 `RUNNING` 转为 `BLOCKED`，不自动重放；
 - 内存/PostgreSQL `FlowRunStore/FlowCheckpoint`，以及 Agent/Flow 共用的 queued
   `ExecutionWorker`、Attempt lease、fencing 和 Operator recovery；
+- queued 执行面的 verified Artifact receipt、side-effect evidence、稳定 Tool operation identity
+  与逐策略恢复门禁；
 - 默认内存 `EventStore`、可替换持久历史和可选 `EventStream` 契约；
 - 可选 `base_agent.server` FastAPI Run 提交、状态查询与取消；
 - 有序只读 Event；

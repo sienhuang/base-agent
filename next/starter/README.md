@@ -239,7 +239,8 @@ AGENT_RUNTIME_BUILD_ID=release-2026-08-20
 schema 中创建 `base_agent_event_sequences`、`base_agent_events`、
 `base_agent_checkpoints`、`base_agent_runs`、`base_agent_flow_runs`、
 `base_agent_flow_checkpoints`、`base_agent_execution_requests`、
-`base_agent_execution_attempts` 和 `base_agent_recovery_decisions`，关闭时释放 Starter 自己创建的
+`base_agent_execution_attempts`、`base_agent_recovery_decisions`、
+`base_agent_artifact_receipts` 和 `base_agent_side_effect_evidence`，关闭时释放 Starter 自己创建的
 连接池。DSN、schema
 和轮询间隔由 Starter 读取；EventStore 注入普通 Agent、Planner、Executor 和 Flow，共享同一
 Engine 的 CheckpointStore 注入所有 Agent；RunStore/FlowRunStore 分别作为顶层 Agent/Flow 的
@@ -283,6 +284,11 @@ uv run --project next/starter --extra postgres execution-worker
 child 内同步阻塞的 Tool 不会阻塞 heartbeat。child Event 会携带 `execution_attempt_id`，
 PostgreSQL EventStore 在同一事务校验 fencing token 后才接受 Event。
 
+同一事务还会把 `artifact.created` 投影为 receipt，并把 `tool.started/waiting/completed` 投影为
+side-effect evidence。Tool operation ID/idempotency key 跨 Attempt 稳定，intent hash 防止同一
+operation 被不同参数复用；旧 fencing token 不能写 Event、receipt 或 evidence。FlowCheckpoint
+只验证 Host 已接受或选择且 metadata 一致的 Artifact。
+
 调用方重试 Agent 或 Flow 提交时应复用 `Idempotency-Key` 请求头；相同 key 和相同输入返回同一个
 逻辑任务，相同 key 但不同输入返回 `409`。
 
@@ -303,13 +309,20 @@ curl http://127.0.0.1:8000/v1/operator/runs/RUN_ID/recovery-decisions \
     "subject_id":"operator-001",
     "reason_code":"verified_safe",
     "idempotency_key":"ticket-123-retry-1"
-  }'
+}'
 ```
+
+`GET` 响应的 `recovery` 会显示 `allowed_strategies`、`artifact_receipts`、
+`side_effect_evidence` 和 `strategy_blockers`。read-only 或 intent 一致的 idempotent 操作可以重放；
+未被目标 checkpoint 覆盖的 mutating/unknown 操作会从允许集合中移除。即使 Operator 提交该策略，
+Store 也会在创建新 ExecutionRequest 前返回 `409`，所以 `reason_code` 不能绕过门禁。
 
 `resume`/`confirm` 仍只用于 `waiting`，不能替代 Operator recovery decision。第一版独立 Worker
 已经覆盖顶层 Agent Run 和 `plan-react` Flow：Flow 在 Plan/Step 安全边界写入 FlowCheckpoint，
 WAITING 时同时保存父 Flow cursor 与等待中的 child Run ID。Operator 可通过
 `/v1/operator/flows/{flow_run_id}/recovery-decisions` 选择 `from_checkpoint` 或 `restart`。
+`from_checkpoint` 只能复用该 checkpoint 已验证的 Artifact，并可跳过其覆盖的副作用；`restart`
+检查整个 Flow 的证据，不会绕过较早的未知副作用。
 Starter 的 `LocalArtifactStore` 仍要求 API、Worker child 能看到同一路径；多节点生产部署应换成
 共享 ArtifactStore。
 

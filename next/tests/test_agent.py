@@ -9,6 +9,7 @@ from base_agent import (
     Agent,
     AgentDefinition,
     RunStatus,
+    SideEffect,
     Skill,
     SkillCatalog,
     ToolChoice,
@@ -49,6 +50,45 @@ async def test_tool_context_is_hidden_from_schema_and_injected_at_runtime() -> N
     context = ToolContext(run_id="run-1", agent_id="agent-1", tool_call_id="call-1")
     assert await context_tool.invoke({"value": 7}, context) == 7
     assert seen == [context]
+
+
+async def test_tool_events_and_context_share_stable_operation_identity() -> None:
+    idempotency_keys: list[str] = []
+
+    @tool(side_effect=SideEffect.IDEMPOTENT)
+    async def persist(value: int, context: ToolContext) -> int:
+        idempotency_keys.append(context.idempotency_key)
+        return value
+
+    agent = Agent(
+        AgentDefinition(
+            id="operation-identity",
+            version="1.0.0",
+            instructions="Persist once.",
+            tools=("persist",),
+            max_model_turns=2,
+        ),
+        model=FakeModel(
+            [
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(id="provider-call", name="persist", arguments={"value": 7}),
+                    )
+                ),
+                ModelResponse(content="done"),
+            ]
+        ),
+        tools=(persist,),
+    )
+
+    result = await agent.start("work", run_id="stable-run").wait()
+    started = next(event for event in result.events if event.kind == "tool.started")
+    completed = next(event for event in result.events if event.kind == "tool.completed")
+
+    assert started.payload["operation_id"] == completed.payload["operation_id"]
+    assert started.payload["idempotency_key"] == idempotency_keys[0]
+    assert started.payload["operation_id"].startswith("op:")
+    assert len(started.payload["intent_sha256"]) == 64
 
 
 def test_toolkit_rejects_blank_name_and_duplicate_tools() -> None:

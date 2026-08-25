@@ -13,9 +13,12 @@ from base_agent.execution import (
     ExecutionAttemptStatus,
     ExecutionLeaseLostError,
     ExecutionOperation,
+    ExecutionRequestConflictError,
     InMemoryExecutionStore,
     RecoveryDecision,
+    RecoveryGateBlockedError,
     RecoveryStrategy,
+    SideEffectStatus,
 )
 from base_agent.models import RunStatus
 from base_agent.run_store import AgentRunRecord, InMemoryRunStore
@@ -42,6 +45,22 @@ def _record(run_id: str = "run-1") -> AgentRunRecord:
         snapshot_fingerprint="snapshot",
         runtime_build_id="build-1",
     )
+
+
+def _tool_evidence_payload(
+    *,
+    operation_id: str,
+    side_effect: str,
+    intent_sha256: str = "a" * 64,
+) -> dict[str, object]:
+    return {
+        "tool_name": "external_operation",
+        "tool_call_id": "call-1",
+        "side_effect": side_effect,
+        "operation_id": operation_id,
+        "idempotency_key": operation_id,
+        "intent_sha256": intent_sha256,
+    }
 
 
 async def test_attempt_lease_expiry_requires_an_explicit_recovery_decision() -> None:
@@ -124,6 +143,201 @@ async def test_expired_attempt_cannot_be_marked_started() -> None:
         await executions.mark_started(claimed.lease, child_pid=123)
 
 
+async def test_uncheckpointed_mutating_evidence_blocks_recovery_replay() -> None:
+    events = InMemoryEventStore()
+    runs = InMemoryRunStore()
+    executions = InMemoryExecutionStore(runs, event_store=events)
+    await executions.enqueue_run(
+        _record(),
+        operation=ExecutionOperation.EXECUTE,
+        payload={"prompt": "work"},
+        idempotency_key="submit-mutating",
+    )
+    claimed = await executions.claim_next(
+        owner_id="worker-1",
+        runtime_route="default",
+        runtime_build_id="build-1",
+        lease_seconds=30,
+    )
+    assert claimed is not None
+    child_events = FencedEventStore(events, executions, claimed.lease)
+    await child_events.emit(
+        "run-1",
+        "tool.started",
+        _tool_evidence_payload(
+            operation_id="op:mutating",
+            side_effect="mutating",
+        ),
+    )
+
+    recovery = await executions.interrupt(
+        claimed.lease,
+        reason_code="worker_shutdown",
+    )
+    evidence = await executions.recovery_evidence("run-1")
+
+    assert evidence.side_effect_evidence[0].status is SideEffectStatus.UNKNOWN
+    assert [
+        blocker.code
+        for blocker in evidence.blockers_for(RecoveryStrategy.RESTART)
+    ] == ["unsafe_side_effect_replay"]
+    assert evidence.blockers_for(RecoveryStrategy.RESTART)[0].operation_id == (
+        "op:mutating"
+    )
+    with pytest.raises(RecoveryGateBlockedError, match="unsafe_side_effect_replay"):
+        await executions.decide_recovery(
+            "run-1",
+            decision=RecoveryDecision.RETRY,
+            strategy=RecoveryStrategy.RESTART,
+            subject_id="operator-1",
+            reason_code="retry_requested",
+            expected_revision=recovery.revision,
+            idempotency_key="ticket-mutating",
+        )
+    with pytest.raises(ExecutionLeaseLostError):
+        await child_events.emit(
+            "run-1",
+            "artifact.created",
+            {
+                "artifact_id": "late-artifact",
+                "name": "late.txt",
+                "media_type": "text/plain",
+                "size_bytes": 4,
+                "sha256": "b" * 64,
+                "producer_run_id": "run-1",
+                "producer_agent_id": "queued-agent",
+            },
+        )
+
+
+async def test_idempotent_evidence_allows_retry_but_changed_intent_is_rejected() -> None:
+    events = InMemoryEventStore()
+    runs = InMemoryRunStore()
+    executions = InMemoryExecutionStore(runs, event_store=events)
+    await executions.enqueue_run(
+        _record(),
+        operation=ExecutionOperation.EXECUTE,
+        payload={"prompt": "work"},
+        idempotency_key="submit-idempotent",
+    )
+    first = await executions.claim_next(
+        owner_id="worker-1",
+        runtime_route="default",
+        runtime_build_id="build-1",
+        lease_seconds=30,
+    )
+    assert first is not None
+    first_events = FencedEventStore(events, executions, first.lease)
+    payload = _tool_evidence_payload(
+        operation_id="op:idempotent",
+        side_effect="idempotent",
+    )
+    await first_events.emit("run-1", "tool.started", payload)
+    recovery = await executions.interrupt(first.lease, reason_code="worker_shutdown")
+
+    retried, _ = await executions.decide_recovery(
+        "run-1",
+        decision=RecoveryDecision.RETRY,
+        strategy=RecoveryStrategy.RESTART,
+        subject_id="operator-1",
+        reason_code="stable_idempotency_key",
+        expected_revision=recovery.revision,
+        idempotency_key="ticket-idempotent",
+    )
+    assert retried.status is RunStatus.QUEUED
+    second = await executions.claim_next(
+        owner_id="worker-2",
+        runtime_route="default",
+        runtime_build_id="build-1",
+        lease_seconds=30,
+    )
+    assert second is not None
+    second_events = FencedEventStore(events, executions, second.lease)
+    await second_events.emit("run-1", "tool.started", payload)
+    with pytest.raises(ExecutionRequestConflictError, match="changed intent"):
+        await second_events.emit(
+            "run-1",
+            "tool.started",
+            _tool_evidence_payload(
+                operation_id="op:idempotent",
+                side_effect="idempotent",
+                intent_sha256="c" * 64,
+            ),
+        )
+
+
+async def test_checkpointed_waiting_operation_can_complete_under_continuation_attempt() -> None:
+    events = InMemoryEventStore()
+    runs = InMemoryRunStore()
+    executions = InMemoryExecutionStore(runs, event_store=events)
+    await executions.enqueue_run(
+        _record(),
+        operation=ExecutionOperation.EXECUTE,
+        payload={"prompt": "work"},
+        idempotency_key="submit-waiting-operation",
+    )
+    first = await executions.claim_next(
+        owner_id="worker-1",
+        runtime_route="default",
+        runtime_build_id="build-1",
+        lease_seconds=30,
+    )
+    assert first is not None
+    first_events = FencedEventStore(events, executions, first.lease)
+    started = _tool_evidence_payload(
+        operation_id="op:waiting",
+        side_effect="mutating",
+    )
+    await first_events.emit("run-1", "tool.started", started)
+    await first_events.emit(
+        "run-1",
+        "tool.waiting",
+        {**started, "request_id": "input-1"},
+    )
+    await first_events.emit(
+        "run-1",
+        "run.waiting",
+        {"checkpoint_revision": 1},
+    )
+    await executions.settle(
+        first.lease,
+        status=RunStatus.WAITING,
+        pending_input={
+            "request_id": "input-1",
+            "kind": "tool_input",
+            "tool_call_id": "call-1",
+            "tool_name": "external_operation",
+            "prompt": "Continue?",
+            "metadata": {},
+        },
+        checkpoint_revision=1,
+    )
+    await executions.enqueue_continuation(
+        "run-1",
+        operation=ExecutionOperation.RESUME,
+        payload={"input": "yes"},
+        idempotency_key="resume-waiting-operation",
+    )
+    second = await executions.claim_next(
+        owner_id="worker-2",
+        runtime_route="default",
+        runtime_build_id="build-1",
+        lease_seconds=30,
+    )
+    assert second is not None
+    second_events = FencedEventStore(events, executions, second.lease)
+    await second_events.emit(
+        "run-1",
+        "tool.completed",
+        {"operation_id": "op:waiting", "status": "success"},
+    )
+
+    evidence = await executions.recovery_evidence("run-1")
+    assert evidence.side_effect_evidence[0].status is SideEffectStatus.SUCCEEDED
+    assert evidence.side_effect_evidence[0].checkpoint_revision == 1
+    assert evidence.side_effect_evidence[0].resolved_by_attempt_id == second.attempt.attempt_id
+
+
 async def test_existing_run_get_includes_recovery_projection_and_decision_post() -> None:
     clock = MutableClock()
     events = InMemoryEventStore()
@@ -183,6 +397,65 @@ async def test_existing_run_get_includes_recovery_projection_and_decision_post()
         assert decided.status_code == 200
         assert decided.json()["status"] == "queued"
         assert "recovery" not in decided.json()
+
+
+async def test_recovery_projection_exposes_evidence_and_strategy_blockers() -> None:
+    events = InMemoryEventStore()
+    runs = InMemoryRunStore()
+    executions = InMemoryExecutionStore(runs, event_store=events)
+    agent = Agent(
+        AgentDefinition(
+            id="queued-agent",
+            version="1.0.0",
+            instructions="Answer.",
+        ),
+        model=FakeModel.text("unused"),
+        event_store=events,
+    )
+    app = create_http_app(
+        agent,
+        event_store=events,
+        run_store=runs,
+        execution_store=executions,
+        execution_mode="queued",
+        runtime_build_id="build-1",
+        operator_authorizer=lambda request, subject_id: None,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        started = await client.post("/v1/runs", json={"prompt": "work"})
+        run_id = started.json()["run_id"]
+        claimed = await executions.claim_next(
+            owner_id="worker-1",
+            runtime_route="default",
+            runtime_build_id="build-1",
+            lease_seconds=30,
+        )
+        assert claimed is not None
+        fenced = FencedEventStore(events, executions, claimed.lease)
+        await fenced.emit(
+            run_id,
+            "tool.started",
+            _tool_evidence_payload(
+                operation_id="op:http-mutating",
+                side_effect="mutating",
+            ),
+        )
+        await executions.interrupt(claimed.lease, reason_code="worker_shutdown")
+
+        response = await client.get(f"/v1/runs/{run_id}")
+        recovery = response.json()["recovery"]
+
+        assert recovery["side_effect_evidence"][0]["status"] == "unknown"
+        assert recovery["strategy_blockers"]["restart"][0]["code"] == (
+            "unsafe_side_effect_replay"
+        )
+        assert recovery["strategy_blockers"]["restart"][0]["operation_id"] == (
+            "op:http-mutating"
+        )
+        assert "restart" not in recovery["allowed_strategies"]
 
 
 async def test_queued_submission_uses_the_http_idempotency_key() -> None:

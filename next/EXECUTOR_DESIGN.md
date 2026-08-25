@@ -1,10 +1,11 @@
 # 独立 Executor、ExecutionAttempt 与人工恢复设计
 
-实现状态（2026-08-21）：Phase A、Phase B 与 Phase C 第一版已落地。Agent/Flow 共用
+实现状态（2026-08-24）：Phase A、Phase B 与 Phase C 已落地。Agent/Flow 共用
 ExecutionRequest、ExecutionAttempt、lease、fencing 与 recovery decision；同一个
 `ExecutionWorker` 按 `target_kind` 分派 Agent/Flow Handler，不再建设独立 flow-worker 基础设施。
-共享 Artifact receipt、side-effect evidence、bounded concurrency 和 checkpoint migration 仍属于
-后续阶段。默认执行模式继续是本地模式。
+共享 Artifact receipt、side-effect evidence 和细粒度恢复门禁已经进入内存/PostgreSQL 执行面；
+bounded concurrency、backpressure 和 checkpoint migration 仍属于后续阶段。默认执行模式继续是
+本地模式。
 
 ## 1. 目标与明确决策
 
@@ -52,7 +53,8 @@ PostgreSQL
   ├── execution attempts + lease/fencing token
   ├── checkpoints
   ├── recovery decisions
-  └── events/artifact metadata
+  ├── events/artifact metadata
+  └── verified artifact receipts + side-effect evidence
           ▲
           │ claim / heartbeat / fenced settlement
 Executor Supervisor
@@ -441,8 +443,18 @@ GET /v1/flows/{flow_run_id}
   },
   "checkpoint": null,
   "completed_stages": [],
-  "artifacts": [],
-  "side_effect_evidence": []
+  "allowed_strategies": [],
+  "artifact_receipts": [],
+  "side_effect_evidence": [],
+  "strategy_blockers": {
+    "restart": [
+      {
+        "code": "unsafe_side_effect_replay",
+        "operation_id": "...",
+        "detail": "mutating operation has no checkpointed completion evidence"
+      }
+    ]
+  }
 }
 ```
 
@@ -451,7 +463,8 @@ Checkpoint、Artifact metadata 和副作用证据 Store 聚合当前快照；Eve
 历史。heartbeat 不写成高频 Event，因此仅靠 Event 不能得到精确的当前 lease 快照。
 
 普通调用者只能看到其已有权限范围内的有限恢复摘要。Attempt owner、运行版本和副作用证据等
-运维字段需要 Operator 权限才返回。响应不包含框架自动生成的“应该 retry”结论。
+运维字段需要 Operator 权限才返回。`allowed_strategies` 只是依据当前持久证据计算出的可提交集合，
+`strategy_blockers` 解释 fail-closed 原因；二者都不是框架自动生成的“应该 retry”结论。
 
 ### 8.2 提交恢复决定
 
@@ -483,7 +496,8 @@ POST /v1/operator/flows/{flow_run_id}/recovery-decisions
 - Sequential Flow：`from_stage`、`from_checkpoint` 或 `restart`；
 - Planner-ReAct Flow：必须依赖持久 Plan revision、Step 状态和 child 关联后再支持。
 
-框架必须验证请求的 checkpoint/Stage/Definition 是否存在并匹配，但不替 Operator 选择策略。
+框架必须验证请求的 checkpoint/Stage/Definition 是否存在并匹配，并在创建新 request 前验证该
+策略对应的 Artifact receipt 与 side-effect evidence 门禁，但不替 Operator 选择策略。
 由 Flow 拥有的 child Run 不能单独恢复；必须通过父 Flow recovery 接口，避免破坏 Plan/Stage
 一致性。
 
@@ -538,15 +552,34 @@ analysis Attempt 中断
 Sequential checkpoint 保存 Stage index/result/handoff/Artifact。`from_stage` 只适用于有明确 Stage
 边界的 Sequential Flow；Planner-ReAct 使用 `from_checkpoint` 或 `restart`。
 
+FlowCheckpoint 会同时固定其接受或选择的 Artifact ID。保存 checkpoint 时，Host 从 ArtifactStore
+重新读取不可变 metadata，并校验 receipt 中的 ID、SHA-256、size、producer、Flow/Stage/Step、
+attempt 和 ToolCall；只有校验一致的 receipt 才转为 `verified`。恢复策略引用的 Artifact 必须已经
+在不晚于该 checkpoint 的 revision 被验证，不能把 `artifact.created` 本身当作可恢复边界。
+
 ## 11. 取消、超时和副作用
 
 - `/cancel` 只设置持久 `cancel_requested`；当前 Supervisor 观察后停止 Child；
 - 用户取消产生逻辑 `CANCELLED`，Worker shutdown 不产生该状态；
 - Tool timeout、Run deadline 和 progress deadline 与 lease 独立；
 - READ_ONLY 或下游幂等能力只是提供给 Operator 的证据，不触发自动 retry；
-- ToolCall 使用稳定 operation ID/idempotency key；
+- ToolCall 使用跨 Attempt 稳定的 operation ID/idempotency key，并固定规范化 Tool name/arguments 的
+  intent SHA-256；同一 operation ID 出现不同 intent 时立即拒绝；
 - `started` 后未确认结果的非幂等副作用必须保留不确定状态；
 - recovery context 只暴露 metadata 和摘要，不复制 Prompt、Tool 参数、密钥或大型结果。
+
+每个 `tool.started`、`tool.waiting` 和 `tool.completed` Event 都在接受 Event 的同一 fencing 事务中
+更新 side-effect evidence。Attempt 中断、lease 过期或异常失败时，未结算的 `started/waiting`
+证据转为 `unknown`。门禁按恢复边界处理：
+
+- `read_only` 可以重放；
+- `idempotent` 只有稳定 operation ID 与 intent 一致时可以重放；
+- `mutating` 或 `unknown` 在 checkpoint 之外会阻止重放；
+- `from_checkpoint` / `from_stage` 可以跳过该 checkpoint 已覆盖的完成或等待操作；
+- `restart` 检查整次逻辑执行的全部证据，因此不会绕过较早的未确认副作用。
+
+如果 WAITING Tool 已写入 checkpoint，新 Attempt 可以使用相同 operation ID 继续并结算该操作；证据
+保留原始 owner attempt/fencing token，并另记 resolution attempt/fencing token，避免伪造历史所有权。
 
 ## 12. 本地模式与分布式模式
 
@@ -603,16 +636,15 @@ execution-worker → claim → target_kind Handler → RUNNING
 4. [x] Planner-ReAct Plan revision/Step/child 位置持久化；
 5. [x] `/v1/operator/flows/.../recovery-decisions`；
 6. [x] 通用 ExecutionWorker 按 target_kind 分派 Handler；
-7. [ ] 对已验证 Artifact receipt 与副作用证据做更细粒度恢复门禁。
+7. [x] 对已验证 Artifact receipt 与副作用证据做更细粒度恢复门禁。
 
 ### Phase D：生产强化
 
-1. side-effect evidence 与稳定 idempotency key；
-2. bounded concurrency、backpressure 和配额；
-3. drain deadline、Tool/Run/progress timeout；
-4. metrics/tracing/告警；
-5. 可选外部 broker Adapter；
-6. checkpoint migration 与旧 Runtime 保留策略。
+1. bounded concurrency、backpressure 和配额；
+2. drain deadline、Tool/Run/progress timeout；
+3. metrics/tracing/告警；
+4. 可选外部 broker Adapter；
+5. checkpoint migration 与旧 Runtime 保留策略。
 
 ## 14. 验收场景
 
@@ -630,7 +662,11 @@ execution-worker → claim → target_kind Handler → RUNNING
 9. 同一个 Run 经 Attempt-1 失联、Attempt-2 成功后只产生一个逻辑成功终态；
 10. WAITING 仍通过 resume/confirm，不能调用 recovery decision 绕过 request ID；
 11. Flow 只从已持久、已验证的 Stage/Artifact 边界恢复；
-12. 没有兼容 Runtime 或 snapshot 时进入 `BLOCKED`，不静默使用新版本。
+12. checkpoint 引用的 Artifact metadata 不一致或 receipt 未验证时拒绝恢复；
+13. 未被 checkpoint 覆盖的 mutating/unknown 操作阻止重放，read-only 和 intent 一致的 idempotent
+    操作允许重放；
+14. WAITING 操作可由新 Attempt 结算，但旧 fencing token 仍不能写 Event 或证据；
+15. 没有兼容 Runtime 或 snapshot 时进入 `BLOCKED`，不静默使用新版本。
 
 ## 15. 非目标
 

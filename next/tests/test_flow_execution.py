@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import httpx
@@ -9,6 +10,7 @@ import pytest
 from base_agent import (
     Agent,
     AgentDefinition,
+    Artifact,
     Flow,
     FlowCheckpoint,
     FlowCheckpointNotFoundError,
@@ -20,6 +22,7 @@ from base_agent import (
 )
 from base_agent.events import InMemoryEventStore
 from base_agent.execution import (
+    ArtifactReceiptStatus,
     ExecutionOperation,
     ExecutionRequestConflictError,
     ExecutionTargetKind,
@@ -28,6 +31,7 @@ from base_agent.execution import (
     RecoveryStrategy,
 )
 from base_agent.flows import SequentialFlow
+from base_agent.flows.checkpoints import strict_json_value
 from base_agent.models import RunStatus
 from base_agent.run_store import AgentRunRecord, InMemoryRunStore
 from base_agent.server import (
@@ -170,6 +174,145 @@ async def test_flow_checkpoint_is_fenced_by_the_shared_execution_attempt() -> No
         pass
     else:
         raise AssertionError("Flow restart retained a stale checkpoint")
+
+
+async def test_verified_artifact_and_checkpointed_side_effect_gate_flow_recovery() -> None:
+    runs = InMemoryRunStore()
+    flows = InMemoryFlowRunStore()
+    events = InMemoryEventStore()
+    executions = InMemoryExecutionStore(
+        runs,
+        flow_store=flows,
+        event_store=events,
+    )
+    flow = _flow()
+    await executions.enqueue_flow(
+        _flow_record(flow),
+        operation=ExecutionOperation.EXECUTE,
+        payload={"prompt": "work"},
+        idempotency_key="flow-artifact-submit",
+    )
+    claimed = await executions.claim_next(
+        owner_id="worker-1",
+        runtime_route="default",
+        runtime_build_id="build-1",
+        lease_seconds=30,
+        target_kinds=(ExecutionTargetKind.FLOW_RUN,),
+    )
+    assert claimed is not None
+    fenced = FencedEventStore(events, executions, claimed.lease)
+    artifact = Artifact(
+        id="artifact-1",
+        name="dataset",
+        media_type="text/csv",
+        size_bytes=8,
+        sha256="a" * 64,
+        created_at=datetime(2026, 8, 21, tzinfo=UTC),
+        run_id="child-query",
+        agent_id="query-agent",
+        flow_run_id="flow-1",
+        invocation_id="flow-1:work:1",
+        stage="work",
+        attempt=1,
+        tool_call_id="write-1",
+        location="runs/flow-1/dataset.csv",
+    )
+    await fenced.emit(
+        "flow-1",
+        "artifact.created",
+        {
+            "artifact_id": artifact.id,
+            "name": artifact.name,
+            "media_type": artifact.media_type,
+            "size_bytes": artifact.size_bytes,
+            "sha256": artifact.sha256,
+            "producer_run_id": artifact.run_id,
+            "producer_agent_id": artifact.agent_id,
+            "flow_run_id": artifact.flow_run_id,
+            "invocation_id": artifact.invocation_id,
+            "stage": artifact.stage,
+            "attempt": artifact.attempt,
+            "tool_call_id": artifact.tool_call_id,
+            "location": artifact.location,
+            "source_artifact_ids": [],
+        },
+    )
+    side_effect = {
+        "tool_name": "publish_dataset",
+        "tool_call_id": "publish-1",
+        "side_effect": "mutating",
+        "operation_id": "op:publish",
+        "idempotency_key": "op:publish",
+        "intent_sha256": "b" * 64,
+        "stage": "work",
+        "attempt": 1,
+    }
+    await fenced.emit("flow-1", "tool.started", side_effect)
+    await fenced.emit(
+        "flow-1",
+        "tool.completed",
+        {**side_effect, "status": "success"},
+    )
+    checkpoint = FlowCheckpoint(
+        flow_run_id="flow-1",
+        flow_id=flow.id,
+        flow_kind=FlowKind.SEQUENTIAL,
+        definition_fingerprint=flow.definition_fingerprint,
+        revision=1,
+        cursor={
+            "prompt": "work",
+            "next_stage_index": 0,
+            "accepted_artifacts": [strict_json_value(artifact)],
+        },
+        stage="work",
+        artifact_ids=(artifact.id,),
+        created_at=datetime(2026, 8, 21, tzinfo=UTC),
+        updated_at=datetime(2026, 8, 21, tzinfo=UTC),
+    )
+    bad_checkpoint = checkpoint.model_copy(
+        update={
+            "cursor": {
+                **checkpoint.cursor,
+                "accepted_artifacts": [
+                    strict_json_value(replace(artifact, sha256="c" * 64))
+                ],
+            }
+        }
+    )
+    with pytest.raises(
+        ExecutionRequestConflictError,
+        match="changed immutable metadata",
+    ):
+        await executions.save_flow_checkpoint(claimed.lease, bad_checkpoint)
+    await executions.save_flow_checkpoint(claimed.lease, checkpoint)
+    recovery = await executions.interrupt(
+        claimed.lease,
+        reason_code="worker_shutdown",
+    )
+    evidence = await executions.recovery_evidence(
+        "flow-1",
+        target_kind=ExecutionTargetKind.FLOW_RUN,
+    )
+
+    assert evidence.artifact_receipts[0].status is ArtifactReceiptStatus.VERIFIED
+    assert evidence.artifact_receipts[0].checkpoint_revision == 1
+    assert evidence.side_effect_evidence[0].checkpoint_revision == 1
+    assert evidence.blockers_for(RecoveryStrategy.FROM_STAGE) == ()
+    assert [
+        blocker.code for blocker in evidence.blockers_for(RecoveryStrategy.RESTART)
+    ] == ["unsafe_side_effect_replay"]
+
+    retried, _ = await executions.decide_recovery(
+        "flow-1",
+        target_kind=ExecutionTargetKind.FLOW_RUN,
+        decision=RecoveryDecision.RETRY,
+        strategy=RecoveryStrategy.FROM_STAGE,
+        subject_id="operator-1",
+        reason_code="artifacts_verified",
+        expected_revision=recovery.revision,
+        idempotency_key="flow-artifact-retry",
+    )
+    assert retried.status is FlowStatus.QUEUED
 
 
 async def test_one_execution_worker_dispatches_agent_and_flow_requests() -> None:

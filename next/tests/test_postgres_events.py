@@ -47,6 +47,8 @@ def test_postgres_event_schema_and_configuration_are_validated() -> None:
     assert tables.execution_requests.name == "base_agent_execution_requests"
     assert tables.execution_attempts.name == "base_agent_execution_attempts"
     assert tables.recovery_decisions.name == "base_agent_recovery_decisions"
+    assert tables.artifact_receipts.name == "base_agent_artifact_receipts"
+    assert tables.side_effect_evidence.name == "base_agent_side_effect_evidence"
     assert {column.name for column in tables.events.primary_key} == {
         "run_id",
         "sequence",
@@ -176,6 +178,85 @@ async def test_postgres_execution_store_fences_claims_and_requires_recovery() ->
             idempotency_key="ticket-postgres-1",
         )
         assert retried.status is RunStatus.QUEUED
+    finally:
+        async with events.engine.begin() as connection:
+            await connection.execute(DropSchema(schema, cascade=True, if_exists=True))
+        await events.close()
+
+
+@requires_postgres
+async def test_postgres_persists_side_effect_evidence_and_blocks_unsafe_replay() -> None:
+    from base_agent.execution import (
+        ExecutionOperation,
+        RecoveryDecision,
+        RecoveryGateBlockedError,
+        RecoveryStrategy,
+        SideEffectStatus,
+    )
+    from base_agent.server import FencedEventStore
+
+    assert POSTGRES_DSN is not None
+    schema = f"base_agent_next_{uuid4().hex}"
+    events = PostgresEventStore.from_url(POSTGRES_DSN, schema=schema)
+    executions = PostgresExecutionStore.from_event_store(events)
+    await events.create_schema()
+    try:
+        await executions.enqueue_run(
+            AgentRunRecord(
+                run_id="evidence-run",
+                agent_id="postgres-agent",
+                agent_version="1.0.0",
+                snapshot_fingerprint="snapshot-a",
+                runtime_build_id="build-a",
+            ),
+            operation=ExecutionOperation.EXECUTE,
+            payload={"prompt": "work"},
+            idempotency_key="submit-evidence-run",
+        )
+        claimed = await executions.claim_next(
+            owner_id="worker-a",
+            runtime_route="default",
+            runtime_build_id="build-a",
+            lease_seconds=30,
+        )
+        assert claimed is not None
+        fenced = FencedEventStore(events, executions, claimed.lease)
+        await fenced.emit(
+            "evidence-run",
+            "tool.started",
+            {
+                "tool_name": "send_message",
+                "tool_call_id": "call-1",
+                "side_effect": "mutating",
+                "operation_id": "op:send-message",
+                "idempotency_key": "op:send-message",
+                "intent_sha256": "a" * 64,
+            },
+        )
+        recovery = await executions.interrupt(
+            claimed.lease,
+            reason_code="worker_shutdown",
+        )
+
+        reopened = PostgresExecutionStore.from_url(POSTGRES_DSN, schema=schema)
+        try:
+            evidence = await reopened.recovery_evidence("evidence-run")
+            assert evidence.side_effect_evidence[0].status is SideEffectStatus.UNKNOWN
+            with pytest.raises(
+                RecoveryGateBlockedError,
+                match="unsafe_side_effect_replay",
+            ):
+                await reopened.decide_recovery(
+                    "evidence-run",
+                    decision=RecoveryDecision.RETRY,
+                    strategy=RecoveryStrategy.RESTART,
+                    subject_id="operator-1",
+                    reason_code="retry_requested",
+                    expected_revision=recovery.revision,
+                    idempotency_key="ticket-evidence-run",
+                )
+        finally:
+            await reopened.close()
     finally:
         async with events.engine.begin() as connection:
             await connection.execute(DropSchema(schema, cascade=True, if_exists=True))

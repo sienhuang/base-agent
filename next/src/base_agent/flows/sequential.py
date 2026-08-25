@@ -625,6 +625,9 @@ class SequentialFlow:
             waiting_child_run_id=(
                 state.waiting_run.run_id if state.waiting_run is not None else None
             ),
+            artifact_ids=tuple(
+                artifact.id for artifact in _unique_artifacts(state.accepted_artifacts)
+            ),
             created_at=created_at,
             updated_at=now,
         )

@@ -572,6 +572,7 @@ class Harness:
                     tool_name=pending_call.name,
                     tool_call_id=pending_call.id,
                     status=pending_result.status.value,
+                    operation_id=checkpoint.pending_input.operation_id,
                 )
             else:
                 if confirmation is None:
@@ -592,6 +593,9 @@ class Harness:
                     pending_result = await self._execute_tool(
                         pending_call,
                         turn=state.next_turn - 1,
+                        operation_index=(checkpoint.pending_input.operation_index or 0),
+                        operation_id=checkpoint.pending_input.operation_id,
+                        invocation=state.invocation,
                         tools_by_name=tools_by_name,
                         emitter=emitter,
                         artifact_manager=artifact_manager,
@@ -633,6 +637,7 @@ class Harness:
                 resource_manager=resource_manager,
                 claim=claim,
                 lease_stop=lease_stop,
+                start_index=(checkpoint.pending_input.operation_index or 0) + 1,
             )
             if batch_result is not None:
                 return batch_result
@@ -923,11 +928,16 @@ class Harness:
         resource_manager: ResourceManager,
         claim: CheckpointClaim | None,
         lease_stop: asyncio.Event | None,
+        start_index: int = 0,
     ) -> RunResult | None:
-        for index, call in enumerate(calls):
+        for offset, call in enumerate(calls):
+            operation_index = start_index + offset
             outcome = await self._execute_tool(
                 call,
                 turn=turn,
+                operation_index=operation_index,
+                operation_id=None,
+                invocation=state.invocation,
                 tools_by_name=tools_by_name,
                 emitter=emitter,
                 artifact_manager=artifact_manager,
@@ -937,7 +947,7 @@ class Harness:
                 return await self._waiting(
                     outcome,
                     state=state,
-                    remaining_calls=calls[index + 1 :],
+                    remaining_calls=calls[offset + 1 :],
                     overflow_calls=overflow_calls,
                     turn=turn,
                     emitter=emitter,
@@ -1428,6 +1438,9 @@ class Harness:
         call: ToolCall,
         *,
         turn: int,
+        operation_index: int,
+        operation_id: str | None,
+        invocation: RunInvocation,
         tools_by_name: Mapping[str, Tool],
         emitter: EventEmitter,
         artifact_manager: ArtifactManager,
@@ -1483,6 +1496,14 @@ class Harness:
             )
             return result
 
+        resolved_operation_id = operation_id or _tool_operation_id(
+            invocation,
+            run_id=emitter.run_id,
+            turn=turn,
+            operation_index=operation_index,
+        )
+        intent_sha256 = _tool_intent_sha256(call.name, arguments)
+
         if tool.confirmation is Confirmation.REQUIRED and not confirmation_granted:
             request_id = str(uuid4())
             try:
@@ -1512,6 +1533,8 @@ class Harness:
                         "arguments": _json_value(arguments),
                         "side_effect": tool.side_effect.value,
                     },
+                    operation_id=resolved_operation_id,
+                    operation_index=operation_index,
                 )
                 await emitter.emit(
                     "tool.confirmation.requested",
@@ -1579,6 +1602,12 @@ class Harness:
                 tool_name=call.name,
                 tool_call_id=call.id,
                 side_effect=tool.side_effect.value,
+                operation_id=resolved_operation_id,
+                idempotency_key=resolved_operation_id,
+                intent_sha256=intent_sha256,
+                stage=invocation.stage,
+                step_id=invocation.step_id,
+                attempt=invocation.attempt,
             )
             tool_started = True
             data = await asyncio.wait_for(
@@ -1588,6 +1617,7 @@ class Harness:
                         run_id=emitter.run_id,
                         agent_id=self._definition.id,
                         tool_call_id=call.id,
+                        operation_id=resolved_operation_id,
                         artifacts=artifact_manager.for_tool(call.id),
                         resources=resource_manager,
                     ),
@@ -1603,6 +1633,13 @@ class Harness:
                     tool_call_id=call.id,
                     status=ToolResultStatus.CANCELLED.value,
                     duration_ms=int((monotonic() - started_at) * 1000),
+                    side_effect=tool.side_effect.value,
+                    operation_id=resolved_operation_id,
+                    idempotency_key=resolved_operation_id,
+                    intent_sha256=intent_sha256,
+                    stage=invocation.stage,
+                    step_id=invocation.step_id,
+                    attempt=invocation.attempt,
                 )
             raise
         except TimeoutError:
@@ -1626,6 +1663,8 @@ class Harness:
                     tool_name=call.name,
                     prompt=data.prompt,
                     metadata=dict(data.metadata),
+                    operation_id=resolved_operation_id,
+                    operation_index=operation_index,
                 )
                 await emitter.emit(
                     "tool.waiting",
@@ -1635,6 +1674,13 @@ class Harness:
                     tool_call_id=call.id,
                     prompt=data.prompt,
                     metadata=dict(data.metadata),
+                    side_effect=tool.side_effect.value,
+                    operation_id=resolved_operation_id,
+                    idempotency_key=resolved_operation_id,
+                    intent_sha256=intent_sha256,
+                    stage=invocation.stage,
+                    step_id=invocation.step_id,
+                    attempt=invocation.attempt,
                 )
                 return _PendingTool(input=pending, call=call)
             result = ToolResult(
@@ -1649,6 +1695,13 @@ class Harness:
             tool_call_id=call.id,
             status=result.status.value,
             duration_ms=int((monotonic() - started_at) * 1000),
+            side_effect=tool.side_effect.value,
+            operation_id=resolved_operation_id,
+            idempotency_key=resolved_operation_id,
+            intent_sha256=intent_sha256,
+            stage=invocation.stage,
+            step_id=invocation.step_id,
+            attempt=invocation.attempt,
         )
         return result
 
@@ -2223,6 +2276,31 @@ async def _has_open_tool_event(emitter: EventEmitter, tool_call_id: str) -> bool
         if event.kind == "tool.started":
             return True
     return False
+
+
+def _tool_operation_id(
+    invocation: RunInvocation,
+    *,
+    run_id: str,
+    turn: int,
+    operation_index: int,
+) -> str:
+    scope = invocation.invocation_id or f"run:{run_id}"
+    digest = hashlib.sha256(
+        f"{scope}\x00turn:{turn}\x00tool:{operation_index}".encode()
+    ).hexdigest()
+    return f"op:{digest}"
+
+
+def _tool_intent_sha256(tool_name: str, arguments: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        {"tool_name": tool_name, "arguments": _json_value(arguments)},
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _index_skill_resources(

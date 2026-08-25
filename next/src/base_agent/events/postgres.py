@@ -43,6 +43,8 @@ from base_agent.checkpoints import (
     checkpoint_json,
 )
 from base_agent.execution import (
+    ArtifactReceipt,
+    ArtifactReceiptStatus,
     AttemptHeartbeat,
     ClaimedExecution,
     ExecutionAttempt,
@@ -57,10 +59,25 @@ from base_agent.execution import (
     ExecutionTargetKind,
     RecoveryDecision,
     RecoveryDecisionRecord,
+    RecoveryEvidenceSnapshot,
+    RecoveryGateBlockedError,
     RecoveryStrategy,
     RecoveryTransition,
+    SideEffectEvidence,
+    SideEffectStatus,
+    _artifact_receipt_from_artifact,
+    _artifact_receipt_from_event,
+    _checkpoint_artifacts,
     _derived_idempotency_key,
+    _recovery_gate_error,
+    _recovery_strategy_blockers,
+    _resumable_side_effect_evidence,
+    _side_effect_completion_status,
+    _side_effect_evidence_id,
+    _side_effect_started_from_event,
+    _validate_artifact_receipt_intent,
     _validate_recovery_intent,
+    _validate_side_effect_intent,
 )
 from base_agent.flow_store import (
     FlowCheckpoint,
@@ -130,6 +147,8 @@ class PostgresEventTables:
     execution_requests: Table
     execution_attempts: Table
     recovery_decisions: Table
+    artifact_receipts: Table
+    side_effect_evidence: Table
 
 
 def build_postgres_event_tables(schema: str | None = None) -> PostgresEventTables:
@@ -278,6 +297,39 @@ def build_postgres_event_tables(schema: str | None = None) -> PostgresEventTable
         Column("record", JSONB, nullable=False),
         Column("created_at", DateTime(timezone=True), nullable=False),
     )
+    artifact_receipts = Table(
+        "base_agent_artifact_receipts",
+        metadata,
+        Column("artifact_id", String(256), primary_key=True),
+        Column("target_kind", String(32), nullable=False, index=True),
+        Column("target_id", String(256), nullable=False, index=True),
+        Column("execution_attempt_id", String(64), nullable=False, index=True),
+        Column("status", String(32), nullable=False, index=True),
+        Column("checkpoint_revision", Integer, nullable=True, index=True),
+        Column("record", JSONB, nullable=False),
+        Column("created_at", DateTime(timezone=True), nullable=False),
+        Column("updated_at", DateTime(timezone=True), nullable=False),
+    )
+    side_effect_evidence = Table(
+        "base_agent_side_effect_evidence",
+        metadata,
+        Column("evidence_id", String(80), primary_key=True),
+        Column("target_kind", String(32), nullable=False, index=True),
+        Column("target_id", String(256), nullable=False, index=True),
+        Column("execution_attempt_id", String(64), nullable=False, index=True),
+        Column("operation_id", String(256), nullable=False, index=True),
+        Column("side_effect", String(32), nullable=False, index=True),
+        Column("status", String(32), nullable=False, index=True),
+        Column("checkpoint_revision", Integer, nullable=True, index=True),
+        Column("record", JSONB, nullable=False),
+        Column("created_at", DateTime(timezone=True), nullable=False),
+        Column("updated_at", DateTime(timezone=True), nullable=False),
+        UniqueConstraint(
+            "operation_id",
+            "execution_attempt_id",
+            name="uq_base_agent_side_effect_operation_attempt",
+        ),
+    )
     return PostgresEventTables(
         metadata=metadata,
         sequences=sequences,
@@ -289,6 +341,8 @@ def build_postgres_event_tables(schema: str | None = None) -> PostgresEventTable
         execution_requests=execution_requests,
         execution_attempts=execution_attempts,
         recovery_decisions=recovery_decisions,
+        artifact_receipts=artifact_receipts,
+        side_effect_evidence=side_effect_evidence,
     )
 
 
@@ -436,6 +490,15 @@ class PostgresEventStore:
                 raise ExecutionLeaseLostError(
                     "Attempt lease target does not match Event run_id"
                 )
+            await _record_event_evidence_in_transaction(
+                connection,
+                self.tables,
+                attempt,
+                kind,
+                normalized_payload,
+                turn=turn,
+                now=now,
+            )
             sequence = await self._append_event(
                 connection,
                 run_id,
@@ -1958,6 +2021,13 @@ class PostgresExecutionStore:
                     "updated_at": now,
                 }
             )
+            if status.value in {"failed", "cancelled"}:
+                await _mark_open_side_effects_unknown_in_transaction(
+                    connection,
+                    self.tables,
+                    attempt.attempt_id,
+                    now=now,
+                )
             await self._write_attempt(connection, ended)
             await self._write_request(connection, completed)
             await self._write_target(connection, settled)
@@ -2055,6 +2125,12 @@ class PostgresExecutionStore:
                     "error": error,
                 },
             )
+            await _mark_open_side_effects_unknown_in_transaction(
+                connection,
+                self.tables,
+                attempt.attempt_id,
+                now=now,
+            )
             await self._write_attempt(connection, ended)
             await self._write_request(connection, blocked_request)
             await self._write_target(connection, blocked)
@@ -2139,6 +2215,45 @@ class PostgresExecutionStore:
         async with self.engine.connect() as connection:
             payload = (await connection.execute(statement)).scalar_one_or_none()
         return None if payload is None else ExecutionAttempt.model_validate(payload)
+
+    async def record_event_evidence(
+        self,
+        lease: ExecutionLease,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        turn: int | None = None,
+    ) -> None:
+        normalized = _finite_json_mapping(payload)
+        async with self.engine.begin() as connection:
+            attempt = await self._locked_attempt(connection, lease.attempt_id)
+            now = await _database_now(connection)
+            self._validate_owned_attempt(attempt, lease, now)
+            target = await self._locked_target(
+                connection,
+                attempt.target_kind,
+                attempt.target_id,
+            )
+            _validate_current_attempt_target(attempt, target)
+            await _record_event_evidence_in_transaction(
+                connection,
+                self.tables,
+                attempt,
+                kind,
+                normalized,
+                turn=turn,
+                now=now,
+            )
+
+    async def recovery_evidence(
+        self,
+        target_id: str,
+        *,
+        target_kind: ExecutionTargetKind = ExecutionTargetKind.AGENT_RUN,
+    ) -> RecoveryEvidenceSnapshot:
+        async with self.engine.begin() as connection:
+            target = await self._locked_target(connection, target_kind, target_id)
+            return await self._recovery_evidence_locked(connection, target)
 
     async def request_cancel(
         self,
@@ -2333,6 +2448,13 @@ class PostgresExecutionStore:
             )
             created_request: ExecutionRequest | None = None
             if decision is RecoveryDecision.RETRY:
+                assert strategy is not None
+                evidence = await self._recovery_evidence_locked(connection, target)
+                blockers = evidence.blockers_for(strategy)
+                if blockers:
+                    raise RecoveryGateBlockedError(
+                        _recovery_gate_error(strategy, blockers)
+                    )
                 source_operation = (
                     ExecutionOperation.EXECUTE
                     if strategy is RecoveryStrategy.RESTART
@@ -2543,6 +2665,13 @@ class PostgresExecutionStore:
             normalized = FlowCheckpoint.model_validate(
                 flow_checkpoint_json(checkpoint)
             )
+            receipt_updates = await _checkpoint_receipt_updates_in_transaction(
+                connection,
+                self.tables,
+                attempt,
+                normalized,
+                now=now,
+            )
             if current is None:
                 await connection.execute(
                     postgresql_insert(self.tables.flow_checkpoints).values(
@@ -2558,6 +2687,15 @@ class PostgresExecutionStore:
                     )
                     .values(**_flow_checkpoint_columns(normalized))
                 )
+            for receipt in receipt_updates:
+                await _write_artifact_receipt(connection, self.tables, receipt)
+            await _mark_attempt_evidence_checkpointed_in_transaction(
+                connection,
+                self.tables,
+                attempt.attempt_id,
+                checkpoint_revision=normalized.revision,
+                now=now,
+            )
             updated = self._updated_target(
                 target,
                 status="running",
@@ -2585,6 +2723,12 @@ class PostgresExecutionStore:
         reason_code: str,
         now: datetime,
     ) -> AgentRunRecord | FlowRunRecord:
+        await _mark_open_side_effects_unknown_in_transaction(
+            connection,
+            self.tables,
+            attempt.attempt_id,
+            now=now,
+        )
         ended = attempt.model_copy(
             update={
                 "status": status,
@@ -2726,6 +2870,77 @@ class PostgresExecutionStore:
         payload = (await connection.execute(statement)).scalar_one_or_none()
         return None if payload is None else ExecutionAttempt.model_validate(payload)
 
+    async def _recovery_evidence_locked(
+        self,
+        connection: Any,
+        target: AgentRunRecord | FlowRunRecord,
+    ) -> RecoveryEvidenceSnapshot:
+        target_kind = (
+            ExecutionTargetKind.AGENT_RUN
+            if isinstance(target, AgentRunRecord)
+            else ExecutionTargetKind.FLOW_RUN
+        )
+        target_id = target.run_id if isinstance(target, AgentRunRecord) else target.flow_run_id
+        receipt_payloads = (
+            await connection.execute(
+                select(self.tables.artifact_receipts.c.record)
+                .where(
+                    self.tables.artifact_receipts.c.target_kind == target_kind.value,
+                    self.tables.artifact_receipts.c.target_id == target_id,
+                )
+                .order_by(self.tables.artifact_receipts.c.created_at)
+            )
+        ).scalars().all()
+        side_effect_payloads = (
+            await connection.execute(
+                select(self.tables.side_effect_evidence.c.record)
+                .where(
+                    self.tables.side_effect_evidence.c.target_kind == target_kind.value,
+                    self.tables.side_effect_evidence.c.target_id == target_id,
+                )
+                .order_by(self.tables.side_effect_evidence.c.created_at)
+            )
+        ).scalars().all()
+        receipts = tuple(ArtifactReceipt.model_validate(item) for item in receipt_payloads)
+        side_effects = tuple(
+            SideEffectEvidence.model_validate(item) for item in side_effect_payloads
+        )
+        checkpoint: FlowCheckpoint | None = None
+        checkpoint_error: str | None = None
+        if isinstance(target, FlowRunRecord) and target.checkpoint_revision is not None:
+            checkpoint_payload = (
+                await connection.execute(
+                    select(self.tables.flow_checkpoints.c.payload).where(
+                        self.tables.flow_checkpoints.c.flow_run_id == target_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if checkpoint_payload is None:
+                checkpoint_error = "durable Flow checkpoint was not found"
+            else:
+                checkpoint = FlowCheckpoint.model_validate(checkpoint_payload)
+                if checkpoint.revision != target.checkpoint_revision:
+                    checkpoint_error = (
+                        "Flow checkpoint revision does not match the logical Flow Run"
+                    )
+        return RecoveryEvidenceSnapshot(
+            target_kind=target_kind,
+            target_id=target_id,
+            checkpoint_revision=target.checkpoint_revision,
+            checkpoint_stage=(
+                target.checkpoint_stage if isinstance(target, FlowRunRecord) else None
+            ),
+            artifact_receipts=receipts,
+            side_effect_evidence=side_effects,
+            strategy_blockers=_recovery_strategy_blockers(
+                target,
+                receipts=receipts,
+                side_effects=side_effects,
+                checkpoint=checkpoint,
+                checkpoint_error=checkpoint_error,
+            ),
+        )
+
     def _validate_owned_attempt(
         self,
         attempt: ExecutionAttempt,
@@ -2852,6 +3067,284 @@ _ACTIVE_EXECUTION_ATTEMPT_STATUSES = frozenset(
         ExecutionAttemptStatus.STOPPING,
     }
 )
+
+
+async def _record_event_evidence_in_transaction(
+    connection: Any,
+    tables: PostgresEventTables,
+    attempt: ExecutionAttempt,
+    kind: str,
+    payload: Mapping[str, Any],
+    *,
+    turn: int | None,
+    now: datetime,
+) -> None:
+    if kind == "artifact.created":
+        receipt = _artifact_receipt_from_event(attempt, payload, now=now)
+        existing_payload = (
+            await connection.execute(
+                select(tables.artifact_receipts.c.record)
+                .where(tables.artifact_receipts.c.artifact_id == receipt.artifact_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if existing_payload is not None:
+            _validate_artifact_receipt_intent(
+                ArtifactReceipt.model_validate(existing_payload),
+                receipt,
+            )
+            return
+        await connection.execute(
+            postgresql_insert(tables.artifact_receipts).values(
+                **_artifact_receipt_columns(receipt)
+            )
+        )
+        return
+    if kind == "tool.started":
+        evidence = _side_effect_started_from_event(
+            attempt,
+            payload,
+            turn=turn,
+            now=now,
+        )
+        intent_payloads = (
+            await connection.execute(
+                select(tables.side_effect_evidence.c.record)
+                .where(
+                    tables.side_effect_evidence.c.target_kind
+                    == attempt.target_kind.value,
+                    tables.side_effect_evidence.c.target_id == attempt.target_id,
+                    tables.side_effect_evidence.c.operation_id == evidence.operation_id,
+                )
+                .with_for_update()
+            )
+        ).scalars().all()
+        for existing_payload in intent_payloads:
+            _validate_side_effect_intent(
+                SideEffectEvidence.model_validate(existing_payload),
+                evidence,
+            )
+        if any(
+            SideEffectEvidence.model_validate(item).evidence_id == evidence.evidence_id
+            for item in intent_payloads
+        ):
+            return
+        await connection.execute(
+            postgresql_insert(tables.side_effect_evidence).values(
+                **_side_effect_evidence_columns(evidence)
+            )
+        )
+        return
+    if kind in {"tool.waiting", "tool.completed"}:
+        operation_id = payload.get("operation_id")
+        if operation_id is None:
+            return
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise ExecutionRequestConflictError(
+                "Tool evidence operation_id must be a non-blank string"
+            )
+        evidence_id = _side_effect_evidence_id(operation_id, attempt.attempt_id)
+        existing_payload = (
+            await connection.execute(
+                select(tables.side_effect_evidence.c.record)
+                .where(tables.side_effect_evidence.c.evidence_id == evidence_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if existing_payload is None:
+            if kind != "tool.completed":
+                raise ExecutionRequestConflictError(
+                    f"Tool operation '{operation_id}' has no current started evidence"
+                )
+            resumable_payloads = (
+                await connection.execute(
+                    select(tables.side_effect_evidence.c.record)
+                    .where(
+                        tables.side_effect_evidence.c.target_kind
+                        == attempt.target_kind.value,
+                        tables.side_effect_evidence.c.target_id == attempt.target_id,
+                        tables.side_effect_evidence.c.operation_id == operation_id,
+                        tables.side_effect_evidence.c.checkpoint_revision.is_not(None),
+                    )
+                    .with_for_update()
+                )
+            ).scalars().all()
+            existing = _resumable_side_effect_evidence(
+                tuple(
+                    SideEffectEvidence.model_validate(item)
+                    for item in resumable_payloads
+                ),
+                attempt,
+                operation_id,
+            )
+        else:
+            existing = SideEffectEvidence.model_validate(existing_payload)
+        status, result_status = _side_effect_completion_status(kind, payload)
+        completed = existing.model_copy(
+            update={
+                "status": status,
+                "result_status": result_status,
+                "completed_at": (now if kind == "tool.completed" else None),
+                "resolved_by_attempt_id": (
+                    attempt.attempt_id
+                    if existing.execution_attempt_id != attempt.attempt_id
+                    else existing.resolved_by_attempt_id
+                ),
+                "resolution_fencing_token": (
+                    attempt.fencing_token
+                    if existing.execution_attempt_id != attempt.attempt_id
+                    else existing.resolution_fencing_token
+                ),
+                "updated_at": now,
+            }
+        )
+        await _write_side_effect_evidence(connection, tables, completed)
+        return
+    if kind in {"run.waiting", "execution.child.waiting"}:
+        checkpoint_revision = payload.get("checkpoint_revision")
+        if isinstance(checkpoint_revision, int) and not isinstance(
+            checkpoint_revision, bool
+        ):
+            await _mark_attempt_evidence_checkpointed_in_transaction(
+                connection,
+                tables,
+                attempt.attempt_id,
+                checkpoint_revision=checkpoint_revision,
+                now=now,
+            )
+
+
+async def _checkpoint_receipt_updates_in_transaction(
+    connection: Any,
+    tables: PostgresEventTables,
+    attempt: ExecutionAttempt,
+    checkpoint: FlowCheckpoint,
+    *,
+    now: datetime,
+) -> tuple[ArtifactReceipt, ...]:
+    artifacts = _checkpoint_artifacts(checkpoint)
+    if {artifact.id for artifact in artifacts} != set(checkpoint.artifact_ids):
+        raise FlowTransitionError(
+            "Flow checkpoint Artifact ids do not match its verified Artifact metadata"
+        )
+    updates: list[ArtifactReceipt] = []
+    for artifact in artifacts:
+        if artifact.flow_run_id != attempt.target_id:
+            raise FlowTransitionError(
+                f"Artifact '{artifact.id}' does not belong to the Flow Run"
+            )
+        pending = _artifact_receipt_from_artifact(attempt, artifact, now=now)
+        existing_payload = (
+            await connection.execute(
+                select(tables.artifact_receipts.c.record)
+                .where(tables.artifact_receipts.c.artifact_id == artifact.id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if existing_payload is not None:
+            existing = ArtifactReceipt.model_validate(existing_payload)
+            _validate_artifact_receipt_intent(existing, pending)
+            pending = existing
+        updates.append(
+            pending.model_copy(
+                update={
+                    "status": ArtifactReceiptStatus.VERIFIED,
+                    "checkpoint_revision": (
+                        pending.checkpoint_revision or checkpoint.revision
+                    ),
+                    "verification_detail": "host_checkpoint",
+                    "verified_at": pending.verified_at or now,
+                }
+            )
+        )
+    return tuple(updates)
+
+
+async def _mark_attempt_evidence_checkpointed_in_transaction(
+    connection: Any,
+    tables: PostgresEventTables,
+    attempt_id: str,
+    *,
+    checkpoint_revision: int,
+    now: datetime,
+) -> None:
+    payloads = (
+        await connection.execute(
+            select(tables.side_effect_evidence.c.record)
+            .where(
+                tables.side_effect_evidence.c.execution_attempt_id == attempt_id,
+                tables.side_effect_evidence.c.checkpoint_revision.is_(None),
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+    for payload in payloads:
+        evidence = SideEffectEvidence.model_validate(payload).model_copy(
+            update={
+                "checkpoint_revision": checkpoint_revision,
+                "updated_at": now,
+            }
+        )
+        await _write_side_effect_evidence(connection, tables, evidence)
+
+
+async def _mark_open_side_effects_unknown_in_transaction(
+    connection: Any,
+    tables: PostgresEventTables,
+    attempt_id: str,
+    *,
+    now: datetime,
+) -> None:
+    payloads = (
+        await connection.execute(
+            select(tables.side_effect_evidence.c.record)
+            .where(
+                tables.side_effect_evidence.c.execution_attempt_id == attempt_id,
+                tables.side_effect_evidence.c.status.in_(
+                    (SideEffectStatus.STARTED.value, SideEffectStatus.WAITING.value)
+                ),
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+    for payload in payloads:
+        evidence = SideEffectEvidence.model_validate(payload).model_copy(
+            update={
+                "status": SideEffectStatus.UNKNOWN,
+                "result_status": "execution_interrupted",
+                "completed_at": now,
+                "updated_at": now,
+            }
+        )
+        await _write_side_effect_evidence(connection, tables, evidence)
+
+
+async def _write_artifact_receipt(
+    connection: Any,
+    tables: PostgresEventTables,
+    receipt: ArtifactReceipt,
+) -> None:
+    statement = postgresql_insert(tables.artifact_receipts).values(
+        **_artifact_receipt_columns(receipt)
+    )
+    await connection.execute(
+        statement.on_conflict_do_update(
+            index_elements=[tables.artifact_receipts.c.artifact_id],
+            set_=_artifact_receipt_columns(receipt),
+        )
+    )
+
+
+async def _write_side_effect_evidence(
+    connection: Any,
+    tables: PostgresEventTables,
+    evidence: SideEffectEvidence,
+) -> None:
+    await connection.execute(
+        update(tables.side_effect_evidence)
+        .where(tables.side_effect_evidence.c.evidence_id == evidence.evidence_id)
+        .values(**_side_effect_evidence_columns(evidence))
+    )
 
 
 async def _append_event_in_transaction(
@@ -2993,6 +3486,36 @@ def _recovery_decision_columns(record: RecoveryDecisionRecord) -> dict[str, Any]
         "idempotency_key": record.idempotency_key,
         "record": _finite_json_mapping(record.model_dump(mode="json")),
         "created_at": record.created_at,
+    }
+
+
+def _artifact_receipt_columns(record: ArtifactReceipt) -> dict[str, Any]:
+    return {
+        "artifact_id": record.artifact_id,
+        "target_kind": record.target_kind.value,
+        "target_id": record.target_id,
+        "execution_attempt_id": record.execution_attempt_id,
+        "status": record.status.value,
+        "checkpoint_revision": record.checkpoint_revision,
+        "record": _finite_json_mapping(record.model_dump(mode="json")),
+        "created_at": record.recorded_at,
+        "updated_at": record.verified_at or record.recorded_at,
+    }
+
+
+def _side_effect_evidence_columns(record: SideEffectEvidence) -> dict[str, Any]:
+    return {
+        "evidence_id": record.evidence_id,
+        "target_kind": record.target_kind.value,
+        "target_id": record.target_id,
+        "execution_attempt_id": record.execution_attempt_id,
+        "operation_id": record.operation_id,
+        "side_effect": record.side_effect.value,
+        "status": record.status.value,
+        "checkpoint_revision": record.checkpoint_revision,
+        "record": _finite_json_mapping(record.model_dump(mode="json")),
+        "created_at": record.started_at,
+        "updated_at": record.updated_at,
     }
 
 

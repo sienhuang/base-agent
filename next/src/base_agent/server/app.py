@@ -22,6 +22,7 @@ from base_agent.execution import (
     ExecutionAttempt,
     ExecutionRequestConflictError,
     ExecutionStore,
+    RecoveryEvidenceSnapshot,
 )
 from base_agent.flow_store import (
     FlowRunRecord,
@@ -68,6 +69,7 @@ from base_agent.server.registry import (
     RunNotFoundError,
 )
 from base_agent.server.schemas import (
+    ArtifactReceiptResponse,
     ArtifactRefResponse,
     ConfirmRunRequest,
     EventResponse,
@@ -76,9 +78,11 @@ from base_agent.server.schemas import (
     PendingInputResponse,
     RecoveryAttemptResponse,
     RecoveryDecisionRequest,
+    RecoveryGateBlockerResponse,
     RecoveryResponse,
     ResumeRunRequest,
     RunResponse,
+    SideEffectEvidenceResponse,
     StartFlowRequest,
     StartFlowResponse,
     StartRunRequest,
@@ -224,6 +228,7 @@ def create_http_app(
                     record,
                     recovery_store,
                     recovery_attempt=await flow_registry.latest_attempt(flow_run_id),
+                    recovery_evidence=await flow_registry.recovery_evidence(flow_run_id),
                 )
             continued = flow_registry.continued_result(flow_run_id)
             if continued is not None:
@@ -494,6 +499,7 @@ def _register_run_routes(
             record,
             event_store,
             recovery_attempt=await registry.latest_attempt(run_id),
+            recovery_evidence=await registry.recovery_evidence(run_id),
         )
 
     @app.post(
@@ -887,6 +893,7 @@ async def _run_record_response(
     event_store: EventStore | None,
     *,
     recovery_attempt: ExecutionAttempt | None = None,
+    recovery_evidence: RecoveryEvidenceSnapshot | None = None,
 ) -> RunResponse:
     events = () if event_store is None else await event_store.list(record.run_id)
     pending = (
@@ -903,13 +910,14 @@ async def _run_record_response(
         error=record.error,
         artifacts=_artifact_responses(events),
         pending_input=pending,
-        recovery=_recovery_response(record, recovery_attempt),
+        recovery=_recovery_response(record, recovery_attempt, recovery_evidence),
     )
 
 
 def _recovery_response(
     record: AgentRunRecord | FlowRunRecord,
     attempt: ExecutionAttempt | None,
+    evidence: RecoveryEvidenceSnapshot | None,
 ) -> RecoveryResponse | None:
     if record.status.value not in {"recovery_required", "blocked"}:
         return None
@@ -933,6 +941,74 @@ def _recovery_response(
         revision=record.revision,
         detected_at=record.recovery_detected_at,
         last_attempt=last_attempt,
+        checkpoint_revision=(
+            evidence.checkpoint_revision if evidence is not None else None
+        ),
+        checkpoint_stage=(evidence.checkpoint_stage if evidence is not None else None),
+        allowed_strategies=(
+            tuple(
+                strategy
+                for strategy, blockers in evidence.strategy_blockers.items()
+                if not blockers
+            )
+            if evidence is not None
+            else ()
+        ),
+        artifact_receipts=(
+            tuple(
+                ArtifactReceiptResponse.model_validate(
+                    receipt.model_dump(
+                        mode="json",
+                        exclude={
+                            "target_kind",
+                            "target_id",
+                            "execution_attempt_id",
+                            "fencing_token",
+                            "flow_run_id",
+                            "invocation_id",
+                            "recorded_at",
+                            "verified_at",
+                        },
+                    )
+                )
+                for receipt in evidence.artifact_receipts
+            )
+            if evidence is not None
+            else ()
+        ),
+        side_effect_evidence=(
+            tuple(
+                SideEffectEvidenceResponse.model_validate(
+                    item.model_dump(
+                        mode="json",
+                        exclude={
+                            "target_kind",
+                            "target_id",
+                            "execution_attempt_id",
+                            "fencing_token",
+                            "resolution_fencing_token",
+                            "started_at",
+                            "completed_at",
+                            "updated_at",
+                        },
+                    )
+                )
+                for item in evidence.side_effect_evidence
+            )
+            if evidence is not None
+            else ()
+        ),
+        strategy_blockers=(
+            {
+                strategy: tuple(
+                    RecoveryGateBlockerResponse.model_validate(blocker.model_dump())
+                    for blocker in blockers
+                )
+                for strategy, blockers in evidence.strategy_blockers.items()
+            }
+            if evidence is not None
+            else {}
+        ),
     )
 
 
@@ -941,6 +1017,7 @@ async def _flow_record_response(
     event_store: EventStore | None,
     *,
     recovery_attempt: ExecutionAttempt | None = None,
+    recovery_evidence: RecoveryEvidenceSnapshot | None = None,
 ) -> FlowResponse:
     events = (
         ()
@@ -969,7 +1046,7 @@ async def _flow_record_response(
         artifacts=(projected.artifacts if projected is not None else ()),
         pending_input=pending,
         waiting_child_run_id=record.waiting_child_run_id,
-        recovery=_recovery_response(record, recovery_attempt),
+        recovery=_recovery_response(record, recovery_attempt, recovery_evidence),
     )
 
 

@@ -11,17 +11,20 @@ from enum import StrEnum
 from typing import Any, Protocol, cast, runtime_checkable
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
+from base_agent.artifacts import Artifact
 from base_agent.events import EventStore
 from base_agent.flow_store import (
     FlowCheckpoint,
+    FlowCheckpointNotFoundError,
     FlowCheckpointStore,
     FlowRunRecord,
     FlowRunStore,
     FlowTransitionError,
 )
 from base_agent.flows.models import FlowStatus
+from base_agent.governance import SideEffect
 from base_agent.models import RunStatus
 from base_agent.run_store import (
     AgentRunRecord,
@@ -77,6 +80,21 @@ class RecoveryStrategy(StrEnum):
     RESTART = "restart"
 
 
+class ArtifactReceiptStatus(StrEnum):
+    PENDING = "pending"
+    VERIFIED = "verified"
+    REJECTED = "rejected"
+
+
+class SideEffectStatus(StrEnum):
+    STARTED = "started"
+    WAITING = "waiting"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"
+
+
 class ExecutionStoreError(RuntimeError):
     """Base error for durable execution ownership operations."""
 
@@ -95,6 +113,131 @@ class ExecutionRequestNotFoundError(ExecutionStoreError, LookupError):
 
 class ExecutionAttemptNotFoundError(ExecutionStoreError, LookupError):
     """No matching ExecutionAttempt exists."""
+
+
+class RecoveryGateBlockedError(ExecutionRequestConflictError):
+    """Persisted evidence proves that the requested replay is not safe."""
+
+
+class ArtifactReceipt(BaseModel):
+    """Fenced, immutable Artifact metadata plus Host verification state."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    artifact_id: str = Field(min_length=1)
+    target_kind: ExecutionTargetKind
+    target_id: str = Field(min_length=1)
+    execution_attempt_id: str = Field(min_length=1)
+    fencing_token: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    media_type: str = Field(min_length=1)
+    size_bytes: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    producer_run_id: str = Field(min_length=1)
+    producer_agent_id: str = Field(min_length=1)
+    flow_run_id: str | None = None
+    invocation_id: str | None = None
+    stage: str | None = None
+    step_id: str | None = None
+    stage_attempt: int | None = Field(default=None, ge=1)
+    tool_call_id: str | None = None
+    location: str | None = None
+    source_artifact_ids: tuple[str, ...] = ()
+    status: ArtifactReceiptStatus = ArtifactReceiptStatus.PENDING
+    checkpoint_revision: int | None = Field(default=None, ge=1)
+    verification_detail: str | None = None
+    recorded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    verified_at: datetime | None = None
+
+    @field_validator("recorded_at", "verified_at")
+    @classmethod
+    def receipt_timestamps_are_aware(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("Artifact receipt timestamps must be timezone-aware")
+        return value
+
+    @model_validator(mode="after")
+    def verified_receipt_has_checkpoint(self) -> ArtifactReceipt:
+        if self.status is ArtifactReceiptStatus.VERIFIED:
+            if self.checkpoint_revision is None or self.verified_at is None:
+                raise ValueError(
+                    "verified Artifact receipt requires checkpoint revision and time"
+                )
+        if len(set(self.source_artifact_ids)) != len(self.source_artifact_ids):
+            raise ValueError("Artifact receipt source ids must be unique")
+        return self
+
+
+class SideEffectEvidence(BaseModel):
+    """Fenced Tool operation evidence used to decide whether replay is safe."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    evidence_id: str = Field(min_length=1)
+    target_kind: ExecutionTargetKind
+    target_id: str = Field(min_length=1)
+    execution_attempt_id: str = Field(min_length=1)
+    fencing_token: str = Field(min_length=1)
+    operation_id: str = Field(min_length=1, max_length=256)
+    idempotency_key: str = Field(min_length=1, max_length=256)
+    intent_sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    tool_call_id: str = Field(min_length=1)
+    tool_name: str = Field(min_length=1)
+    side_effect: SideEffect
+    status: SideEffectStatus
+    result_status: str | None = None
+    stage: str | None = None
+    step_id: str | None = None
+    stage_attempt: int | None = Field(default=None, ge=1)
+    turn: int | None = Field(default=None, ge=1)
+    checkpoint_revision: int | None = Field(default=None, ge=1)
+    resolved_by_attempt_id: str | None = None
+    resolution_fencing_token: str | None = None
+    started_at: datetime
+    completed_at: datetime | None = None
+    updated_at: datetime
+
+    @field_validator("started_at", "completed_at", "updated_at")
+    @classmethod
+    def evidence_timestamps_are_aware(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("side-effect evidence timestamps must be timezone-aware")
+        return value
+
+    @model_validator(mode="after")
+    def evidence_lifecycle_is_consistent(self) -> SideEffectEvidence:
+        if self.updated_at < self.started_at:
+            raise ValueError("side-effect evidence cannot update before it starts")
+        if self.completed_at is not None and self.completed_at < self.started_at:
+            raise ValueError("side-effect evidence cannot complete before it starts")
+        return self
+
+
+class RecoveryGateBlocker(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(min_length=1)
+    detail: str = Field(min_length=1)
+    artifact_id: str | None = None
+    evidence_id: str | None = None
+    operation_id: str | None = None
+
+
+class RecoveryEvidenceSnapshot(BaseModel):
+    """Operator-visible evidence and deterministic blockers per recovery strategy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    target_kind: ExecutionTargetKind
+    target_id: str = Field(min_length=1)
+    checkpoint_revision: int | None = Field(default=None, ge=1)
+    checkpoint_stage: str | None = None
+    artifact_receipts: tuple[ArtifactReceipt, ...] = ()
+    side_effect_evidence: tuple[SideEffectEvidence, ...] = ()
+    strategy_blockers: dict[RecoveryStrategy, tuple[RecoveryGateBlocker, ...]]
+
+    def blockers_for(self, strategy: RecoveryStrategy) -> tuple[RecoveryGateBlocker, ...]:
+        return self.strategy_blockers.get(strategy, ())
 
 
 class ExecutionRequest(BaseModel):
@@ -369,6 +512,22 @@ class ExecutionStore(Protocol):
         target_kind: ExecutionTargetKind = ExecutionTargetKind.AGENT_RUN,
     ) -> tuple[AgentRunRecord | FlowRunRecord, RecoveryDecisionRecord]: ...
 
+    async def record_event_evidence(
+        self,
+        lease: ExecutionLease,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        turn: int | None = None,
+    ) -> None: ...
+
+    async def recovery_evidence(
+        self,
+        target_id: str,
+        *,
+        target_kind: ExecutionTargetKind = ExecutionTargetKind.AGENT_RUN,
+    ) -> RecoveryEvidenceSnapshot: ...
+
     async def save_flow_checkpoint(
         self,
         lease: ExecutionLease,
@@ -414,6 +573,8 @@ class InMemoryExecutionStore:
         self._requests: dict[str, ExecutionRequest] = {}
         self._attempts: dict[str, ExecutionAttempt] = {}
         self._decisions: dict[str, RecoveryDecisionRecord] = {}
+        self._artifact_receipts: dict[str, ArtifactReceipt] = {}
+        self._side_effect_evidence: dict[str, SideEffectEvidence] = {}
         self._lock = asyncio.Lock()
 
     async def enqueue_run(
@@ -855,6 +1016,8 @@ class InMemoryExecutionStore:
                 status=status.value,
                 updates=updates,
             )
+            if status.value in {"failed", "cancelled"}:
+                self._mark_open_side_effects_unknown(attempt.attempt_id, now=now)
             self._attempts[attempt.attempt_id] = attempt.model_copy(
                 update={
                     "status": terminal_attempt,
@@ -940,6 +1103,7 @@ class InMemoryExecutionStore:
                     "error": error,
                 },
             )
+            self._mark_open_side_effects_unknown(attempt.attempt_id, now=now)
             self._attempts[attempt.attempt_id] = ended
             self._requests[request.request_id] = blocked_request
             if self._event_store is not None:
@@ -1002,6 +1166,47 @@ class InMemoryExecutionStore:
             if not candidates:
                 return None
             return max(candidates, key=lambda item: item.attempt_number).model_copy(deep=True)
+
+    async def record_event_evidence(
+        self,
+        lease: ExecutionLease,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        turn: int | None = None,
+    ) -> None:
+        async with self._lock:
+            attempt = self._owned_attempt(lease)
+            now = self._now()
+            if attempt.lease_expires_at <= now:
+                raise ExecutionLeaseLostError(
+                    f"Attempt lease '{lease.attempt_id}' expired"
+                )
+            target = await self._target(attempt.target_kind, attempt.target_id)
+            if (
+                target.status.value != "running"
+                or target.current_attempt_id != attempt.attempt_id
+            ):
+                raise ExecutionLeaseLostError(
+                    "Attempt is no longer current for its target"
+                )
+            self._record_event_evidence_unlocked(
+                attempt,
+                kind,
+                payload,
+                turn=turn,
+                now=now,
+            )
+
+    async def recovery_evidence(
+        self,
+        target_id: str,
+        *,
+        target_kind: ExecutionTargetKind = ExecutionTargetKind.AGENT_RUN,
+    ) -> RecoveryEvidenceSnapshot:
+        async with self._lock:
+            target = await self._target(target_kind, target_id)
+            return await self._recovery_evidence_unlocked(target)
 
     async def request_cancel(
         self,
@@ -1111,6 +1316,13 @@ class InMemoryExecutionStore:
             now = self._now()
             created_request: ExecutionRequest | None = None
             if decision is RecoveryDecision.RETRY:
+                assert strategy is not None
+                evidence = await self._recovery_evidence_unlocked(target)
+                blockers = evidence.blockers_for(strategy)
+                if blockers:
+                    raise RecoveryGateBlockedError(
+                        _recovery_gate_error(strategy, blockers)
+                    )
                 if (
                     target_kind is ExecutionTargetKind.AGENT_RUN
                     and strategy is RecoveryStrategy.FROM_STAGE
@@ -1142,7 +1354,7 @@ class InMemoryExecutionStore:
                         f"interrupted request for target '{target_id}' was not found"
                     )
                 payload = dict(source.payload)
-                payload["recovery_strategy"] = cast(RecoveryStrategy, strategy).value
+                payload["recovery_strategy"] = strategy.value
                 payload["recovery_operation"] = source.operation.value
                 created_request = ExecutionRequest(
                     target_kind=target_kind,
@@ -1291,9 +1503,22 @@ class InMemoryExecutionStore:
                 raise FlowTransitionError(
                     "Flow checkpoint does not match its pinned Flow definition"
                 )
+            receipt_updates = self._checkpoint_receipt_updates(
+                attempt,
+                checkpoint,
+                now=now,
+            )
             saved = await store.save(
                 checkpoint,
                 expected_revision=target.checkpoint_revision,
+            )
+            self._artifact_receipts.update(
+                {receipt.artifact_id: receipt for receipt in receipt_updates}
+            )
+            self._mark_attempt_evidence_checkpointed(
+                attempt.attempt_id,
+                checkpoint_revision=saved.revision,
+                now=now,
             )
             await store.transition(
                 target.flow_run_id,
@@ -1311,6 +1536,232 @@ class InMemoryExecutionStore:
 
     async def load_flow_checkpoint(self, flow_run_id: str) -> FlowCheckpoint:
         return await self._require_flow_store().load(flow_run_id)
+
+    def _record_event_evidence_unlocked(
+        self,
+        attempt: ExecutionAttempt,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        turn: int | None,
+        now: datetime,
+    ) -> None:
+        if kind == "artifact.created":
+            receipt = _artifact_receipt_from_event(attempt, payload, now=now)
+            existing_receipt = self._artifact_receipts.get(receipt.artifact_id)
+            if existing_receipt is not None:
+                _validate_artifact_receipt_intent(existing_receipt, receipt)
+                return
+            self._artifact_receipts[receipt.artifact_id] = receipt
+            return
+        if kind == "tool.started":
+            evidence = _side_effect_started_from_event(
+                attempt,
+                payload,
+                turn=turn,
+                now=now,
+            )
+            for existing_evidence in self._side_effect_evidence.values():
+                if (
+                    existing_evidence.target_kind is attempt.target_kind
+                    and existing_evidence.target_id == attempt.target_id
+                    and existing_evidence.operation_id == evidence.operation_id
+                ):
+                    _validate_side_effect_intent(existing_evidence, evidence)
+            matching_evidence = self._side_effect_evidence.get(evidence.evidence_id)
+            if matching_evidence is not None:
+                _validate_side_effect_intent(matching_evidence, evidence)
+                return
+            self._side_effect_evidence[evidence.evidence_id] = evidence
+            return
+        if kind in {"tool.waiting", "tool.completed"}:
+            operation_id = _optional_payload_string(payload, "operation_id")
+            if operation_id is None:
+                return
+            evidence_id = _side_effect_evidence_id(operation_id, attempt.attempt_id)
+            started_evidence = self._side_effect_evidence.get(evidence_id)
+            if started_evidence is None:
+                if kind != "tool.completed":
+                    raise ExecutionRequestConflictError(
+                        f"Tool operation '{operation_id}' has no current started evidence"
+                    )
+                started_evidence = _resumable_side_effect_evidence(
+                    self._side_effect_evidence.values(),
+                    attempt,
+                    operation_id,
+                )
+            status, result_status = _side_effect_completion_status(kind, payload)
+            self._side_effect_evidence[started_evidence.evidence_id] = (
+                started_evidence.model_copy(
+                update={
+                    "status": status,
+                    "result_status": result_status,
+                    "completed_at": (now if kind == "tool.completed" else None),
+                    "resolved_by_attempt_id": (
+                        attempt.attempt_id
+                        if started_evidence.execution_attempt_id != attempt.attempt_id
+                        else started_evidence.resolved_by_attempt_id
+                    ),
+                    "resolution_fencing_token": (
+                        attempt.fencing_token
+                        if started_evidence.execution_attempt_id != attempt.attempt_id
+                        else started_evidence.resolution_fencing_token
+                    ),
+                    "updated_at": now,
+                }
+                )
+            )
+            return
+        if kind in {"run.waiting", "execution.child.waiting"}:
+            checkpoint_revision = payload.get("checkpoint_revision")
+            if isinstance(checkpoint_revision, int) and not isinstance(
+                checkpoint_revision, bool
+            ):
+                self._mark_attempt_evidence_checkpointed(
+                    attempt.attempt_id,
+                    checkpoint_revision=checkpoint_revision,
+                    now=now,
+                )
+
+    def _checkpoint_receipt_updates(
+        self,
+        attempt: ExecutionAttempt,
+        checkpoint: FlowCheckpoint,
+        *,
+        now: datetime,
+    ) -> tuple[ArtifactReceipt, ...]:
+        artifacts = _checkpoint_artifacts(checkpoint)
+        if {artifact.id for artifact in artifacts} != set(checkpoint.artifact_ids):
+            raise FlowTransitionError(
+                "Flow checkpoint Artifact ids do not match its verified Artifact metadata"
+            )
+        updates: list[ArtifactReceipt] = []
+        for artifact in artifacts:
+            if artifact.flow_run_id != attempt.target_id:
+                raise FlowTransitionError(
+                    f"Artifact '{artifact.id}' does not belong to the Flow Run"
+                )
+            pending = _artifact_receipt_from_artifact(attempt, artifact, now=now)
+            existing = self._artifact_receipts.get(artifact.id)
+            if existing is not None:
+                _validate_artifact_receipt_intent(existing, pending)
+                pending = existing
+            updates.append(
+                pending.model_copy(
+                    update={
+                        "status": ArtifactReceiptStatus.VERIFIED,
+                        "checkpoint_revision": (
+                            pending.checkpoint_revision or checkpoint.revision
+                        ),
+                        "verification_detail": "host_checkpoint",
+                        "verified_at": pending.verified_at or now,
+                    }
+                )
+            )
+        return tuple(updates)
+
+    def _mark_attempt_evidence_checkpointed(
+        self,
+        attempt_id: str,
+        *,
+        checkpoint_revision: int,
+        now: datetime,
+    ) -> None:
+        for evidence_id, evidence in tuple(self._side_effect_evidence.items()):
+            if (
+                evidence.execution_attempt_id == attempt_id
+                and evidence.checkpoint_revision is None
+            ):
+                self._side_effect_evidence[evidence_id] = evidence.model_copy(
+                    update={
+                        "checkpoint_revision": checkpoint_revision,
+                        "updated_at": now,
+                    }
+                )
+
+    def _mark_open_side_effects_unknown(
+        self,
+        attempt_id: str,
+        *,
+        now: datetime,
+    ) -> None:
+        for evidence_id, evidence in tuple(self._side_effect_evidence.items()):
+            if (
+                evidence.execution_attempt_id == attempt_id
+                and evidence.status
+                in {SideEffectStatus.STARTED, SideEffectStatus.WAITING}
+            ):
+                self._side_effect_evidence[evidence_id] = evidence.model_copy(
+                    update={
+                        "status": SideEffectStatus.UNKNOWN,
+                        "result_status": "execution_interrupted",
+                        "completed_at": now,
+                        "updated_at": now,
+                    }
+                )
+
+    async def _recovery_evidence_unlocked(
+        self,
+        target: AgentRunRecord | FlowRunRecord,
+    ) -> RecoveryEvidenceSnapshot:
+        target_kind = (
+            ExecutionTargetKind.AGENT_RUN
+            if isinstance(target, AgentRunRecord)
+            else ExecutionTargetKind.FLOW_RUN
+        )
+        target_id = target.run_id if isinstance(target, AgentRunRecord) else target.flow_run_id
+        receipts = tuple(
+            sorted(
+                (
+                    receipt.model_copy(deep=True)
+                    for receipt in self._artifact_receipts.values()
+                    if receipt.target_kind is target_kind
+                    and receipt.target_id == target_id
+                ),
+                key=lambda receipt: (receipt.recorded_at, receipt.artifact_id),
+            )
+        )
+        effects = tuple(
+            sorted(
+                (
+                    evidence.model_copy(deep=True)
+                    for evidence in self._side_effect_evidence.values()
+                    if evidence.target_kind is target_kind
+                    and evidence.target_id == target_id
+                ),
+                key=lambda evidence: (evidence.started_at, evidence.evidence_id),
+            )
+        )
+        checkpoint: FlowCheckpoint | None = None
+        checkpoint_error: str | None = None
+        if isinstance(target, FlowRunRecord) and target.checkpoint_revision is not None:
+            try:
+                checkpoint = await self._require_flow_store().load(target_id)
+            except FlowCheckpointNotFoundError:
+                checkpoint_error = "durable Flow checkpoint was not found"
+            else:
+                if checkpoint.revision != target.checkpoint_revision:
+                    checkpoint_error = (
+                        "Flow checkpoint revision does not match the logical Flow Run"
+                    )
+        blockers = _recovery_strategy_blockers(
+            target,
+            receipts=receipts,
+            side_effects=effects,
+            checkpoint=checkpoint,
+            checkpoint_error=checkpoint_error,
+        )
+        return RecoveryEvidenceSnapshot(
+            target_kind=target_kind,
+            target_id=target_id,
+            checkpoint_revision=target.checkpoint_revision,
+            checkpoint_stage=(
+                target.checkpoint_stage if isinstance(target, FlowRunRecord) else None
+            ),
+            artifact_receipts=receipts,
+            side_effect_evidence=effects,
+            strategy_blockers=blockers,
+        )
 
     async def _emit_cancelled(
         self,
@@ -1340,6 +1791,7 @@ class InMemoryExecutionStore:
         reason_code: str,
     ) -> AgentRunRecord | FlowRunRecord:
         now = self._now()
+        self._mark_open_side_effects_unknown(attempt.attempt_id, now=now)
         ended = attempt.model_copy(
             update={
                 "status": attempt_status,
@@ -1481,6 +1933,392 @@ class InMemoryExecutionStore:
         if value.tzinfo is None:
             raise ValueError("ExecutionStore clock must return a timezone-aware datetime")
         return value.astimezone(UTC)
+
+
+def _artifact_receipt_from_event(
+    attempt: ExecutionAttempt,
+    payload: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> ArtifactReceipt:
+    flow_run_id = _optional_payload_string(payload, "flow_run_id")
+    if (
+        attempt.target_kind is ExecutionTargetKind.FLOW_RUN
+        and flow_run_id != attempt.target_id
+    ):
+        raise ExecutionRequestConflictError(
+            "Artifact receipt does not belong to the fenced Flow Run"
+        )
+    return ArtifactReceipt(
+        artifact_id=_required_payload_string(payload, "artifact_id"),
+        target_kind=attempt.target_kind,
+        target_id=attempt.target_id,
+        execution_attempt_id=attempt.attempt_id,
+        fencing_token=attempt.fencing_token,
+        name=_required_payload_string(payload, "name"),
+        media_type=_required_payload_string(payload, "media_type"),
+        size_bytes=_required_payload_int(payload, "size_bytes", minimum=0),
+        sha256=_required_payload_string(payload, "sha256"),
+        producer_run_id=_required_payload_string(payload, "producer_run_id"),
+        producer_agent_id=_required_payload_string(payload, "producer_agent_id"),
+        flow_run_id=flow_run_id,
+        invocation_id=_optional_payload_string(payload, "invocation_id"),
+        stage=_optional_payload_string(payload, "stage"),
+        step_id=_optional_payload_string(payload, "step_id"),
+        stage_attempt=_optional_payload_int(payload, "attempt", minimum=1),
+        tool_call_id=_optional_payload_string(payload, "tool_call_id"),
+        location=_optional_payload_string(payload, "location"),
+        source_artifact_ids=_payload_string_tuple(payload, "source_artifact_ids"),
+        recorded_at=now,
+    )
+
+
+def _artifact_receipt_from_artifact(
+    attempt: ExecutionAttempt,
+    artifact: Artifact,
+    *,
+    now: datetime,
+) -> ArtifactReceipt:
+    return ArtifactReceipt(
+        artifact_id=artifact.id,
+        target_kind=attempt.target_kind,
+        target_id=attempt.target_id,
+        execution_attempt_id=attempt.attempt_id,
+        fencing_token=attempt.fencing_token,
+        name=artifact.name,
+        media_type=artifact.media_type,
+        size_bytes=artifact.size_bytes,
+        sha256=artifact.sha256,
+        producer_run_id=artifact.run_id,
+        producer_agent_id=artifact.agent_id,
+        flow_run_id=artifact.flow_run_id,
+        invocation_id=artifact.invocation_id,
+        stage=artifact.stage,
+        step_id=artifact.step_id,
+        stage_attempt=artifact.attempt,
+        tool_call_id=artifact.tool_call_id,
+        location=artifact.location,
+        source_artifact_ids=artifact.source_artifact_ids,
+        recorded_at=now,
+    )
+
+
+def _validate_artifact_receipt_intent(
+    existing: ArtifactReceipt,
+    proposed: ArtifactReceipt,
+) -> None:
+    immutable_fields = (
+        "target_kind",
+        "target_id",
+        "artifact_id",
+        "name",
+        "media_type",
+        "size_bytes",
+        "sha256",
+        "producer_run_id",
+        "producer_agent_id",
+        "flow_run_id",
+        "invocation_id",
+        "stage",
+        "step_id",
+        "stage_attempt",
+        "tool_call_id",
+        "location",
+        "source_artifact_ids",
+    )
+    if any(getattr(existing, field) != getattr(proposed, field) for field in immutable_fields):
+        raise ExecutionRequestConflictError(
+            f"Artifact receipt '{proposed.artifact_id}' changed immutable metadata"
+        )
+
+
+def _side_effect_started_from_event(
+    attempt: ExecutionAttempt,
+    payload: Mapping[str, Any],
+    *,
+    turn: int | None,
+    now: datetime,
+) -> SideEffectEvidence:
+    operation_id = _required_payload_string(payload, "operation_id")
+    idempotency_key = _required_payload_string(payload, "idempotency_key")
+    if operation_id != idempotency_key:
+        raise ExecutionRequestConflictError(
+            "Tool operation_id and idempotency_key must identify the same intent"
+        )
+    return SideEffectEvidence(
+        evidence_id=_side_effect_evidence_id(operation_id, attempt.attempt_id),
+        target_kind=attempt.target_kind,
+        target_id=attempt.target_id,
+        execution_attempt_id=attempt.attempt_id,
+        fencing_token=attempt.fencing_token,
+        operation_id=operation_id,
+        idempotency_key=idempotency_key,
+        intent_sha256=_required_payload_string(payload, "intent_sha256"),
+        tool_call_id=_required_payload_string(payload, "tool_call_id"),
+        tool_name=_required_payload_string(payload, "tool_name"),
+        side_effect=SideEffect(_required_payload_string(payload, "side_effect")),
+        status=SideEffectStatus.STARTED,
+        stage=_optional_payload_string(payload, "stage"),
+        step_id=_optional_payload_string(payload, "step_id"),
+        stage_attempt=_optional_payload_int(payload, "attempt", minimum=1),
+        turn=turn,
+        started_at=now,
+        updated_at=now,
+    )
+
+
+def _validate_side_effect_intent(
+    existing: SideEffectEvidence,
+    proposed: SideEffectEvidence,
+) -> None:
+    if (
+        existing.target_kind is not proposed.target_kind
+        or existing.target_id != proposed.target_id
+        or existing.operation_id != proposed.operation_id
+        or existing.idempotency_key != proposed.idempotency_key
+        or existing.intent_sha256 != proposed.intent_sha256
+        or existing.tool_name != proposed.tool_name
+        or existing.side_effect is not proposed.side_effect
+    ):
+        raise ExecutionRequestConflictError(
+            f"Tool operation '{proposed.operation_id}' changed intent"
+        )
+
+
+def _resumable_side_effect_evidence(
+    evidence_records: Collection[SideEffectEvidence],
+    attempt: ExecutionAttempt,
+    operation_id: str,
+) -> SideEffectEvidence:
+    candidates = [
+        evidence
+        for evidence in evidence_records
+        if evidence.target_kind is attempt.target_kind
+        and evidence.target_id == attempt.target_id
+        and evidence.operation_id == operation_id
+        and evidence.checkpoint_revision is not None
+        and (
+            evidence.status is SideEffectStatus.WAITING
+            or evidence.resolved_by_attempt_id == attempt.attempt_id
+        )
+    ]
+    if not candidates:
+        raise ExecutionRequestConflictError(
+            f"Tool operation '{operation_id}' completed without resumable evidence"
+        )
+    return max(candidates, key=lambda evidence: evidence.updated_at)
+
+
+def _side_effect_completion_status(
+    kind: str,
+    payload: Mapping[str, Any],
+) -> tuple[SideEffectStatus, str | None]:
+    if kind == "tool.waiting":
+        return SideEffectStatus.WAITING, "waiting"
+    result_status = _optional_payload_string(payload, "status")
+    if result_status == "success":
+        return SideEffectStatus.SUCCEEDED, result_status
+    if result_status == "cancelled":
+        return SideEffectStatus.CANCELLED, result_status
+    if result_status in {"timeout", "error"}:
+        return SideEffectStatus.UNKNOWN, result_status
+    return SideEffectStatus.FAILED, result_status
+
+
+def _side_effect_evidence_id(operation_id: str, attempt_id: str) -> str:
+    digest = hashlib.sha256(f"{operation_id}:{attempt_id}".encode()).hexdigest()
+    return f"effect:{digest}"
+
+
+def _checkpoint_artifacts(checkpoint: FlowCheckpoint) -> tuple[Artifact, ...]:
+    key = (
+        "accepted_artifacts"
+        if checkpoint.flow_kind.value == "sequential"
+        else "selected_artifacts"
+    )
+    payload = checkpoint.cursor.get(key, [])
+    if not isinstance(payload, list):
+        raise FlowTransitionError(
+            f"Flow checkpoint '{key}' must contain verified Artifact metadata"
+        )
+    adapter = TypeAdapter(Artifact)
+    try:
+        artifacts = tuple(adapter.validate_python(item) for item in payload)
+    except Exception as exc:
+        raise FlowTransitionError(
+            "Flow checkpoint contains invalid verified Artifact metadata"
+        ) from exc
+    if len({artifact.id for artifact in artifacts}) != len(artifacts):
+        raise FlowTransitionError("Flow checkpoint contains duplicate Artifact ids")
+    return artifacts
+
+
+def _recovery_strategy_blockers(
+    target: AgentRunRecord | FlowRunRecord,
+    *,
+    receipts: tuple[ArtifactReceipt, ...],
+    side_effects: tuple[SideEffectEvidence, ...],
+    checkpoint: FlowCheckpoint | None,
+    checkpoint_error: str | None,
+) -> dict[RecoveryStrategy, tuple[RecoveryGateBlocker, ...]]:
+    by_artifact_id = {receipt.artifact_id: receipt for receipt in receipts}
+    blockers: dict[RecoveryStrategy, tuple[RecoveryGateBlocker, ...]] = {}
+    for strategy in RecoveryStrategy:
+        current: list[RecoveryGateBlocker] = []
+        uses_checkpoint = strategy is not RecoveryStrategy.RESTART
+        if uses_checkpoint and target.checkpoint_revision is None:
+            current.append(
+                RecoveryGateBlocker(
+                    code="checkpoint_missing",
+                    detail="the recovery strategy requires a durable checkpoint",
+                )
+            )
+        if strategy is RecoveryStrategy.FROM_STAGE:
+            if not isinstance(target, FlowRunRecord):
+                current.append(
+                    RecoveryGateBlocker(
+                        code="stage_recovery_unsupported",
+                        detail="Agent Runs do not support from_stage recovery",
+                    )
+                )
+            elif target.checkpoint_stage is None:
+                current.append(
+                    RecoveryGateBlocker(
+                        code="checkpoint_stage_missing",
+                        detail="the Flow checkpoint has no durable Stage boundary",
+                    )
+                )
+        if uses_checkpoint and checkpoint_error is not None:
+            current.append(
+                RecoveryGateBlocker(
+                    code="checkpoint_invalid",
+                    detail=checkpoint_error,
+                )
+            )
+        if uses_checkpoint and checkpoint is not None:
+            for artifact_id in checkpoint.artifact_ids:
+                receipt = by_artifact_id.get(artifact_id)
+                if receipt is None:
+                    current.append(
+                        RecoveryGateBlocker(
+                            code="artifact_receipt_missing",
+                            detail=(
+                                f"checkpoint Artifact '{artifact_id}' has no persisted receipt"
+                            ),
+                            artifact_id=artifact_id,
+                        )
+                    )
+                    continue
+                if (
+                    receipt.status is not ArtifactReceiptStatus.VERIFIED
+                    or receipt.checkpoint_revision is None
+                    or receipt.checkpoint_revision > checkpoint.revision
+                ):
+                    current.append(
+                        RecoveryGateBlocker(
+                            code="artifact_not_verified",
+                            detail=(
+                                f"checkpoint Artifact '{artifact_id}' is not Host-verified"
+                            ),
+                            artifact_id=artifact_id,
+                        )
+                    )
+        for evidence in side_effects:
+            covered_by_checkpoint = (
+                target.checkpoint_revision is not None
+                and evidence.checkpoint_revision is not None
+                and evidence.checkpoint_revision <= target.checkpoint_revision
+            )
+            if uses_checkpoint and covered_by_checkpoint:
+                continue
+            if evidence.side_effect is SideEffect.READ_ONLY:
+                continue
+            if evidence.side_effect is SideEffect.IDEMPOTENT:
+                continue
+            current.append(
+                RecoveryGateBlocker(
+                    code="unsafe_side_effect_replay",
+                    detail=(
+                        f"{evidence.side_effect.value} Tool '{evidence.tool_name}' "
+                        f"has {evidence.status.value} evidence outside the recovery boundary"
+                    ),
+                    evidence_id=evidence.evidence_id,
+                    operation_id=evidence.operation_id,
+                )
+            )
+        blockers[strategy] = tuple(current)
+    return blockers
+
+
+def _recovery_gate_error(
+    strategy: RecoveryStrategy,
+    blockers: tuple[RecoveryGateBlocker, ...],
+) -> str:
+    codes = ", ".join(blocker.code for blocker in blockers[:5])
+    suffix = "" if len(blockers) <= 5 else f" (+{len(blockers) - 5} more)"
+    return f"recovery strategy '{strategy.value}' is blocked by evidence: {codes}{suffix}"
+
+
+def _required_payload_string(payload: Mapping[str, Any], key: str) -> str:
+    value = _optional_payload_string(payload, key)
+    if value is None:
+        raise ExecutionRequestConflictError(f"evidence payload requires '{key}'")
+    return value
+
+
+def _optional_payload_string(payload: Mapping[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ExecutionRequestConflictError(
+            f"evidence payload '{key}' must be a non-blank string"
+        )
+    return value
+
+
+def _required_payload_int(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    minimum: int,
+) -> int:
+    value = _optional_payload_int(payload, key, minimum=minimum)
+    if value is None:
+        raise ExecutionRequestConflictError(f"evidence payload requires '{key}'")
+    return value
+
+
+def _optional_payload_int(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    minimum: int,
+) -> int | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ExecutionRequestConflictError(
+            f"evidence payload '{key}' must be an integer >= {minimum}"
+        )
+    return value
+
+
+def _payload_string_tuple(payload: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    value = payload.get(key, ())
+    if not isinstance(value, (list, tuple)) or any(
+        not isinstance(item, str) or not item.strip() for item in value
+    ):
+        raise ExecutionRequestConflictError(
+            f"evidence payload '{key}' must contain non-blank strings"
+        )
+    result = tuple(value)
+    if len(set(result)) != len(result):
+        raise ExecutionRequestConflictError(
+            f"evidence payload '{key}' must not contain duplicates"
+        )
+    return result
 
 
 def _active_attempt(attempt: ExecutionAttempt) -> bool:
