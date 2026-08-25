@@ -506,7 +506,7 @@ API/Executor 分离、Supervisor/Child 隔离、ExecutionAttempt 状态细分、
 reconcile 和人工恢复接口见 [`EXECUTOR_DESIGN.md`](EXECUTOR_DESIGN.md)。同一个
 `ExecutionWorker` 已可按 `target_kind` 分派 Agent/Flow Handler；二者共享 PostgreSQL 执行面，
 默认仍使用兼容的本地执行模式。Artifact receipt、side-effect evidence 与细粒度恢复门禁已经
-落地；并发/背压和 checkpoint migration 仍按后续阶段推进。
+落地；单 Worker bounded concurrency 已支持，背压/配额和 checkpoint migration 仍按后续阶段推进。
 
 当前 Provider 契约、OpenAI-compatible Adapter、错误分类和验收命令见
 [`PROVIDERS.md`](PROVIDERS.md)。
@@ -535,6 +535,7 @@ reconcile 和人工恢复接口见 [`EXECUTOR_DESIGN.md`](EXECUTOR_DESIGN.md)。
   `LocalRunExecutor`；过期 `RUNNING` 转为 `BLOCKED`，不自动重放；
 - 内存/PostgreSQL `FlowRunStore/FlowCheckpoint`，以及 Agent/Flow 共用的 queued
   `ExecutionWorker`、Attempt lease、fencing 和 Operator recovery；
+- 单 Worker 有界监管多个 Child Attempt，各自独立 heartbeat/cancel/settlement；
 - queued 执行面的 verified Artifact receipt、side-effect evidence、稳定 Tool operation identity
   与逐策略恢复门禁；
 - 默认内存 `EventStore`、可替换持久历史和可选 `EventStream` 契约；

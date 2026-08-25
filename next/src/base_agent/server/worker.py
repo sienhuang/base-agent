@@ -1,4 +1,4 @@
-"""Independent Worker Supervisor with one subprocess per ExecutionAttempt."""
+"""Independent Worker Supervisor with bounded subprocess concurrency."""
 
 from __future__ import annotations
 
@@ -258,6 +258,12 @@ class FlowExecutionHandler:
         )
 
 
+@dataclass(slots=True)
+class _ActiveExecution:
+    process: asyncio.subprocess.Process
+    lease: ExecutionLease
+
+
 class ExecutionWorker:
     """Supervise registered execution target handlers with shared Attempt leases."""
 
@@ -274,6 +280,7 @@ class ExecutionWorker:
         heartbeat_interval_seconds: float = 10.0,
         poll_interval_seconds: float = 0.5,
         reconcile_interval_seconds: float = 5.0,
+        max_concurrent_attempts: int = 1,
         child_env_remove: Sequence[str] = (),
         child_env_overrides: Mapping[str, str] | None = None,
     ) -> None:
@@ -301,6 +308,8 @@ class ExecutionWorker:
             raise ValueError("heartbeat interval must be positive and shorter than the lease")
         if poll_interval_seconds <= 0 or reconcile_interval_seconds <= 0:
             raise ValueError("poll and reconcile intervals must be greater than zero")
+        if max_concurrent_attempts < 1:
+            raise ValueError("max_concurrent_attempts must be greater than zero")
         self.execution_store = execution_store
         self.handlers = {
             handler.target_kind: handler for handler in resolved_handlers
@@ -314,6 +323,7 @@ class ExecutionWorker:
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.poll_interval_seconds = poll_interval_seconds
         self.reconcile_interval_seconds = reconcile_interval_seconds
+        self.max_concurrent_attempts = max_concurrent_attempts
         self.child_env_remove = tuple(child_env_remove)
         self.child_env_overrides = dict(child_env_overrides or {})
         if any(not name.strip() or "=" in name for name in self.child_env_remove):
@@ -324,43 +334,68 @@ class ExecutionWorker:
         ):
             raise ValueError("child_env_overrides keys must be environment variable names")
         self._stopping = asyncio.Event()
-        self._active_process: asyncio.subprocess.Process | None = None
-        self._active_lease: ExecutionLease | None = None
+        self._active: dict[str, _ActiveExecution] = {}
+
+    @property
+    def active_attempt_count(self) -> int:
+        return len(self._active)
 
     async def run_forever(self) -> None:
-        """Poll until close() requests a graceful Worker shutdown."""
+        """Fill free execution slots until close() requests a graceful shutdown."""
         loop = asyncio.get_running_loop()
         next_reconcile = loop.time()
-        while not self._stopping.is_set():
-            if loop.time() >= next_reconcile:
-                await self.reconcile()
-                next_reconcile = loop.time() + self.reconcile_interval_seconds
-            claimed = await self.execution_store.claim_next(
-                owner_id=self.owner_id,
-                runtime_route=self.runtime_route,
-                runtime_build_id=self.runtime_build_id,
-                lease_seconds=self.lease_seconds,
-                target_kinds=self.handlers,
-            )
-            if claimed is None:
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        self._stopping.wait(),
-                        timeout=self.poll_interval_seconds,
+        tasks: set[asyncio.Task[None]] = set()
+        try:
+            while not self._stopping.is_set():
+                completed = {task for task in tasks if task.done()}
+                tasks.difference_update(completed)
+                for task in completed:
+                    task.result()
+
+                now = loop.time()
+                if now >= next_reconcile:
+                    await self.reconcile()
+                    next_reconcile = loop.time() + self.reconcile_interval_seconds
+
+                queue_empty = False
+                while (
+                    not self._stopping.is_set()
+                    and len(tasks) < self.max_concurrent_attempts
+                ):
+                    claimed = await self._claim_next()
+                    if claimed is None:
+                        queue_empty = True
+                        break
+                    tasks.add(
+                        asyncio.create_task(
+                            self._execute_safely(claimed),
+                            name=f"execution-attempt:{claimed.attempt.attempt_id}",
+                        )
                     )
-                continue
-            await self._execute_safely(claimed)
+
+                if self._stopping.is_set():
+                    break
+                timeout = min(
+                    self.poll_interval_seconds,
+                    max(0.0, next_reconcile - loop.time()),
+                )
+                if not queue_empty and len(tasks) < self.max_concurrent_attempts:
+                    await asyncio.sleep(0)
+                    continue
+                await self._wait_for_progress(tasks, wait_seconds=timeout)
+        except BaseException:
+            await self.close()
+            raise
+        finally:
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run_once(self) -> bool:
         """Claim and finish at most one request; useful for tests and jobs."""
+        if self._stopping.is_set() or self.active_attempt_count >= self.max_concurrent_attempts:
+            return False
         await self.reconcile()
-        claimed = await self.execution_store.claim_next(
-            owner_id=self.owner_id,
-            runtime_route=self.runtime_route,
-            runtime_build_id=self.runtime_build_id,
-            lease_seconds=self.lease_seconds,
-            target_kinds=self.handlers,
-        )
+        claimed = await self._claim_next()
         if claimed is None:
             return False
         await self._execute_safely(claimed)
@@ -370,13 +405,52 @@ class ExecutionWorker:
         await self.execution_store.reconcile_expired()
 
     async def close(self) -> None:
-        """Stop claiming and hand an active Attempt to explicit recovery."""
+        """Stop claiming and hand every active Attempt to explicit recovery."""
         self._stopping.set()
-        process = self._active_process
-        lease = self._active_lease
-        if process is None or lease is None:
+        active = tuple(self._active.values())
+        if not active:
             return
-        await _terminate_process(process)
+        await asyncio.gather(
+            *(_terminate_process(item.process) for item in active)
+        )
+        await asyncio.gather(
+            *(
+                self._interrupt_for_shutdown(item.lease)
+                for item in active
+            )
+        )
+
+    async def _claim_next(self) -> ClaimedExecution | None:
+        return await self.execution_store.claim_next(
+            owner_id=self.owner_id,
+            runtime_route=self.runtime_route,
+            runtime_build_id=self.runtime_build_id,
+            lease_seconds=self.lease_seconds,
+            target_kinds=self.handlers,
+        )
+
+    async def _wait_for_progress(
+        self,
+        tasks: set[asyncio.Task[None]],
+        *,
+        wait_seconds: float,
+    ) -> None:
+        stop_task = asyncio.create_task(
+            self._stopping.wait(),
+            name="execution-worker-stop-wait",
+        )
+        try:
+            await asyncio.wait(
+                (*tasks, stop_task),
+                timeout=wait_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            if not stop_task.done():
+                stop_task.cancel()
+                await asyncio.gather(stop_task, return_exceptions=True)
+
+    async def _interrupt_for_shutdown(self, lease: ExecutionLease) -> None:
         with suppress(ExecutionLeaseLostError):
             await self.execution_store.interrupt(
                 lease,
@@ -391,7 +465,7 @@ class ExecutionWorker:
         except Exception:
             with suppress(ExecutionLeaseLostError):
                 await self.execution_store.interrupt(
-                    self._active_lease or claimed.lease,
+                    self._current_lease(claimed),
                     reason_code="supervisor_error",
                 )
             raise
@@ -411,9 +485,15 @@ class ExecutionWorker:
             env=child_environment,
         )
         lease = claimed.lease
-        self._active_process = process
-        self._active_lease = lease
+        self._active[lease.attempt_id] = _ActiveExecution(
+            process=process,
+            lease=lease,
+        )
         try:
+            if self._stopping.is_set():
+                await _terminate_process(process)
+                await self._interrupt_for_shutdown(lease)
+                return
             await self.execution_store.mark_started(lease, child_pid=process.pid)
             child_input = json.dumps(
                 handler.child_input(claimed, lease),
@@ -430,6 +510,9 @@ class ExecutionWorker:
                 )
                 if communicate in done:
                     stdout, stderr = await communicate
+                    if self._stopping.is_set():
+                        await self._interrupt_for_shutdown(current_lease)
+                        return
                     await self._settle_child(
                         claimed,
                         current_lease,
@@ -448,7 +531,9 @@ class ExecutionWorker:
                     await _terminate_process(process)
                     return
                 current_lease = heartbeat.lease
-                self._active_lease = current_lease
+                active = self._active.get(lease.attempt_id)
+                if active is not None and active.process is process:
+                    active.lease = current_lease
                 if heartbeat.cancel_requested:
                     await _terminate_process(process)
                     communicate.cancel()
@@ -460,13 +545,18 @@ class ExecutionWorker:
             await _terminate_process(process)
             with suppress(ExecutionLeaseLostError):
                 await self.execution_store.interrupt(
-                    self._active_lease or lease,
+                    self._current_lease(claimed),
                     reason_code="worker_shutdown",
                 )
             raise
         finally:
-            self._active_process = None
-            self._active_lease = None
+            active = self._active.get(lease.attempt_id)
+            if active is not None and active.process is process:
+                self._active.pop(lease.attempt_id, None)
+
+    def _current_lease(self, claimed: ClaimedExecution) -> ExecutionLease:
+        active = self._active.get(claimed.attempt.attempt_id)
+        return claimed.lease if active is None else active.lease
 
     async def _settle_child(
         self,

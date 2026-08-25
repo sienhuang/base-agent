@@ -1,6 +1,6 @@
 # Next Steps
 
-更新时间：2026-08-24
+更新时间：2026-08-25
 
 ## 当前共识
 
@@ -41,9 +41,14 @@ Phase C 最后一项已经完成：
 
 ## 下一步：Phase D
 
-Phase D 优先顺序为：
+Phase D 已完成第一项中的 Worker bounded concurrency：Core 提供
+`max_concurrent_attempts`（兼容默认 1），Starter 通过
+`AGENT_WORKER_MAX_CONCURRENCY=10` 默认监管最多 10 个 Attempt。每个 Child 独立续租、取消和
+结算，Worker shutdown 会处理全部活动 Attempt；并发上限、接力领取和批量 shutdown 已有测试。
 
-1. bounded concurrency、backpressure 和配额；
+接下来优先顺序为：
+
+1. 队列 backpressure 和配额；
 2. drain deadline、Tool/Run/progress timeout；
 3. metrics、tracing 和告警；
 4. 可选外部 broker Adapter；

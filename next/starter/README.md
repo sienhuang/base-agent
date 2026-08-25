@@ -266,6 +266,7 @@ AGENT_RUN_LEASE_SECONDS=30
 AGENT_RUN_HEARTBEAT_SECONDS=10
 AGENT_WORKER_POLL_SECONDS=0.5
 AGENT_WORKER_RECONCILE_SECONDS=5
+AGENT_WORKER_MAX_CONCURRENCY=10
 ```
 
 分别启动 API 和 Worker。Operator token 只提供给 API，Worker 启动和 child 环境不需要该权限：
@@ -280,8 +281,11 @@ uv run --project next/starter --extra postgres execution-worker
 
 `agent-worker` 作为兼容入口仍可使用。`POST /v1/runs` 和 `POST /v1/flows/plan-react` 此时都返回
 `queued`。同一个 Worker 从同一张 request 表领取任务，再按 `target_kind=agent_run|flow_run`
-分派给 Agent 或 Flow Handler；每个 Attempt 启动隔离 child。Supervisor 在 child 外续租，所以
-child 内同步阻塞的 Tool 不会阻塞 heartbeat。child Event 会携带 `execution_attempt_id`，
+分派给 Agent 或 Flow Handler；每个 Attempt 启动隔离 child。`AGENT_WORKER_MAX_CONCURRENCY` 默认
+为 10，Worker 只按空闲槽位 claim，并为每个活动 Attempt 独立维护 heartbeat、取消和结算；Core
+直接组合 `ExecutionWorker` 时仍默认 1，避免改变已有部署容量。Supervisor 在 child 外续租，所以
+任一 child 内同步阻塞的 Tool 不会阻塞其他 Attempt 的 heartbeat。Worker shutdown 会停止 claim、
+终止全部活动 child，并将它们分别转为 `recovery_required(reason=worker_shutdown)`。child Event 会携带 `execution_attempt_id`，
 PostgreSQL EventStore 在同一事务校验 fencing token 后才接受 Event。
 
 同一事务还会把 `artifact.created` 投影为 receipt，并把 `tool.started/waiting/completed` 投影为

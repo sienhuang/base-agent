@@ -3,8 +3,8 @@
 实现状态（2026-08-24）：Phase A、Phase B 与 Phase C 已落地。Agent/Flow 共用
 ExecutionRequest、ExecutionAttempt、lease、fencing 与 recovery decision；同一个
 `ExecutionWorker` 按 `target_kind` 分派 Agent/Flow Handler，不再建设独立 flow-worker 基础设施。
-共享 Artifact receipt、side-effect evidence 和细粒度恢复门禁已经进入内存/PostgreSQL 执行面；
-bounded concurrency、backpressure 和 checkpoint migration 仍属于后续阶段。默认执行模式继续是
+共享 Artifact receipt、side-effect evidence、细粒度恢复门禁和 Worker bounded concurrency 已经
+进入执行面；队列 backpressure、配额和 checkpoint migration 仍属于后续阶段。默认执行模式继续是
 本地模式。
 
 ## 1. 目标与明确决策
@@ -87,7 +87,7 @@ FastAPI 滚动发布不会停止 Execution Child，也不会影响 Supervisor he
 
 Supervisor 是 Worker Pod 的主进程，负责且只负责执行控制：
 
-- 用 `FOR UPDATE SKIP LOCKED` 领取一个可执行 request；
+- 只按空闲执行槽位用 `FOR UPDATE SKIP LOCKED` 领取可执行 request；
 - 原子创建新的 ExecutionAttempt、分配 fencing token、推进逻辑状态；
 - 在独立于 Child 的调度循环中更新 heartbeat；
 - 监听 Child 的 IPC 消息并执行带 fencing 的状态/Event 提交；
@@ -117,8 +117,10 @@ Supervisor 在持有当前 fencing token 时才接受并持久化消息。旧 Ch
 永久卡死时 lease 仍会续租，因此必须另外使用 Tool timeout、Run deadline 或 progress
 deadline，不能用 lease 代替执行超时。
 
-第一版每个 Worker 可以只并发一个 Child，后续再增加有界并发；并发数属于部署容量配置，
-不进入 Agent Prompt 或 Definition。
+每个 Worker 用 `max_concurrent_attempts` 限制同时监管的 Child 数量；每个 Child 都有独立的
+ExecutionAttempt、lease heartbeat、取消和结算循环。Core 默认值为 1 以兼容已有组合，Starter
+通过 `AGENT_WORKER_MAX_CONCURRENCY` 配置，默认 10。Worker 只在存在空闲槽位时 claim；shutdown
+停止领取并中断全部活动 Attempt。并发数属于部署容量配置，不进入 Agent Prompt 或 Definition。
 
 ## 3. 三层状态，不再混用
 
@@ -640,11 +642,12 @@ execution-worker → claim → target_kind Handler → RUNNING
 
 ### Phase D：生产强化
 
-1. bounded concurrency、backpressure 和配额；
-2. drain deadline、Tool/Run/progress timeout；
-3. metrics/tracing/告警；
-4. 可选外部 broker Adapter；
-5. checkpoint migration 与旧 Runtime 保留策略。
+1. [x] 单 Worker bounded concurrency 与多 Attempt 独立监管；
+2. [ ] 队列 backpressure 和配额；
+3. [ ] drain deadline、Tool/Run/progress timeout；
+4. [ ] metrics/tracing/告警；
+5. [ ] 可选外部 broker Adapter；
+6. [ ] checkpoint migration 与旧 Runtime 保留策略。
 
 ## 14. 验收场景
 
@@ -666,7 +669,8 @@ execution-worker → claim → target_kind Handler → RUNNING
 13. 未被 checkpoint 覆盖的 mutating/unknown 操作阻止重放，read-only 和 intent 一致的 idempotent
     操作允许重放；
 14. WAITING 操作可由新 Attempt 结算，但旧 fencing token 仍不能写 Event 或证据；
-15. 没有兼容 Runtime 或 snapshot 时进入 `BLOCKED`，不静默使用新版本。
+15. 单 Worker 不超过配置并发上限，每个活动 Attempt 独立续租，shutdown 时全部进入显式恢复；
+16. 没有兼容 Runtime 或 snapshot 时进入 `BLOCKED`，不静默使用新版本。
 
 ## 15. 非目标
 

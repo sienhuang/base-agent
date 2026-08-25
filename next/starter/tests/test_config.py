@@ -32,6 +32,7 @@ _CONFIG_NAMES = (
     "AGENT_RUNTIME_ROUTE",
     "AGENT_WORKER_POLL_SECONDS",
     "AGENT_WORKER_RECONCILE_SECONDS",
+    "AGENT_WORKER_MAX_CONCURRENCY",
     "AGENT_OPERATOR_TOKEN",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
@@ -70,6 +71,7 @@ def test_settings_read_starter_dotenv_without_mutating_process_environment(
                 "AGENT_RUN_LEASE_SECONDS=45",
                 "AGENT_RUN_HEARTBEAT_SECONDS=15",
                 "AGENT_RUNTIME_BUILD_ID=starter-test-build",
+                "AGENT_WORKER_MAX_CONCURRENCY=7",
             )
         ),
         encoding="utf-8",
@@ -101,6 +103,7 @@ def test_settings_read_starter_dotenv_without_mutating_process_environment(
     assert settings.run_lease_seconds == 45
     assert settings.run_heartbeat_interval_seconds == 15
     assert settings.runtime_build_id == "starter-test-build"
+    assert settings.worker_max_concurrency == 7
     assert os.getenv("AGENT_PROVIDER") is None
 
 
@@ -212,6 +215,7 @@ def test_settings_default_to_process_local_event_store(
     assert settings.runtime_build_id is None
     assert settings.execution_mode == "local"
     assert settings.runtime_route == "default"
+    assert settings.worker_max_concurrency == 10
     assert settings.operator_token is None
 
 
@@ -309,3 +313,22 @@ def test_settings_reject_run_heartbeat_not_shorter_than_lease(
         )
     else:
         raise AssertionError("Run heartbeat must be shorter than its lease")
+
+
+def test_settings_reject_non_positive_worker_concurrency(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    for name in _CONFIG_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(config, "_DOTENV_PATH", tmp_path / ".env")
+    monkeypatch.setenv("AGENT_WORKER_MAX_CONCURRENCY", "0")
+
+    try:
+        Settings.from_env()
+    except ValueError as exc:
+        assert str(exc) == (
+            "AGENT_WORKER_MAX_CONCURRENCY must be greater than zero"
+        )
+    else:
+        raise AssertionError("Worker concurrency must be positive")

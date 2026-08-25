@@ -56,6 +56,7 @@ async def run_worker(settings: Settings) -> None:
         heartbeat_interval_seconds=settings.run_heartbeat_interval_seconds,
         poll_interval_seconds=settings.worker_poll_interval_seconds,
         reconcile_interval_seconds=settings.worker_reconcile_interval_seconds,
+        max_concurrent_attempts=settings.worker_max_concurrency,
         child_env_remove=("AGENT_OPERATOR_TOKEN",),
         child_env_overrides={"AGENT_OPERATOR_TOKEN": "execution-child-no-operator-authority"},
     )

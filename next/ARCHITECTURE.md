@@ -319,6 +319,12 @@ Worker、Lease、Operator API 和分布式恢复不进入 Harness 主路径。MT
 状态与安全恢复 cursor，并提供显式 Operator retry/cancel/fail。Agent 与 Flow 共享 execution
 request/attempt/recovery 表，同一个 Worker 按 `target_kind` 选择 Handler。
 
+ExecutionWorker 可以在一个 Supervisor 进程内有界监管多个 Attempt。它只按空闲槽位 claim，每个
+Child 保持独立 process、lease heartbeat、cancel 和 settlement；shutdown 会停止新 claim，并把
+全部活动 Attempt 转入显式恢复。Core 默认并发 1，Starter 默认通过
+`AGENT_WORKER_MAX_CONCURRENCY=10` 启用 10 个槽位。该能力只限制执行侧容量，尚不包含 API 入队
+backpressure 或租户配额。
+
 生产 Adapter 把 API、Executor Supervisor 和 Execution Child 拆成独立进程，并把逻辑 Run、
 ExecutionRequest、ExecutionAttempt 与 RecoveryDecision 分开。lease 归 Attempt；失联只转为
 `RECOVERY_REQUIRED`，由受信任 Operator 接口决定 retry/cancel/fail。完整状态机、PostgreSQL

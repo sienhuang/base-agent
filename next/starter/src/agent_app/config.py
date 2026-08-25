@@ -77,6 +77,7 @@ class Settings:
     runtime_route: str = "default"
     worker_poll_interval_seconds: float = 0.5
     worker_reconcile_interval_seconds: float = 5.0
+    worker_max_concurrency: int = 10
     operator_token: str | None = None
 
     @classmethod
@@ -149,9 +150,12 @@ class Settings:
             worker_reconcile_interval_seconds = float(
                 _env_value("AGENT_WORKER_RECONCILE_SECONDS", file_values) or "5"
             )
+            worker_max_concurrency = int(
+                _env_value("AGENT_WORKER_MAX_CONCURRENCY", file_values) or "10"
+            )
         except ValueError as exc:
             raise ValueError(
-                "Event polling and Run lease settings must be numeric"
+                "Event polling, Run lease, and Worker settings must be numeric"
             ) from exc
         if timeout_seconds <= 0:
             raise ValueError("AGENT_CLI_TIMEOUT_SECONDS must be greater than zero")
@@ -171,6 +175,8 @@ class Settings:
             )
         if worker_poll_interval_seconds <= 0 or worker_reconcile_interval_seconds <= 0:
             raise ValueError("Worker polling and reconciliation settings must be positive")
+        if worker_max_concurrency < 1:
+            raise ValueError("AGENT_WORKER_MAX_CONCURRENCY must be greater than zero")
 
         raw_event_store = (
             _env_value("AGENT_EVENT_STORE", file_values) or "memory"
@@ -255,6 +261,7 @@ class Settings:
             runtime_route=runtime_route,
             worker_poll_interval_seconds=worker_poll_interval_seconds,
             worker_reconcile_interval_seconds=worker_reconcile_interval_seconds,
+            worker_max_concurrency=worker_max_concurrency,
             operator_token=operator_token,
         )
 

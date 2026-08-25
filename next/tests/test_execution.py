@@ -533,6 +533,126 @@ async def test_worker_heartbeats_while_a_child_process_is_blocked() -> None:
     assert attempt.heartbeat_at > attempt.claimed_at
 
 
+async def test_worker_supervises_attempts_up_to_its_concurrency_limit() -> None:
+    runs = InMemoryRunStore()
+    executions = InMemoryExecutionStore(runs)
+    run_ids = tuple(f"concurrent-run-{index}" for index in range(3))
+    for run_id in run_ids:
+        await executions.enqueue_run(
+            _record(run_id),
+            operation=ExecutionOperation.EXECUTE,
+            payload={"prompt": run_id},
+            idempotency_key=f"submit-{run_id}",
+        )
+    script = (
+        "import json,sys,time; "
+        "json.load(sys.stdin); time.sleep(0.25); "
+        "print(json.dumps({'status':'succeeded','output':'ok','text':'ok'}))"
+    )
+    worker = ExecutionWorker(
+        executions,
+        child_command=(sys.executable, "-c", script),
+        runtime_build_id="build-1",
+        lease_seconds=0.15,
+        heartbeat_interval_seconds=0.03,
+        poll_interval_seconds=0.005,
+        reconcile_interval_seconds=0.05,
+        max_concurrent_attempts=2,
+    )
+    task = asyncio.create_task(worker.run_forever())
+    try:
+        for _ in range(200):
+            if worker.active_attempt_count == 2:
+                records = [await runs.get(run_id) for run_id in run_ids]
+                if sum(record.status is RunStatus.RUNNING for record in records) == 2:
+                    break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("Worker did not fill both execution slots")
+
+        records = [await runs.get(run_id) for run_id in run_ids]
+        assert sum(record.status is RunStatus.RUNNING for record in records) == 2
+        assert sum(record.status is RunStatus.QUEUED for record in records) == 1
+
+        for _ in range(300):
+            records = [await runs.get(run_id) for run_id in run_ids]
+            if all(record.status is RunStatus.SUCCEEDED for record in records):
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("Worker did not drain all queued executions")
+
+        attempts = [await executions.latest_attempt(run_id) for run_id in run_ids]
+        assert all(attempt is not None for attempt in attempts)
+        assert all(
+            attempt.heartbeat_at > attempt.claimed_at
+            for attempt in attempts
+            if attempt is not None
+        )
+    finally:
+        await worker.close()
+        await task
+
+
+async def test_worker_shutdown_interrupts_every_active_attempt() -> None:
+    runs = InMemoryRunStore()
+    executions = InMemoryExecutionStore(runs)
+    run_ids = tuple(f"shutdown-run-{index}" for index in range(3))
+    for run_id in run_ids:
+        await executions.enqueue_run(
+            _record(run_id),
+            operation=ExecutionOperation.EXECUTE,
+            payload={"prompt": run_id},
+            idempotency_key=f"submit-{run_id}",
+        )
+    script = "import json,sys,time; json.load(sys.stdin); time.sleep(10)"
+    worker = ExecutionWorker(
+        executions,
+        child_command=(sys.executable, "-c", script),
+        runtime_build_id="build-1",
+        lease_seconds=1,
+        heartbeat_interval_seconds=0.1,
+        poll_interval_seconds=0.005,
+        reconcile_interval_seconds=0.1,
+        max_concurrent_attempts=3,
+    )
+    task = asyncio.create_task(worker.run_forever())
+    for _ in range(200):
+        if worker.active_attempt_count == 3:
+            break
+        await asyncio.sleep(0.005)
+    else:
+        await worker.close()
+        await task
+        raise AssertionError("Worker did not start all concurrent children")
+
+    await worker.close()
+    await task
+
+    records = [await runs.get(run_id) for run_id in run_ids]
+    attempts = [await executions.latest_attempt(run_id) for run_id in run_ids]
+    assert all(record.status is RunStatus.RECOVERY_REQUIRED for record in records)
+    assert all(record.recovery_reason_code == "worker_shutdown" for record in records)
+    assert all(
+        attempt is not None
+        and attempt.status is ExecutionAttemptStatus.INTERRUPTED
+        for attempt in attempts
+    )
+
+
+def test_worker_rejects_non_positive_concurrency() -> None:
+    runs = InMemoryRunStore()
+    executions = InMemoryExecutionStore(runs)
+
+    with pytest.raises(ValueError, match="max_concurrent_attempts"):
+        ExecutionWorker(
+            executions,
+            child_command=(sys.executable, "-c", "pass"),
+            runtime_build_id="build-1",
+            max_concurrent_attempts=0,
+        )
+
+
 async def test_child_terminal_event_is_not_authoritative_before_settlement() -> None:
     events = InMemoryEventStore()
     runs = InMemoryRunStore()
