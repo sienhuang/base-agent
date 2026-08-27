@@ -1,0 +1,22 @@
+mcp_servers:
+  local_math:
+    transport: stdio
+    command: python
+    args: [/absolute/path/to/mcp_server.py]
+
+  remote_github:
+    transport: streamable_http
+    url: https://mcp.example.com/mcp
+    auth:
+      type: oauth
+      redirect_uri: http://127.0.0.1:8001/v1/mcp/oauth/callback
+      client_name: base-agent Starter
+    tool_timeout_seconds: 30
+    supports_parallel_tool_calls: false
+
+  remote_with_token:
+    transport: streamable_http
+    url: https://token-mcp.example.com/mcp
+    auth:
+      type: bearer
+      token_env: EXAMPLE_MCP_TOKEN

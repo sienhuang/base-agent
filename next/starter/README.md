@@ -212,6 +212,56 @@ uv run --project next/starter \
   uvicorn agent_app.asgi:app --host 127.0.0.1 --port 8000
 ```
 
+### 使用 MCP Server 与 OAuth
+
+安装 MCP extra，复制示例配置，并让 API、Worker 和 execution child 使用同一个状态目录：
+
+```bash
+uv sync --project next/starter --extra mcp
+cp next/starter/mcp.example.yaml next/starter/mcp.yaml
+```
+
+```dotenv
+AGENT_MCP_CONFIG_PATH=mcp.yaml
+AGENT_MCP_STATE_ROOT=.mcp
+```
+
+部署前先同步所有启用 MCP Server 的 Tool manifest，再启动 API 和 Worker：
+
+```bash
+uv run --project next/starter agent-mcp-sync
+uv run --project next/starter agent-server --port 8001
+uv run --project next/starter execution-worker
+```
+
+`agent-mcp-sync` 会并发连接所有启用的 MCP Server，只有全部发现成功后才开始写入各自的
+manifest。没有设置 `AGENT_MCP_CONFIG_PATH` 时，该命令输出
+`No MCP configuration; nothing to sync.` 并以退出码 `0` 结束，因此不使用 MCP 的部署也可以
+无条件保留同一套启动命令。明确配置了不存在或无效的文件、缺少 Bearer 环境变量、远端不可达
+或任一发现失败时，命令以非零状态退出，API 和 Worker 不应继续启动。
+
+无认证、固定 Header 和 Bearer Token 不需要人工授权；`agent-mcp-sync` 会直接完成认证、
+`initialize` 和 `tools/list`。OAuth 已有可用 Token 或 refresh token 时也会非交互刷新并同步。
+OAuth Server 首次使用或 refresh token 失效时，需要先启动 API control plane，再通过 Operator
+凭据发起授权：
+
+```bash
+curl -sS -X POST \
+  http://127.0.0.1:8001/v1/mcp/connections/remote_github/authorize \
+  -H 'Authorization: Bearer replace-with-a-long-random-secret'
+```
+
+响应中的 `authorization_url` 需要在浏览器打开；第三方完成授权后会回调配置里的
+`/v1/mcp/oauth/callback`。Token 和远端 Tool schema 随后写入 `AGENT_MCP_STATE_ROOT`。授权完成后
+停止临时 API，执行 `agent-mcp-sync`，再按上面的固定顺序启动 API 与 Worker。当前版本在 Run
+内保持 Tool snapshot 不变；远端 Tool 清单变化时重新同步，并让 API 与 Worker 从同一份新
+manifest 启动。独立 execution child 只读取已保存 Token 并按需连接，不会在 Worker 中发起
+交互式 OAuth。
+
+本地 Token 文件使用原子写和 `0600` 权限，但没有加密；多主机生产环境应将 SDK 的
+`OAuthTokenStorage` 替换为共享数据库或 Secret Manager。完整配置与安全边界见
+[`../MCP.md`](../MCP.md)。
+
 ### 使用 PostgreSQL EventStore
 
 默认的 `AGENT_EVENT_STORE=memory` 适合本地快速测试，进程退出后 Event 会消失。要让普通

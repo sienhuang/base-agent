@@ -15,6 +15,7 @@ from base_agent.server.worker import (
     FlowExecutionHandler,
     default_python_child_command,
 )
+from base_agent.tools import Tool
 
 from agent_app.app import build_agent
 from agent_app.config import Settings
@@ -27,12 +28,20 @@ async def run_worker(settings: Settings) -> None:
         raise ValueError("execution-worker requires AGENT_EXECUTION_MODE=postgres-worker")
     runtime = build_event_store_runtime(settings)
     await runtime.start()
+    mcp_tools: tuple[Tool, ...] = ()
+    if settings.mcp_config_path is not None:
+        from agent_app.mcp import build_mcp_runtime
+
+        mcp_runtime = build_mcp_runtime(settings)
+        if mcp_runtime is not None:
+            mcp_tools = mcp_runtime.tools()
     agent = build_agent(
         build_provider(settings),
         artifact_store=LocalArtifactStore(settings.artifact_root),
         event_store=runtime.store,
         checkpoint_store=runtime.checkpoints,
         confirmation_policy=AwaitHumanConfirmations(),
+        additional_tools=mcp_tools,
     )
     worker = ExecutionWorker(
         runtime.executions,

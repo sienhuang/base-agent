@@ -13,6 +13,9 @@ dependencies = [
 postgres = [
     "base-agent-next[postgres]==0.1.0",
 ]
+mcp = [
+    "base-agent-next[mcp]==0.1.0",
+]
 
 [tool.uv.sources]
 base-agent-next = { path = "..", editable = true }
@@ -20,6 +23,7 @@ base-agent-next = { path = "..", editable = true }
 [dependency-groups]
 dev = [
     "base-agent-next[postgres]==0.1.0",
+    "base-agent-next[mcp]==0.1.0",
     "mypy>=1.15",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
@@ -28,6 +32,7 @@ dev = [
 
 [project.scripts]
 agent-app = "agent_app.cli:main"
+agent-mcp-sync = "agent_app.mcp_sync:main"
 agent-server = "agent_app.asgi:main"
 agent-worker = "agent_app.worker:main"
 execution-worker = "agent_app.worker:main"

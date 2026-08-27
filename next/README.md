@@ -2,6 +2,9 @@
 
 `next/` 是按 Agent SDK 产品目标重新实现的独立内核，不是旧 Runtime 的目录搬迁。
 
+第三方 MCP Server 接入、OAuth/TokenStore 边界和 Worker Tool manifest 见
+[`MCP.md`](MCP.md)。
+
 开发者主路径只有：
 
 ```text

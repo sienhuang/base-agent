@@ -21,6 +21,7 @@ from base_agent.flows import FlowStatus, PlannerReActFlow, PlannerReActResult
 from base_agent.governance import ToolConfirmation
 from base_agent.models import PendingInput, RunStatus
 from base_agent.server.worker import ChildExecutionResult, FencedEventStore
+from base_agent.tools import Tool
 from pydantic import BaseModel, ConfigDict
 
 from agent_app.app import build_plan_react_flow
@@ -45,6 +46,13 @@ async def execute_child(payload: FlowChildExecutionInput) -> ChildExecutionResul
     runtime = build_event_store_runtime(settings)
     await runtime.start()
     try:
+        mcp_tools: tuple[Tool, ...] = ()
+        if settings.mcp_config_path is not None:
+            from agent_app.mcp import build_mcp_runtime
+
+            mcp_runtime = build_mcp_runtime(settings)
+            if mcp_runtime is not None:
+                mcp_tools = mcp_runtime.tools()
         fenced_events = FencedEventStore(
             runtime.store,
             runtime.executions,
@@ -73,6 +81,7 @@ async def execute_child(payload: FlowChildExecutionInput) -> ChildExecutionResul
             checkpoint_store=runtime.checkpoints,
             flow_checkpoint_writer=save_checkpoint,
             confirmation_policy=AwaitHumanConfirmations(),
+            additional_tools=mcp_tools,
         )
         mismatch = _definition_mismatch(flow, payload.flow)
         if mismatch is not None:

@@ -79,6 +79,8 @@ class Settings:
     worker_reconcile_interval_seconds: float = 5.0
     worker_max_concurrency: int = 10
     operator_token: str | None = None
+    mcp_config_path: Path | None = None
+    mcp_state_root: Path = _APPLICATION_ROOT / ".mcp"
 
     @classmethod
     def from_env(
@@ -228,6 +230,15 @@ class Settings:
         artifact_root = Path(artifact_root_value).expanduser()
         if not artifact_root.is_absolute():
             artifact_root = _APPLICATION_ROOT / artifact_root
+        mcp_config_value = _optional_env("AGENT_MCP_CONFIG_PATH", file_values)
+        mcp_config_path = (
+            _resolve_application_path(mcp_config_value)
+            if mcp_config_value is not None
+            else None
+        )
+        mcp_state_root = _resolve_application_path(
+            _env_value("AGENT_MCP_STATE_ROOT", file_values) or ".mcp"
+        )
 
         return cls(
             provider=resolved_provider,
@@ -263,6 +274,8 @@ class Settings:
             worker_reconcile_interval_seconds=worker_reconcile_interval_seconds,
             worker_max_concurrency=worker_max_concurrency,
             operator_token=operator_token,
+            mcp_config_path=mcp_config_path,
+            mcp_state_root=mcp_state_root,
         )
 
     def for_plan_react_role(self, role: PlanReactRole) -> Settings:
@@ -325,3 +338,10 @@ def _optional_structured_output_mode(
     if normalized not in _STRUCTURED_OUTPUT_MODES:
         raise ValueError(f"{name} must be json-schema, json-object, or prompt")
     return cast(StructuredOutputMode, normalized)
+
+
+def _resolve_application_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = _APPLICATION_ROOT / path
+    return path.resolve()

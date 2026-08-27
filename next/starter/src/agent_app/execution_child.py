@@ -19,6 +19,7 @@ from base_agent.governance import ToolConfirmation
 from base_agent.models import PendingInput, RunInvocation, RunResult, RunStatus
 from base_agent.run_store import AgentRunRecord
 from base_agent.server.worker import ChildExecutionResult, FencedEventStore
+from base_agent.tools import Tool
 from pydantic import BaseModel, ConfigDict
 
 from agent_app.app import build_agent
@@ -43,6 +44,13 @@ async def execute_child(payload: ChildExecutionInput) -> ChildExecutionResult:
     runtime = build_event_store_runtime(settings)
     await runtime.start()
     try:
+        mcp_tools: tuple[Tool, ...] = ()
+        if settings.mcp_config_path is not None:
+            from agent_app.mcp import build_mcp_runtime
+
+            mcp_runtime = build_mcp_runtime(settings)
+            if mcp_runtime is not None:
+                mcp_tools = mcp_runtime.tools()
         fenced_events = FencedEventStore(
             runtime.store,
             runtime.executions,
@@ -54,6 +62,7 @@ async def execute_child(payload: ChildExecutionInput) -> ChildExecutionResult:
             event_store=fenced_events,
             checkpoint_store=runtime.checkpoints,
             confirmation_policy=AwaitHumanConfirmations(),
+            additional_tools=mcp_tools,
         )
         snapshot = agent.snapshot
         if payload.run.snapshot_fingerprint != snapshot.fingerprint:

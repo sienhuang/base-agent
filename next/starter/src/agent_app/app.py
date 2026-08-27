@@ -23,6 +23,7 @@ from base_agent.flows.checkpoints import CheckpointWriter
 from base_agent.governance import ConfirmationPolicy
 from base_agent.observability import Observer
 from base_agent.providers import ModelProvider
+from base_agent.tools import Tool, Toolkit, flatten_tools
 
 from agent_app.assets import prompt
 from agent_app.provider import OfflineProvider
@@ -88,12 +89,27 @@ def build_agent(
     artifact_store: ArtifactStore | None = None,
     event_store: EventStore | None = None,
     checkpoint_store: CheckpointStore | None = None,
+    additional_tools: Sequence[Tool | Toolkit] = (),
 ) -> Agent:
     """Compose application Prompt and Provider with the SDK Agent facade."""
+    extra_tools = flatten_tools(additional_tools)
+    extra_names = tuple(tool.spec.name for tool in extra_tools)
+    extra_permissions = frozenset(
+        permission for tool in extra_tools for permission in tool.permissions
+    )
+    resolved_definition = (
+        replace(
+            definition,
+            tools=tuple(dict.fromkeys((*definition.tools, *extra_names))),
+            permissions=definition.permissions | extra_permissions,
+        )
+        if extra_tools
+        else definition
+    )
     return Agent(
-        definition,
+        resolved_definition,
         model=model or OfflineProvider(),
-        tools=REGISTERED_TOOLS,
+        tools=(*REGISTERED_TOOLS, *extra_tools),
         skills=SKILL_CATALOG,
         confirmation_policy=confirmation_policy,
         observers=observers,
@@ -117,6 +133,7 @@ def build_plan_react_flow(
     event_store: EventStore | None = None,
     checkpoint_store: CheckpointStore | None = None,
     flow_checkpoint_writer: CheckpointWriter | None = None,
+    additional_tools: Sequence[Tool | Toolkit] = (),
 ) -> PlannerReActFlow:
     """Compose Planner and Executor Agents with independently selectable Providers."""
     provider = model or OfflineProvider()
@@ -144,6 +161,7 @@ def build_plan_react_flow(
         artifact_store=artifact_store,
         event_store=event_store,
         checkpoint_store=checkpoint_store,
+        additional_tools=additional_tools,
     )
     return Flow.planner_react(
         id="starter-plan-react",
@@ -168,6 +186,7 @@ async def run(
     artifact_store: ArtifactStore | None = None,
     event_store: EventStore | None = None,
     checkpoint_store: CheckpointStore | None = None,
+    additional_tools: Sequence[Tool | Toolkit] = (),
 ) -> RunResult:
     agent = build_agent(
         model,
@@ -176,6 +195,7 @@ async def run(
         artifact_store=artifact_store,
         event_store=event_store,
         checkpoint_store=checkpoint_store,
+        additional_tools=additional_tools,
     )
     if stream:
         if on_event is None:

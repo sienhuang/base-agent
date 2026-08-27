@@ -34,6 +34,8 @@ _CONFIG_NAMES = (
     "AGENT_WORKER_RECONCILE_SECONDS",
     "AGENT_WORKER_MAX_CONCURRENCY",
     "AGENT_OPERATOR_TOKEN",
+    "AGENT_MCP_CONFIG_PATH",
+    "AGENT_MCP_STATE_ROOT",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_MODEL",
@@ -72,6 +74,8 @@ def test_settings_read_starter_dotenv_without_mutating_process_environment(
                 "AGENT_RUN_HEARTBEAT_SECONDS=15",
                 "AGENT_RUNTIME_BUILD_ID=starter-test-build",
                 "AGENT_WORKER_MAX_CONCURRENCY=7",
+                "AGENT_MCP_CONFIG_PATH=config/mcp.yaml",
+                "AGENT_MCP_STATE_ROOT=.mcp-test",
             )
         ),
         encoding="utf-8",
@@ -104,6 +108,8 @@ def test_settings_read_starter_dotenv_without_mutating_process_environment(
     assert settings.run_heartbeat_interval_seconds == 15
     assert settings.runtime_build_id == "starter-test-build"
     assert settings.worker_max_concurrency == 7
+    assert settings.mcp_config_path == (config._APPLICATION_ROOT / "config/mcp.yaml").resolve()
+    assert settings.mcp_state_root == (config._APPLICATION_ROOT / ".mcp-test").resolve()
     assert os.getenv("AGENT_PROVIDER") is None
 
 

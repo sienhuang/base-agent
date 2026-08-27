@@ -22,6 +22,11 @@ postgres = [
     "asyncpg>=0.30,<1",
     "sqlalchemy[asyncio]>=2.0.40,<2.1",
 ]
+mcp = [
+    "httpx>=0.27,<1",
+    "jsonschema>=4.23,<5",
+    "mcp>=1.28,<2",
+]
 
 [build-system]
 requires = ["hatchling>=1.27"]
@@ -35,6 +40,8 @@ dev = [
     "asyncpg>=0.30,<1",
     "fastapi>=0.115,<1",
     "httpx>=0.27,<1",
+    "jsonschema>=4.23,<5",
+    "mcp>=1.28,<2",
     "mypy>=1.15",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
@@ -42,6 +49,7 @@ dev = [
     "sqlalchemy[asyncio]>=2.0.40,<2.1",
     "sse-starlette>=3,<4",
     "types-pyyaml>=6.0.12",
+    "types-jsonschema>=4.23",
 ]
 
 [tool.pytest.ini_options]
