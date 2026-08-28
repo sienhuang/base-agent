@@ -11,6 +11,7 @@ from base_agent.models import Event
 
 from agent_app.app import run, run_plan_react
 from agent_app.config import ProviderName, Settings, StructuredOutputMode
+from agent_app.context import build_plan_react_context
 from agent_app.provider import build_plan_react_providers, build_provider
 
 RunMode = Literal["agent", "plan-react"]
@@ -27,6 +28,7 @@ async def _run(
 ) -> int:
     try:
         provider = build_provider(settings)
+        plan_react_context = build_plan_react_context(settings)
         if flow == "plan-react":
             planner_provider, executor_provider = build_plan_react_providers(
                 settings,
@@ -69,6 +71,10 @@ async def _run(
                 stream=stream,
                 on_event=observer,
                 artifact_store=artifact_store,
+                planner_context_policy=plan_react_context.planner_policy,
+                planner_context_budget=plan_react_context.planner_budget,
+                executor_context_policy=plan_react_context.executor_policy,
+                executor_context_budget=plan_react_context.executor_budget,
             )
             if flow_result.output:
                 print(flow_result.output)

@@ -18,6 +18,7 @@ Tool、Skill、权限和确认策略，并返回结构化 `StepOutcome`。Plan�
 src/agent_app/
 ├── app.py                 # 唯一 composition root
 ├── config.py              # Provider 环境配置
+├── context.py             # Planner/Executor ContextPolicy 与预算
 ├── provider.py            # Offline/API/CLI Provider 选择
 ├── cli.py                 # 命令行入口
 ├── asgi.py                # 只构造 Agent；HTTP 实现来自 base_agent.server
@@ -113,6 +114,41 @@ PLAN_REACT_EXECUTOR_STRUCTURED_OUTPUT_MODE=prompt
 每个未设置的角色字段都会继承对应的 `OPENAI_BASE_URL`、`OPENAI_API_KEY` 和
 `AGENT_STRUCTURED_OUTPUT_MODE`。当两个角色解析出的连接配置完全相同时，Starter 会复用同一个
 Provider；只要模型、Base URL、API Key 或结构化输出模式不同，就会构造独立 Provider。
+
+### Planner-ReAct ContextPolicy
+
+Planner 和 Executor 是两个独立 Agent，因此 ContextPolicy 也分别配置：
+
+- Planner 使用 SDK 的 `KeepAllContextPolicy`。每次 create/review 都是 Host 构造的独立短 Run，
+  保留完整输入更利于稳定地产生 `PlannerDecision`。
+- Executor 使用应用自有的 `RecentToolGroupsContextPolicy`。它始终保留系统上下文和所有非工具
+  消息，只保留最近 N 个完整工具组；一个工具组是单条 `assistant(tool_calls)` 以及它对应的全部
+  `tool` 结果，多工具调用不会被拆开，也不会产生孤立 ToolResult。
+
+默认保留最近 4 个工具组，可以在 `.env` 调整：
+
+```dotenv
+PLAN_REACT_EXECUTOR_CONTEXT_MAX_TOOL_GROUPS=4
+```
+
+两个角色还可以分别声明 ContextBudget；未设置 window 时保持不设上限：
+
+```dotenv
+PLAN_REACT_PLANNER_CONTEXT_WINDOW_TOKENS=32768
+PLAN_REACT_PLANNER_CONTEXT_RESERVED_OUTPUT_TOKENS=4096
+PLAN_REACT_PLANNER_CONTEXT_SAFETY_MARGIN_TOKENS=512
+
+PLAN_REACT_EXECUTOR_CONTEXT_WINDOW_TOKENS=65536
+PLAN_REACT_EXECUTOR_CONTEXT_RESERVED_OUTPUT_TOKENS=8192
+PLAN_REACT_EXECUTOR_CONTEXT_SAFETY_MARGIN_TOKENS=1024
+```
+
+ContextBudget 会固定进 Agent snapshot，并在 `context.prepared` Event 中暴露
+`max_input_tokens`；实际历史裁剪由 Executor 的完整工具组策略执行。由于不同 Provider 的
+tokenizer 不同，这个策略不伪造 token 估算。修改任何 ContextPolicy 参数或预算后，API、Worker
+和 execution child 必须使用相同环境并一起重启，否则已创建 Run 的 snapshot 校验会拒绝继续。
+这只影响每次模型请求看到的上下文，不改变 Planner-ReAct 的 Plan/Step 调度状态机，因此不会与
+Flow 的 sequence control 冲突。
 
 `.env` 只配置 Provider 和基础设施，不定义 Agent 能力。普通 Tool、Skill、权限和执行预算统一
 收敛在 `app.py` 的 `STARTER_AGENT_DEFINITION`；CLI 与 HTTP 都调用同一个 `build_agent()`，

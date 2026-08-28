@@ -10,6 +10,7 @@ from base_agent import (
     CheckpointStore,
     RunResult,
 )
+from base_agent.context import ContextBudget, ContextPolicy
 from base_agent.events import EventStore
 from base_agent.flows import (
     Flow,
@@ -26,6 +27,7 @@ from base_agent.providers import ModelProvider
 from base_agent.tools import Tool, Toolkit, flatten_tools
 
 from agent_app.assets import prompt
+from agent_app.context import RecentToolGroupsContextPolicy
 from agent_app.provider import OfflineProvider
 from agent_app.skills import (
     PYTHON_CALCULATOR_SKILL_NAME,
@@ -89,6 +91,8 @@ def build_agent(
     artifact_store: ArtifactStore | None = None,
     event_store: EventStore | None = None,
     checkpoint_store: CheckpointStore | None = None,
+    context_policy: ContextPolicy | None = None,
+    context_budget: ContextBudget | None = None,
     additional_tools: Sequence[Tool | Toolkit] = (),
 ) -> Agent:
     """Compose application Prompt and Provider with the SDK Agent facade."""
@@ -112,6 +116,8 @@ def build_agent(
         tools=(*REGISTERED_TOOLS, *extra_tools),
         skills=SKILL_CATALOG,
         confirmation_policy=confirmation_policy,
+        context_policy=context_policy,
+        context_budget=context_budget,
         observers=observers,
         artifact_store=artifact_store,
         event_store=event_store,
@@ -133,6 +139,10 @@ def build_plan_react_flow(
     event_store: EventStore | None = None,
     checkpoint_store: CheckpointStore | None = None,
     flow_checkpoint_writer: CheckpointWriter | None = None,
+    planner_context_policy: ContextPolicy | None = None,
+    planner_context_budget: ContextBudget | None = None,
+    executor_context_policy: ContextPolicy | None = None,
+    executor_context_budget: ContextBudget | None = None,
     additional_tools: Sequence[Tool | Toolkit] = (),
 ) -> PlannerReActFlow:
     """Compose Planner and Executor Agents with independently selectable Providers."""
@@ -150,6 +160,8 @@ def build_plan_react_flow(
     planner = Agent(
         planner_definition,
         model=planner_provider or provider,
+        context_policy=planner_context_policy,
+        context_budget=planner_context_budget,
         artifact_store=artifact_store,
         event_store=event_store,
         checkpoint_store=checkpoint_store,
@@ -158,6 +170,12 @@ def build_plan_react_flow(
         executor_provider or provider,
         definition=executor_definition,
         confirmation_policy=confirmation_policy,
+        context_policy=(
+            executor_context_policy
+            if executor_context_policy is not None
+            else RecentToolGroupsContextPolicy()
+        ),
+        context_budget=executor_context_budget,
         artifact_store=artifact_store,
         event_store=event_store,
         checkpoint_store=checkpoint_store,
@@ -186,6 +204,8 @@ async def run(
     artifact_store: ArtifactStore | None = None,
     event_store: EventStore | None = None,
     checkpoint_store: CheckpointStore | None = None,
+    context_policy: ContextPolicy | None = None,
+    context_budget: ContextBudget | None = None,
     additional_tools: Sequence[Tool | Toolkit] = (),
 ) -> RunResult:
     agent = build_agent(
@@ -195,6 +215,8 @@ async def run(
         artifact_store=artifact_store,
         event_store=event_store,
         checkpoint_store=checkpoint_store,
+        context_policy=context_policy,
+        context_budget=context_budget,
         additional_tools=additional_tools,
     )
     if stream:
@@ -219,6 +241,10 @@ async def run_plan_react(
     artifact_store: ArtifactStore,
     event_store: EventStore | None = None,
     checkpoint_store: CheckpointStore | None = None,
+    planner_context_policy: ContextPolicy | None = None,
+    planner_context_budget: ContextBudget | None = None,
+    executor_context_policy: ContextPolicy | None = None,
+    executor_context_budget: ContextBudget | None = None,
 ) -> PlannerReActResult:
     """Run the Starter's fixed Planner/ReAct composition to completion."""
     observers = () if on_event is None else (on_event,)
@@ -234,5 +260,9 @@ async def run_plan_react(
         artifact_store=artifact_store,
         event_store=event_store,
         checkpoint_store=checkpoint_store,
+        planner_context_policy=planner_context_policy,
+        planner_context_budget=planner_context_budget,
+        executor_context_policy=executor_context_policy,
+        executor_context_budget=executor_context_budget,
     )
     return await flow.run(prompt_text, stream=stream)

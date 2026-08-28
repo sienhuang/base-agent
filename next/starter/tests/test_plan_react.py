@@ -42,6 +42,8 @@ def test_plan_react_composition_uses_fixed_structured_roles() -> None:
     assert flow.planner.definition.skills == ()
     assert flow.executor.definition.tools
     assert flow.executor.definition.skills
+    assert flow.planner.snapshot.context_policy == "keep_all"
+    assert flow.executor.snapshot.context_policy == "recent_tool_groups_v1:max=4"
     assert flow.planner.artifact_store is artifact_store
     assert flow.executor.artifact_store is artifact_store
     assert flow.event_store is event_store

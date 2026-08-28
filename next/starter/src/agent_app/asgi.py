@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from agent_app.app import build_agent, build_plan_react_flow
 from agent_app.config import Settings
+from agent_app.context import build_plan_react_context
 from agent_app.events import build_event_store_runtime
 from agent_app.provider import build_plan_react_providers, build_provider
 
@@ -33,6 +34,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         resolved_settings,
         default_provider=provider,
     )
+    plan_react_context = build_plan_react_context(resolved_settings)
     artifact_store = LocalArtifactStore(resolved_settings.artifact_root)
     event_runtime = build_event_store_runtime(resolved_settings)
     mcp_runtime = None
@@ -65,6 +67,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         event_store=event_runtime.store,
         checkpoint_store=event_runtime.checkpoints,
         confirmation_policy=AwaitHumanConfirmations(),
+        planner_context_policy=plan_react_context.planner_policy,
+        planner_context_budget=plan_react_context.planner_budget,
+        executor_context_policy=plan_react_context.executor_policy,
+        executor_context_budget=plan_react_context.executor_budget,
         additional_tools=mcp_tools,
     )
     shutdown = [event_runtime.close]

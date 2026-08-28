@@ -16,6 +16,13 @@ _CONFIG_NAMES = (
     "PLAN_REACT_EXECUTOR_BASE_URL",
     "PLAN_REACT_PLANNER_STRUCTURED_OUTPUT_MODE",
     "PLAN_REACT_EXECUTOR_STRUCTURED_OUTPUT_MODE",
+    "PLAN_REACT_PLANNER_CONTEXT_WINDOW_TOKENS",
+    "PLAN_REACT_PLANNER_CONTEXT_RESERVED_OUTPUT_TOKENS",
+    "PLAN_REACT_PLANNER_CONTEXT_SAFETY_MARGIN_TOKENS",
+    "PLAN_REACT_EXECUTOR_CONTEXT_WINDOW_TOKENS",
+    "PLAN_REACT_EXECUTOR_CONTEXT_RESERVED_OUTPUT_TOKENS",
+    "PLAN_REACT_EXECUTOR_CONTEXT_SAFETY_MARGIN_TOKENS",
+    "PLAN_REACT_EXECUTOR_CONTEXT_MAX_TOOL_GROUPS",
     "AGENT_STRUCTURED_OUTPUT_MODE",
     "AGENT_CLI_EXECUTABLE",
     "AGENT_CLI_TIMEOUT_SECONDS",
@@ -62,6 +69,13 @@ def test_settings_read_starter_dotenv_without_mutating_process_environment(
                 "PLAN_REACT_EXECUTOR_BASE_URL=http://executor.local/v1",
                 "PLAN_REACT_PLANNER_STRUCTURED_OUTPUT_MODE=json-schema",
                 "PLAN_REACT_EXECUTOR_STRUCTURED_OUTPUT_MODE=prompt",
+                "PLAN_REACT_PLANNER_CONTEXT_WINDOW_TOKENS=32768",
+                "PLAN_REACT_PLANNER_CONTEXT_RESERVED_OUTPUT_TOKENS=4096",
+                "PLAN_REACT_PLANNER_CONTEXT_SAFETY_MARGIN_TOKENS=512",
+                "PLAN_REACT_EXECUTOR_CONTEXT_WINDOW_TOKENS=65536",
+                "PLAN_REACT_EXECUTOR_CONTEXT_RESERVED_OUTPUT_TOKENS=8192",
+                "PLAN_REACT_EXECUTOR_CONTEXT_SAFETY_MARGIN_TOKENS=1024",
+                "PLAN_REACT_EXECUTOR_CONTEXT_MAX_TOOL_GROUPS=2",
                 "OPENAI_API_KEY=dotenv-key",
                 "OPENAI_BASE_URL=http://localhost:8000/v1",
                 "AGENT_STRUCTURED_OUTPUT_MODE=json-object",
@@ -96,6 +110,13 @@ def test_settings_read_starter_dotenv_without_mutating_process_environment(
     assert executor.api_key == "dotenv-executor-key"
     assert executor.base_url == "http://executor.local/v1"
     assert executor.structured_output_mode == "prompt"
+    assert settings.plan_react_planner_context_window_tokens == 32_768
+    assert settings.plan_react_planner_context_reserved_output_tokens == 4_096
+    assert settings.plan_react_planner_context_safety_margin_tokens == 512
+    assert settings.plan_react_executor_context_window_tokens == 65_536
+    assert settings.plan_react_executor_context_reserved_output_tokens == 8_192
+    assert settings.plan_react_executor_context_safety_margin_tokens == 1_024
+    assert settings.plan_react_executor_context_max_tool_groups == 2
     assert settings.api_key == "dotenv-key"
     assert settings.base_url == "http://localhost:8000/v1"
     assert settings.structured_output_mode == "json-object"
@@ -223,6 +244,30 @@ def test_settings_default_to_process_local_event_store(
     assert settings.runtime_route == "default"
     assert settings.worker_max_concurrency == 10
     assert settings.operator_token is None
+    assert settings.plan_react_planner_context_window_tokens is None
+    assert settings.plan_react_executor_context_window_tokens is None
+    assert settings.plan_react_executor_context_max_tool_groups == 4
+
+
+def test_settings_reject_invalid_plan_react_context_configuration(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    for name in _CONFIG_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(config, "_DOTENV_PATH", tmp_path / ".env")
+    monkeypatch.setenv("PLAN_REACT_EXECUTOR_CONTEXT_WINDOW_TOKENS", "4096")
+    monkeypatch.setenv("PLAN_REACT_EXECUTOR_CONTEXT_RESERVED_OUTPUT_TOKENS", "4096")
+
+    try:
+        Settings.from_env()
+    except ValueError as exc:
+        assert str(exc) == (
+            "invalid Plan-ReAct Executor context budget: reserved_output_tokens plus "
+            "safety_margin_tokens must leave input capacity"
+        )
+    else:
+        raise AssertionError("invalid Executor context budget must fail")
 
 
 def test_postgres_worker_settings_can_be_used_by_a_non_api_process(

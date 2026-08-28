@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
+from base_agent.context import ContextBudget
 from dotenv import dotenv_values
 
 ProviderName = Literal[
@@ -59,6 +60,13 @@ class Settings:
     plan_react_executor_base_url: str | None = None
     plan_react_planner_structured_output_mode: StructuredOutputMode | None = None
     plan_react_executor_structured_output_mode: StructuredOutputMode | None = None
+    plan_react_planner_context_window_tokens: int | None = None
+    plan_react_planner_context_reserved_output_tokens: int = 0
+    plan_react_planner_context_safety_margin_tokens: int = 0
+    plan_react_executor_context_window_tokens: int | None = None
+    plan_react_executor_context_reserved_output_tokens: int = 0
+    plan_react_executor_context_safety_margin_tokens: int = 0
+    plan_react_executor_context_max_tool_groups: int = 4
     api_key: str | None = None
     base_url: str | None = None
     structured_output_mode: StructuredOutputMode = "prompt"
@@ -125,6 +133,72 @@ class Settings:
             "PLAN_REACT_EXECUTOR_BASE_URL",
             file_values,
         )
+        try:
+            planner_context_window_tokens = _optional_integer_env(
+                "PLAN_REACT_PLANNER_CONTEXT_WINDOW_TOKENS",
+                file_values,
+            )
+            planner_context_reserved_output_tokens = _integer_env(
+                "PLAN_REACT_PLANNER_CONTEXT_RESERVED_OUTPUT_TOKENS",
+                file_values,
+                default=0,
+            )
+            planner_context_safety_margin_tokens = _integer_env(
+                "PLAN_REACT_PLANNER_CONTEXT_SAFETY_MARGIN_TOKENS",
+                file_values,
+                default=0,
+            )
+            executor_context_window_tokens = _optional_integer_env(
+                "PLAN_REACT_EXECUTOR_CONTEXT_WINDOW_TOKENS",
+                file_values,
+            )
+            executor_context_reserved_output_tokens = _integer_env(
+                "PLAN_REACT_EXECUTOR_CONTEXT_RESERVED_OUTPUT_TOKENS",
+                file_values,
+                default=0,
+            )
+            executor_context_safety_margin_tokens = _integer_env(
+                "PLAN_REACT_EXECUTOR_CONTEXT_SAFETY_MARGIN_TOKENS",
+                file_values,
+                default=0,
+            )
+            executor_context_max_tool_groups = _integer_env(
+                "PLAN_REACT_EXECUTOR_CONTEXT_MAX_TOOL_GROUPS",
+                file_values,
+                default=4,
+            )
+        except ValueError as exc:
+            raise ValueError("Plan-ReAct context settings must be integers") from exc
+        if executor_context_max_tool_groups < 1:
+            raise ValueError(
+                "PLAN_REACT_EXECUTOR_CONTEXT_MAX_TOOL_GROUPS must be greater than zero"
+            )
+        for role, budget in (
+            (
+                "Planner",
+                (
+                    planner_context_window_tokens,
+                    planner_context_reserved_output_tokens,
+                    planner_context_safety_margin_tokens,
+                ),
+            ),
+            (
+                "Executor",
+                (
+                    executor_context_window_tokens,
+                    executor_context_reserved_output_tokens,
+                    executor_context_safety_margin_tokens,
+                ),
+            ),
+        ):
+            try:
+                ContextBudget(
+                    context_window_tokens=budget[0],
+                    reserved_output_tokens=budget[1],
+                    safety_margin_tokens=budget[2],
+                )
+            except ValueError as exc:
+                raise ValueError(f"invalid Plan-ReAct {role} context budget: {exc}") from exc
 
         try:
             timeout_seconds = float(
@@ -251,6 +325,23 @@ class Settings:
             plan_react_executor_base_url=plan_react_executor_base_url,
             plan_react_planner_structured_output_mode=planner_structured_output_mode,
             plan_react_executor_structured_output_mode=executor_structured_output_mode,
+            plan_react_planner_context_window_tokens=planner_context_window_tokens,
+            plan_react_planner_context_reserved_output_tokens=(
+                planner_context_reserved_output_tokens
+            ),
+            plan_react_planner_context_safety_margin_tokens=(
+                planner_context_safety_margin_tokens
+            ),
+            plan_react_executor_context_window_tokens=executor_context_window_tokens,
+            plan_react_executor_context_reserved_output_tokens=(
+                executor_context_reserved_output_tokens
+            ),
+            plan_react_executor_context_safety_margin_tokens=(
+                executor_context_safety_margin_tokens
+            ),
+            plan_react_executor_context_max_tool_groups=(
+                executor_context_max_tool_groups
+            ),
             api_key=_optional_env("OPENAI_API_KEY", file_values),
             base_url=_optional_env("OPENAI_BASE_URL", file_values),
             structured_output_mode=cast(
@@ -338,6 +429,24 @@ def _optional_structured_output_mode(
     if normalized not in _STRUCTURED_OUTPUT_MODES:
         raise ValueError(f"{name} must be json-schema, json-object, or prompt")
     return cast(StructuredOutputMode, normalized)
+
+
+def _optional_integer_env(
+    name: str,
+    file_values: Mapping[str, str | None],
+) -> int | None:
+    value = _optional_env(name, file_values)
+    return None if value is None else int(value)
+
+
+def _integer_env(
+    name: str,
+    file_values: Mapping[str, str | None],
+    *,
+    default: int,
+) -> int:
+    value = _optional_env(name, file_values)
+    return default if value is None else int(value)
 
 
 def _resolve_application_path(value: str) -> Path:

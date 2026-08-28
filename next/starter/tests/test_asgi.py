@@ -111,6 +111,41 @@ async def test_http_uses_the_shared_starter_definition(monkeypatch) -> None:
     assert run_result.snapshot.permissions == STARTER_AGENT_DEFINITION.permissions
 
 
+async def test_http_plan_react_uses_configured_context_snapshots(tmp_path) -> None:
+    built = asgi.create_app(
+        Settings(
+            provider="offline",
+            artifact_root=tmp_path,
+            plan_react_planner_context_window_tokens=32_768,
+            plan_react_planner_context_reserved_output_tokens=4_096,
+            plan_react_executor_context_window_tokens=65_536,
+            plan_react_executor_context_reserved_output_tokens=8_192,
+            plan_react_executor_context_max_tool_groups=2,
+        )
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=built),
+        base_url="http://testserver",
+    ) as client:
+        started = await client.post(
+            "/v1/flows/plan-react",
+            json={"prompt": "calculate 4 * 30"},
+        )
+        flow_run_id = started.json()["flow_run_id"]
+        result = await built.state.flow_registry.get(flow_run_id).wait()
+
+    assert started.status_code == 202
+    planner_snapshot = result.child_runs[0].run.snapshot
+    executor_snapshot = result.child_runs[1].run.snapshot
+    assert planner_snapshot.context_policy == "keep_all"
+    assert planner_snapshot.context_window_tokens == 32_768
+    assert planner_snapshot.context_reserved_output_tokens == 4_096
+    assert executor_snapshot.context_policy == "recent_tool_groups_v1:max=2"
+    assert executor_snapshot.context_window_tokens == 65_536
+    assert executor_snapshot.context_reserved_output_tokens == 8_192
+
+
 async def test_http_waits_for_and_accepts_exact_tool_confirmation(monkeypatch) -> None:
     monkeypatch.setattr(
         asgi.Settings,

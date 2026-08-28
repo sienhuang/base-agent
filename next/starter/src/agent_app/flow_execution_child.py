@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict
 
 from agent_app.app import build_plan_react_flow
 from agent_app.config import Settings
+from agent_app.context import build_plan_react_context
 from agent_app.events import build_event_store_runtime
 from agent_app.provider import build_plan_react_providers, build_provider
 
@@ -70,6 +71,7 @@ async def execute_child(payload: FlowChildExecutionInput) -> ChildExecutionResul
             settings,
             default_provider=default_provider,
         )
+        plan_react_context = build_plan_react_context(settings)
         flow = build_plan_react_flow(
             default_provider,
             planner_provider=planner_provider,
@@ -81,6 +83,10 @@ async def execute_child(payload: FlowChildExecutionInput) -> ChildExecutionResul
             checkpoint_store=runtime.checkpoints,
             flow_checkpoint_writer=save_checkpoint,
             confirmation_policy=AwaitHumanConfirmations(),
+            planner_context_policy=plan_react_context.planner_policy,
+            planner_context_budget=plan_react_context.planner_budget,
+            executor_context_policy=plan_react_context.executor_policy,
+            executor_context_budget=plan_react_context.executor_budget,
             additional_tools=mcp_tools,
         )
         mismatch = _definition_mismatch(flow, payload.flow)
