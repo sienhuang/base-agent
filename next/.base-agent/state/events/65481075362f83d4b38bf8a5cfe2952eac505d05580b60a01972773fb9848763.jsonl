@@ -1,0 +1,4 @@
+{"stream_id":"run-822d767cb4ad4535b131322665146fc4","sequence":1,"kind":"run.created","timestamp":"2026-09-02T02:58:50.866980Z","payload":{"agent_name":"planner","agent_fingerprint":"03f8d272d4f2064e5379c163e68815d7d3e5c9c53172eb58ba2dd776cab3f21c","conversation_id":null}}
+{"stream_id":"run-822d767cb4ad4535b131322665146fc4","sequence":2,"kind":"session.bound","timestamp":"2026-09-02T02:58:50.875332Z","payload":{"session_id":"session-9346b20a54b7427593139526887dd76d","conversation_id":null}}
+{"stream_id":"run-822d767cb4ad4535b131322665146fc4","sequence":3,"kind":"run.started","timestamp":"2026-09-02T02:58:50.875932Z","payload":{"session_id":"session-9346b20a54b7427593139526887dd76d"}}
+{"stream_id":"run-822d767cb4ad4535b131322665146fc4","sequence":4,"kind":"run.failed","timestamp":"2026-09-02T03:01:43.867339Z","payload":{"session_id":"session-9346b20a54b7427593139526887dd76d","error_type":"TransportClosedError"}}

@@ -1,0 +1,98 @@
+{
+  "version": 4,
+  "record": {
+    "identity": {
+      "createdAt": 1788264105177,
+      "cwd": "/Users/huangsien/PycharmProjects/base-agent/next"
+    },
+    "rows": {
+      "title": {
+        "ver": 1,
+        "seq": 51,
+        "val": "只回复 pong"
+      },
+      "goal": {
+        "ver": 4,
+        "seq": 51,
+        "val": null
+      },
+      "plan": {
+        "ver": 2,
+        "seq": 51,
+        "val": {
+          "active": false,
+          "wanted": null,
+          "running": null
+        }
+      },
+      "tokenUsage": {
+        "ver": 2,
+        "seq": 51,
+        "val": {
+          "totals": {
+            "uncachedInputTokens": 1622,
+            "outputTokens": 32,
+            "cacheReadTokens": 6144,
+            "cacheWriteTokens": 0
+          },
+          "last": {
+            "turn": 1,
+            "step": 1,
+            "buckets": {
+              "uncachedInputTokens": 1622,
+              "outputTokens": 32,
+              "cacheReadTokens": 6144,
+              "cacheWriteTokens": 0
+            }
+          }
+        }
+      },
+      "contextPressure": {
+        "ver": 4,
+        "seq": 51,
+        "val": {
+          "surfaceTokens": 179,
+          "contextWindow": 1000000,
+          "pressureTokens": 7766,
+          "sampledSurfaceTokens": 141
+        }
+      },
+      "contextBreakdown": {
+        "ver": 2,
+        "seq": 51,
+        "val": {
+          "systemTokens": 1033,
+          "toolsTokens": 6835,
+          "messageTokens": 179
+        }
+      },
+      "subagentTiming": {
+        "ver": 2,
+        "seq": 51,
+        "val": {
+          "descriptorSeen": false,
+          "settledMs": 0
+        }
+      },
+      "subagent": {
+        "ver": 2,
+        "seq": 51,
+        "val": {}
+      },
+      "todos": {
+        "ver": 2,
+        "seq": 51,
+        "val": null
+      },
+      "permissions": {
+        "ver": 1,
+        "seq": 51,
+        "val": {
+          "preset": "workspace-write",
+          "sandbox": "workspace-write",
+          "approval": "ask"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,99 @@
+{
+  "version": 4,
+  "record": {
+    "identity": {
+      "createdAt": 1788317930901,
+      "cwd": "/Users/huangsien/PycharmProjects/base-agent/next"
+    },
+    "rows": {
+      "title": {
+        "ver": 1,
+        "seq": 13579,
+        "val": "计算dau"
+      },
+      "goal": {
+        "ver": 4,
+        "seq": 13579,
+        "val": null
+      },
+      "plan": {
+        "ver": 2,
+        "seq": 13579,
+        "val": {
+          "active": false,
+          "wanted": null,
+          "running": null
+        }
+      },
+      "tokenUsage": {
+        "ver": 2,
+        "seq": 13579,
+        "val": {
+          "totals": {
+            "uncachedInputTokens": 70339,
+            "outputTokens": 13217,
+            "cacheReadTokens": 262912,
+            "cacheWriteTokens": 0
+          },
+          "last": {
+            "turn": 1,
+            "step": 16,
+            "buckets": {
+              "uncachedInputTokens": 3684,
+              "outputTokens": 1454,
+              "cacheReadTokens": 32768,
+              "cacheWriteTokens": 0
+            }
+          }
+        }
+      },
+      "contextPressure": {
+        "ver": 4,
+        "seq": 13579,
+        "val": {
+          "surfaceTokens": 23168,
+          "contextWindow": 1000000,
+          "pressureTokens": 36452,
+          "sampledSurfaceTokens": 21409
+        }
+      },
+      "contextBreakdown": {
+        "ver": 2,
+        "seq": 13579,
+        "val": {
+          "systemTokens": 1033,
+          "toolsTokens": 6835,
+          "messageTokens": 23168
+        }
+      },
+      "subagentTiming": {
+        "ver": 2,
+        "seq": 13579,
+        "val": {
+          "descriptorSeen": false,
+          "settledMs": 0,
+          "pendingTurnStart": 1788317930921
+        }
+      },
+      "subagent": {
+        "ver": 2,
+        "seq": 13579,
+        "val": {}
+      },
+      "todos": {
+        "ver": 2,
+        "seq": 13579,
+        "val": null
+      },
+      "permissions": {
+        "ver": 1,
+        "seq": 13579,
+        "val": {
+          "preset": "workspace-write",
+          "sandbox": "workspace-write",
+          "approval": "ask"
+        }
+      }
+    }
+  }
+}

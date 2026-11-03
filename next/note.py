@@ -159,6 +159,11 @@ error: final model turn requested Tools while Tool use was disabled）
     --show-tool-results \
     'tool=calculate_product calls=1 tool_args={"left":4,"right":30}'
 
+  --启动mtbi-analysis_
+     MTBI_WORKSPACE=/private/tmp/mtbi-artifact-smoke \
+     uv run --project next/mtbi-analysis mtbi-analysis-server \
+        --host 127.0.0.1 \
+
   ###TODO
 
   ### 这一阶段应该测试什么
@@ -174,13 +179,27 @@ error: final model turn requested Tools while Tool use was disabled）
 
   现有 Skill 类型已经在 next/src/base_agent/skills/models.py:12，SDK 也有基础单元测试，但 Starter 还没有把它作为开发者使用场景完整验收。
 
-  ### 后续合理顺序
 
-  我建议接下来按这个顺序：
 
-  1. Starter 验收 Skill。
-  2. Starter 验收两个 Agent 的 SequentialFlow 和显式 handoff。
-  3. 增加 RunHandle/start()，把执行和事件消费解耦。
-  4. 在 RunHandle 之上增加 HTTP SSE。
-  5. 增加取消和小型 ContextPolicy。
-  6. 最后再考虑 Planner/Executor。
+  ### 启动next 
+   uv run --project next/starter --extra postgres agent-server --host 127.0.0.1 --port 8001
+   uv run --project next/starter --extra postgres execution-worker
+
+
+####重点
+########为什么想要做这样的一个东西
+想要封装的不是一个agent，而是一个统一的执行内核，使用同一套的执行规则，提供相对可靠的一个执行平台。
+方便查看和监控整个AI的流程效果会不会更好，不仅仅指的是结果上，而是执行过程是否有所提升，比如说同样是执行，之前5次循环达成，后来有没有3次可以达成这样类似的。
+之后只需要关注到prompt、tool、skill 和少量的agent/flow 的编排上，以及context的把控上。
+
+  问题                               Base-Agent 的答案
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Context 在哪里控制？               ContextPolicy 构造每次模型请求
+─────────────────────────────────  ───────────────────────────────────────────────
+  Recall 到 Memory 就算使用了吗？    不算，Policy 还要选择并注入
+─────────────────────────────────  ───────────────────────────────────────────────
+  AI 能生成 Artifact 吗？            能生成内容，但 Artifact 事实由 Host 创建
+─────────────────────────────────  ───────────────────────────────────────────────
+  Tool 失败怎么办？                  转成结构化 ToolResult，由模型或上层 Flow 处理
+─────────────────────────────────  ───────────────────────────────────────────────
+  多个 Agent 如何协作？              Flow 通过显式 Handoff 和 Artifact 交接

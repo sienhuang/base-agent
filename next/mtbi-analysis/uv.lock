@@ -155,6 +155,9 @@ server = [
 requires-dist = [
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.30,<1" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.115,<1" },
+    { name = "httpx", marker = "extra == 'mcp'", specifier = ">=0.27,<1" },
+    { name = "jsonschema", marker = "extra == 'mcp'", specifier = ">=4.23,<5" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.28,<2" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=2,<3" },
     { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "pyyaml", specifier = ">=6,<7" },
@@ -162,19 +165,22 @@ requires-dist = [
     { name = "sse-starlette", marker = "extra == 'server'", specifier = ">=3,<4" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.30,<1" },
 ]
-provides-extras = ["openai", "server", "postgres"]
+provides-extras = ["openai", "server", "postgres", "mcp"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "asyncpg", specifier = ">=0.30,<1" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "httpx", specifier = ">=0.27,<1" },
+    { name = "jsonschema", specifier = ">=4.23,<5" },
+    { name = "mcp", specifier = ">=1.28,<2" },
     { name = "mypy", specifier = ">=1.15" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.25" },
     { name = "ruff", specifier = ">=0.11" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.40,<2.1" },
     { name = "sse-starlette", specifier = ">=3,<4" },
+    { name = "types-jsonschema", specifier = ">=4.23" },
     { name = "types-pyyaml", specifier = ">=6.0.12" },
 ]
 

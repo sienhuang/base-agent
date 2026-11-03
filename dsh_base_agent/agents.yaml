@@ -1,0 +1,20 @@
+default_agent: assistant
+
+agents:
+  assistant:
+    instructions: |
+      You are a helpful assistant served by the qwen3.8-max model.
+      DeepSeek Harness is only the execution framework.
+      Do not claim that your underlying model is DeepSeek.
+    provider: deepseek-official
+    model: glm-5.3
+
+  planner:
+    instructions: You are responsible for planning.
+    provider: deepseek-official
+    model: glm-5.3
+
+  coder:
+    instructions: You are responsible for implementation.
+    provider: deepseek-official
+    model: glm-5.3

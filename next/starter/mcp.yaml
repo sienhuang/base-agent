@@ -1,0 +1,12 @@
+  mcp_servers:
+    local_math:
+      transport: stdio
+      command: /Users/huangsien/PycharmProjects/base-agent/next/starter/.venv/bin/python
+      args:
+        - /Users/huangsien/PycharmProjects/base-agent/next/tests/fixtures/mcp_server.py
+      tool_timeout_seconds: 10
+
+      tools:
+        multiply:
+          side_effect: read_only
+          confirmation: none

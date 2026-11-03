@@ -1,0 +1,98 @@
+{
+  "version": 4,
+  "record": {
+    "identity": {
+      "createdAt": 1788263982195,
+      "cwd": "/Users/huangsien/PycharmProjects/base-agent/next"
+    },
+    "rows": {
+      "title": {
+        "ver": 1,
+        "seq": 20,
+        "val": "只回复 pong"
+      },
+      "goal": {
+        "ver": 4,
+        "seq": 20,
+        "val": null
+      },
+      "plan": {
+        "ver": 2,
+        "seq": 20,
+        "val": {
+          "active": false,
+          "wanted": null,
+          "running": null
+        }
+      },
+      "tokenUsage": {
+        "ver": 2,
+        "seq": 20,
+        "val": {
+          "totals": {
+            "uncachedInputTokens": 1622,
+            "outputTokens": 3,
+            "cacheReadTokens": 6144,
+            "cacheWriteTokens": 0
+          },
+          "last": {
+            "turn": 1,
+            "step": 1,
+            "buckets": {
+              "uncachedInputTokens": 1622,
+              "outputTokens": 3,
+              "cacheReadTokens": 6144,
+              "cacheWriteTokens": 0
+            }
+          }
+        }
+      },
+      "contextPressure": {
+        "ver": 4,
+        "seq": 20,
+        "val": {
+          "surfaceTokens": 150,
+          "contextWindow": 1000000,
+          "pressureTokens": 7766,
+          "sampledSurfaceTokens": 141
+        }
+      },
+      "contextBreakdown": {
+        "ver": 2,
+        "seq": 20,
+        "val": {
+          "systemTokens": 1033,
+          "toolsTokens": 6835,
+          "messageTokens": 150
+        }
+      },
+      "subagentTiming": {
+        "ver": 2,
+        "seq": 20,
+        "val": {
+          "descriptorSeen": false,
+          "settledMs": 0
+        }
+      },
+      "subagent": {
+        "ver": 2,
+        "seq": 20,
+        "val": {}
+      },
+      "todos": {
+        "ver": 2,
+        "seq": 20,
+        "val": null
+      },
+      "permissions": {
+        "ver": 1,
+        "seq": 20,
+        "val": {
+          "preset": "workspace-write",
+          "sandbox": "workspace-write",
+          "approval": "ask"
+        }
+      }
+    }
+  }
+}
